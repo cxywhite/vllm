@@ -1,0 +1,48 @@
+/root/miniconda3/envs/openrlhf/lib/python3.10/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 11-12 12:07:52 [__init__.py:216] Automatically detected platform cuda.
+Namespace(backend='vllm', base_url='http://127.0.0.1:8011', host='127.0.0.1', port=8000, endpoint='/v1/completions', dataset_name='random', dataset_path=None, no_stream=False, max_concurrency=128, model='/root/.cache/huggingface/hub/Qwen2.5-7B-Instruct', tokenizer=None, use_beam_search=False, num_prompts=128, logprobs=None, request_rate=inf, burstiness=1.0, seed=42, trust_remote_code=False, disable_tqdm=False, profile=False, save_result=False, save_detailed=False, append_result=False, metadata=None, result_dir=None, result_filename=None, ignore_eos=True, percentile_metrics='ttft,tpot,itl,e2el', metric_percentiles='99', goodput=['ttft:2000', 'tpot:50'], custom_output_len=256, custom_skip_chat_template=False, sonnet_input_len=550, sonnet_output_len=150, sonnet_prefix_len=200, sharegpt_output_len=None, random_input_len=512, random_output_len=1024, random_range_ratio=0.0, random_prefix_len=0, hf_subset=None, hf_split=None, hf_output_len=None, top_p=0.8, top_k=20, min_p=None, temperature=0.7, repetition_penalty=1.05, tokenizer_mode='auto', served_model_name=None, lora_modules=None, ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, load_input_requests=None, save_input_requests=True)
+Starting initial single prompt test run...
+Initial test run completed. Starting main benchmark run...
+Traffic request rate: inf RPS.
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 128
+  0%|          | 0/128 [00:00<?, ?it/s]  1%|          | 1/128 [00:24<50:55, 24.06s/it]  5%|▍         | 6/128 [00:24<06:11,  3.05s/it] 49%|████▉     | 63/128 [00:28<00:16,  3.86it/s] 51%|█████     | 65/128 [00:29<00:16,  3.73it/s] 52%|█████▏    | 66/128 [00:29<00:16,  3.71it/s] 52%|█████▏    | 67/128 [00:29<00:16,  3.70it/s] 53%|█████▎    | 68/128 [00:30<00:17,  3.46it/s] 54%|█████▍    | 69/128 [00:30<00:17,  3.44it/s] 55%|█████▍    | 70/128 [00:30<00:16,  3.43it/s] 55%|█████▌    | 71/128 [00:31<00:16,  3.42it/s] 56%|█████▋    | 72/128 [00:31<00:18,  2.98it/s] 57%|█████▋    | 73/128 [00:32<00:18,  3.02it/s] 58%|█████▊    | 74/128 [00:32<00:17,  3.10it/s] 59%|█████▊    | 75/128 [00:32<00:16,  3.18it/s] 59%|█████▉    | 76/128 [00:33<00:15,  3.25it/s] 60%|██████    | 77/128 [00:33<00:15,  3.33it/s] 61%|██████    | 78/128 [00:33<00:14,  3.40it/s] 62%|██████▏   | 79/128 [00:33<00:14,  3.45it/s] 62%|██████▎   | 80/128 [00:34<00:13,  3.50it/s] 63%|██████▎   | 81/128 [00:34<00:13,  3.54it/s] 64%|██████▍   | 82/128 [00:34<00:12,  3.58it/s] 65%|██████▍   | 83/128 [00:34<00:12,  3.59it/s] 66%|██████▌   | 84/128 [00:35<00:11,  3.67it/s] 67%|██████▋   | 86/128 [00:35<00:09,  4.66it/s] 68%|██████▊   | 87/128 [00:35<00:09,  4.36it/s] 69%|██████▉   | 88/128 [00:36<00:09,  4.16it/s] 70%|██████▉   | 89/128 [00:36<00:09,  4.08it/s] 71%|███████   | 91/128 [00:36<00:07,  4.97it/s] 72%|███████▏  | 92/128 [00:36<00:07,  4.60it/s] 73%|███████▎  | 93/128 [00:37<00:07,  4.43it/s] 74%|███████▍  | 95/128 [00:37<00:06,  5.25it/s] 75%|███████▌  | 96/128 [00:37<00:06,  4.81it/s] 77%|███████▋  | 98/128 [00:37<00:05,  5.65it/s] 78%|███████▊  | 100/128 [00:38<00:04,  6.38it/s] 79%|███████▉  | 101/128 [00:38<00:04,  5.84it/s] 80%|████████  | 103/128 [00:38<00:03,  6.58it/s] 82%|████████▏ | 105/128 [00:38<00:03,  7.03it/s] 84%|████████▎ | 107/128 [00:39<00:02,  7.52it/s] 84%|████████▍ | 108/128 [00:39<00:02,  7.74it/s] 85%|████████▌ | 109/128 [00:39<00:02,  7.95it/s] 86%|████████▌ | 110/128 [00:39<00:02,  7.55it/s] 88%|████████▊ | 112/128 [00:39<00:01,  8.62it/s] 88%|████████▊ | 113/128 [00:39<00:01,  8.72it/s] 90%|████████▉ | 115/128 [00:40<00:01,  8.94it/s] 91%|█████████▏| 117/128 [00:40<00:01,  9.33it/s] 93%|█████████▎| 119/128 [00:40<00:00,  9.40it/s] 95%|█████████▍| 121/128 [00:40<00:00, 10.38it/s] 97%|█████████▋| 124/128 [00:40<00:00, 11.06it/s] 98%|█████████▊| 126/128 [00:40<00:00, 12.50it/s]100%|██████████| 128/128 [00:41<00:00,  3.12it/s]
+============ Serving Benchmark Result ============
+Successful requests:                     128       
+Benchmark duration (s):                  41.00     
+Total input tokens:                      65335     
+Total generated tokens:                  131072    
+Min_input_len:                           457.0     
+Max_input_len:                           512.0     
+Mean_input_len:                          510.4296875
+P50_input_len:                           512.0     
+P99_input_len:                           512.0     
+Min_output_len:                          1024.0    
+Max_output_len:                          1024.0    
+Mean_output_len:                         1024.0    
+P50_output_len:                          1024.0    
+P99_output_len:                          1024.0    
+Request throughput (req/s):              3.12      
+Request goodput (req/s):                 1.76      
+Output token goodput (tok/s):            1798.03   
+Total token goodput (tok/s):             2694.59   
+Output token throughput (tok/s):         3196.51   
+Total Token throughput (tok/s):          4789.86   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1210.82   
+Median TTFT (ms):                        517.68    
+P99 TTFT (ms):                           2143.67   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          28.83     
+Median TPOT (ms):                        27.71     
+P99 TPOT (ms):                           37.94     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           28.83     
+Median ITL (ms):                         21.05     
+P99 ITL (ms):                            25.32     
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          30699.34  
+Median E2EL (ms):                        28852.22  
+P99 E2EL (ms):                           40947.26  
+==================================================

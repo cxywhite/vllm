@@ -1,0 +1,48 @@
+/root/miniconda3/envs/openrlhf/lib/python3.10/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 11-12 13:04:00 [__init__.py:216] Automatically detected platform cuda.
+Namespace(backend='vllm', base_url='http://127.0.0.1:8011', host='127.0.0.1', port=8000, endpoint='/v1/completions', dataset_name='random', dataset_path=None, no_stream=False, max_concurrency=480, model='/root/.cache/huggingface/hub/Qwen2.5-7B-Instruct', tokenizer=None, use_beam_search=False, num_prompts=480, logprobs=None, request_rate=inf, burstiness=1.0, seed=42, trust_remote_code=False, disable_tqdm=False, profile=False, save_result=False, save_detailed=False, append_result=False, metadata=None, result_dir=None, result_filename=None, ignore_eos=True, percentile_metrics='ttft,tpot,itl,e2el', metric_percentiles='99', goodput=['ttft:2000', 'tpot:50'], custom_output_len=256, custom_skip_chat_template=False, sonnet_input_len=550, sonnet_output_len=150, sonnet_prefix_len=200, sharegpt_output_len=None, random_input_len=512, random_output_len=1024, random_range_ratio=0.0, random_prefix_len=0, hf_subset=None, hf_split=None, hf_output_len=None, top_p=0.8, top_k=20, min_p=None, temperature=0.7, repetition_penalty=1.05, tokenizer_mode='auto', served_model_name=None, lora_modules=None, ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, load_input_requests=None, save_input_requests=True)
+Starting initial single prompt test run...
+Initial test run completed. Starting main benchmark run...
+Traffic request rate: inf RPS.
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 480
+  0%|          | 0/480 [00:00<?, ?it/s]  0%|          | 1/480 [01:18<10:26:41, 78.50s/it]  7%|▋         | 35/480 [01:18<11:47,  1.59s/it]   50%|█████     | 240/480 [01:18<00:40,  5.92it/s]100%|██████████| 480/480 [01:18<00:00,  6.09it/s]
+============ Serving Benchmark Result ============
+Successful requests:                     480       
+Benchmark duration (s):                  78.85     
+Total input tokens:                      245332    
+Total generated tokens:                  491520    
+Min_input_len:                           361.0     
+Max_input_len:                           512.0     
+Mean_input_len:                          511.10833333333335
+P50_input_len:                           512.0     
+P99_input_len:                           512.0     
+Min_output_len:                          1024.0    
+Max_output_len:                          1024.0    
+Mean_output_len:                         1024.0    
+P50_output_len:                          1024.0    
+P99_output_len:                          1024.0    
+Request throughput (req/s):              6.09      
+Request goodput (req/s):                 0.00      
+Output token goodput (tok/s):            0.00      
+Total token goodput (tok/s):             0.00      
+Output token throughput (tok/s):         6233.30   
+Total Token throughput (tok/s):          9344.52   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1540.44   
+Median TTFT (ms):                        2273.17   
+P99 TTFT (ms):                           2305.69   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          75.45     
+Median TPOT (ms):                        74.76     
+P99 TPOT (ms):                           76.24     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           75.45     
+Median ITL (ms):                         75.03     
+P99 ITL (ms):                            102.62    
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          78726.07  
+Median E2EL (ms):                        78752.99  
+P99 E2EL (ms):                           78782.03  
+==================================================

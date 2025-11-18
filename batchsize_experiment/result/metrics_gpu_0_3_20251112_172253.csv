@@ -1,0 +1,18 @@
+batchsize,Request throughput (req/s),Request goodput (req/s),Output token goodput (tok/s),Total token goodput (tok/s),Output token throughput (tok/s),Total Token throughput (tok/s),_source_file
+32,2.0,2.0,2048.04,3066.5,2048.04,3066.5,/root/predict/batchsize_experiment/log/gpu_0.3/client_batchsize32_20251112_050706.log
+64,3.09,3.09,3169.07,4748.72,3169.07,4748.72,/root/predict/batchsize_experiment/log/gpu_0.3/client_batchsize64_20251112_050734.log
+128,3.14,3.14,3220.06,4825.16,3220.06,4825.16,/root/predict/batchsize_experiment/log/gpu_0.3/client_batchsize128_20251112_050807.log
+256,2.98,1.49,1526.37,2287.22,3052.74,4576.68,/root/predict/batchsize_experiment/log/gpu_0.3/client_batchsize256_20251112_050900.log
+280,2.89,1.27,1301.68,1950.45,2963.18,4442.41,/root/predict/batchsize_experiment/log/gpu_0.3/client_batchsize280_20251112_051039.log
+300,2.96,1.02,1041.3,1560.41,3032.92,4547.12,/root/predict/batchsize_experiment/log/gpu_0.3/client_batchsize300_20251112_051228.log
+320,3.04,1.17,1195.59,1791.48,3110.49,4663.55,/root/predict/batchsize_experiment/log/gpu_0.3/client_batchsize320_20251112_051422.log
+340,3.06,1.02,1049.48,1572.41,3130.02,4692.97,/root/predict/batchsize_experiment/log/gpu_0.3/client_batchsize340_20251112_051620.log
+360,2.92,1.0,1020.11,1528.54,2985.69,4476.6,/root/predict/batchsize_experiment/log/gpu_0.3/client_batchsize360_20251112_051824.log
+380,2.91,0.93,949.38,1422.53,2981.52,4470.37,/root/predict/batchsize_experiment/log/gpu_0.3/client_batchsize380_20251112_052041.log
+400,3.0,0.92,945.56,1416.83,3074.99,4610.61,/root/predict/batchsize_experiment/log/gpu_0.3/client_batchsize400_20251112_052304.log
+420,3.07,0.89,906.84,1358.78,3147.7,4719.71,/root/predict/batchsize_experiment/log/gpu_0.3/client_batchsize420_20251112_052530.log
+440,2.95,0.81,831.51,1245.92,3023.69,4533.67,/root/predict/batchsize_experiment/log/gpu_0.3/client_batchsize440_20251112_052800.log
+460,2.95,0.79,806.71,1208.77,3016.95,4523.65,/root/predict/batchsize_experiment/log/gpu_0.3/client_batchsize460_20251112_053042.log
+480,2.95,0.73,748.36,1121.3,3018.59,4525.26,/root/predict/batchsize_experiment/log/gpu_0.3/client_batchsize480_20251112_053331.log
+500,3.02,0.72,741.14,1110.5,3088.08,4629.43,/root/predict/batchsize_experiment/log/gpu_0.3/client_batchsize500_20251112_053628.log
+512,3.04,0.71,724.6,1086.03,3117.6,4673.33,/root/predict/batchsize_experiment/log/gpu_0.3/client_batchsize512_20251112_053927.log
