@@ -4,10 +4,10 @@
 log_parser_and_plot.py
 
 Usage example:
-  python log_parser_and_plot2.py \
-    --log-dirs /root/predict/batchsize_experiment/log/gpu_0.3 /root/predict/batchsize_experiment/log/gpu_0.95 \
-    --labels gpu_0.3 gpu_0.95 \
-    --out-dir /root/predict/batchsize_experiment/result
+  python log_parser_and_plot.py \
+    --log-dirs /root/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/experiment_result/log/gpu_0.3 /root/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/experiment_result/log/gpu_0.7 \
+    --labels gpu_0.3 gpu_0.7 \
+    --out-dir /root/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/experiment_result/fig
 
 作用:
 - 分别读取两个目录下的 .log 文件并解析指标（与之前版本保持一致）
