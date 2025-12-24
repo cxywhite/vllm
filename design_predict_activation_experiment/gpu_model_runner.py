@@ -120,6 +120,9 @@ if TYPE_CHECKING:
 # [WT]predict activation 2025-12-17 19:16:31
 from vllm.logger import init_logger
 logger = init_logger(__name__)
+import sys
+sys.path.append('/root/predict-schedule')
+from design_predict_activation_experiment.wt_metadata import Custom_Metadata
 # [WT] end
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -2299,14 +2302,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             #     if match:
             #         return match.group(1)
             #     return None
-
+            #
             # scheduler 输出
+            
             scheduled_new_reqs = scheduler_output.scheduled_new_reqs
             num_scheduled_tokens_map = scheduler_output.num_scheduled_tokens
 
-            # 构造映射：req_id -> (range, num_tokens, sampling params)
-            my_metadata: dict[str, tuple[tuple[int, int], int, float, float, int, float]] = {}
-
+            # 构造映射：req_id -> (range, num_tokens, sampling params,expected_output_length)
+            # my_metadata: dict[str, tuple[tuple[int, int], int, float, float, int, float,int]] = {}
+            my_metadata: list[Custom_Metadata]=[]
             start_idx = 0
             for req in scheduled_new_reqs:
                 full_req_id = req.req_id
@@ -2328,16 +2332,26 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 top_p = sampling_params.top_p
                 top_k = sampling_params.top_k
                 rep_penalty = sampling_params.repetition_penalty
-
-                # 保存到 map
-                my_metadata[simplified_req_id] = (
-                    (start_idx, end_idx),
-                    num_tokens,
-                    temp,
-                    top_p,
-                    top_k,
-                    rep_penalty
-                )
+                my_metadata.append(Custom_Metadata(
+                    req_id=simplified_req_id,
+                    token_range=(start_idx, end_idx),
+                    num_tokens=num_tokens,
+                    temperature=temp,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=rep_penalty,
+                    predict_output_len=None  # 占位符，暂时不需要
+                ))
+                # # 保存到 map
+                # my_metadata[simplified_req_id] = (
+                #     (start_idx, end_idx),
+                #     num_tokens,
+                #     temp,
+                #     top_p,
+                #     top_k,
+                #     rep_penalty,
+                #     None,  # 占位符，expected_output_length，暂时不需要
+                # )
 
                 # 更新 start_idx
                 start_idx = end_idx
@@ -2379,6 +2393,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 # Common case.
                 hidden_states = model_output
+                logger.info(f'[WT] GPUModelRunner hidden_states: {hidden_states}')
                 aux_hidden_states = None
 
             if not self.broadcast_pp_output:

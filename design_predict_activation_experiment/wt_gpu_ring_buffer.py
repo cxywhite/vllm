@@ -4,7 +4,9 @@ import torch
 import numpy as np
 import threading
 import time
-
+import sys
+sys.path.append('/root/predict-schedule')
+from design_predict_activation_experiment.wt_metadata import Custom_Metadata
 EMPTY   = 0
 WRITING = 1
 READY   = 2
@@ -57,7 +59,7 @@ class GPURingBuffer:
     def write_batch(self,
                     hidden_states: torch.Tensor,  # [N, hidden_dim]
                     importance: torch.Tensor,      # [N]
-                    meta: dict):
+                    meta: list[Custom_Metadata]):
 
         n = hidden_states.shape[0]
         assert n <= self.max_tokens, \

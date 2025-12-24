@@ -11,6 +11,8 @@ import numpy as np
 import sys
 sys.path.append('/root/vllm')
 from examples.online_serving.disaggregated_serving_p2p_nccl_xpyd.wt_shared_gpu_buffer import SharedGPUBufferManager,write_ready_flag,read_ready_flag
+sys.path.append('/root/predict-schedule')
+from design_predict_activation_experiment.wt_metadata import Custom_Metadata
 import pickle
 import os
 class BertLengthDistributionModel_B(torch.nn.Module):
@@ -171,15 +173,15 @@ class PredictorWorker:
     def _run_predict(self,
                     hidden_flat: torch.Tensor,  # [N,4096]
                     importance_flat: torch.Tensor,  # [N]
-                    meta: dict):
+                    meta: list[Custom_Metadata]):
         req_seqs = []
         lengths  = []
         temp_list = []
         topp_list = []
         topk_list = []
         repetition_penalty_list = []
-        for req_id, info in meta.items():
-            (start, end) = info[0]
+        for m in meta:
+            (start, end) = m.token_range
 
             seq = hidden_flat[start:end]
             imp = importance_flat[start:end]
@@ -195,10 +197,10 @@ class PredictorWorker:
             # print(f'WT222 selected_seq shape: {selected_seq.shape}.')
             req_seqs.append(selected_seq)
             lengths.append(selected_seq.shape[0])
-            temp_list.append(float(info[2]))
-            topp_list.append(float(info[3]))
-            topk_list.append(int(info[4]))
-            repetition_penalty_list.append(float(info[5]))
+            temp_list.append(float(m.temperature))
+            topp_list.append(float(m.top_p))
+            topk_list.append(int(m.top_k))
+            repetition_penalty_list.append(float(m.repetition_penalty))
             
         if not req_seqs:
             return
@@ -240,8 +242,29 @@ class PredictorWorker:
             print(f"[WT] Predictor logits shape: {logits.shape}, values: {logits}")
             probabilities = F.softmax(logits, dim=-1)
             print(f"[WT] Predictor probabilities: {probabilities}")
+            # [ 393. 1145. 7775. 8167.]20%, 40%, 60%, 80% 分位数
+            # bucket_stats = [
+            #     { "low": 0,    "high": 393,  "mean": 219 },
+            #     { "low": 393,  "high": 1145, "mean": 645 },
+            #     { "low": 1145, "high": 7775, "mean": 3680 },
+            #     { "low": 7775, "high": 8167, "mean": 8078 },
+            #     { "low": 8167, "high": 8190, "mean": 8179 },
+            # ]
+            bucket_high=torch.tensor([393,1145,7775,8167,8190],device=device)
+            bucket_mean=torch.tensor([219,645,3680,8078,8179],device=device)
+            lambdas=torch.tensor([0.2, 0.2, 0.5, 0.8, 1.0],device=device)
+            mu_eff = (1 - lambdas) * bucket_mean + lambdas * bucket_high
+            
+            predict_len=(probabilities * mu_eff).sum(dim=-1)
+            # predict_len向上取整为int型整数
+            
+            for i in range(len(meta)):
+                assert meta[i].predict_output_len==None
+                meta[i].predict_output_len = int(predict_len[i].item())
             self.predict_num += batch_size
             print(f'*'*20)
+            print(f'[WT] meta:')
+            print(f'{meta}')
             print(f"[WT] Total predictions made: {self.predict_num}")
 
 

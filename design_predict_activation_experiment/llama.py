@@ -61,6 +61,9 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 import json
 logger = init_logger(__name__)
+import sys
+sys.path.append('/root/predict-schedule')
+from design_predict_activation_experiment.wt_metadata import Custom_Metadata
 # [WT] end
 class LlamaMLP(nn.Module):
     def __init__(
@@ -219,7 +222,7 @@ class LlamaAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         # [WT]predict activation 2025-12-22 14:46:40
-        my_metadata: Optional[dict[str, Any]] = None,
+        my_metadata: Optional[list[Custom_Metadata]] = None,
         activate_predict:Optional[bool]=None,
         # [WT] end
     ) -> torch.Tensor:
@@ -238,9 +241,8 @@ class LlamaAttention(nn.Module):
                 device=hidden_states.device,
                 dtype=torch.float32
             )
-
-            for _, info in my_metadata.items():
-                start, end = info[0]
+            for meta in my_metadata:
+                start, end = meta.token_range
                 if start >= end:
                     continue
 
@@ -259,6 +261,26 @@ class LlamaAttention(nn.Module):
 
                 # importance: [s]
                 token_importance[start:end] = score.mean(dim=0)
+            # for _, info in my_metadata.items():
+            #     start, end = info[0]
+            #     if start >= end:
+            #         continue
+
+            #     _q = qh[start:end]  # [s, h, d]
+            #     _k = kh[start:end]
+
+            #     _q = _q.permute(1, 0, 2).unsqueeze(1)   # [h,1,s,d]
+            #     _k = _k.permute(1, 0, 2).unsqueeze(0)   # [1,h_kv,s,d]
+
+            #     attn = torch.matmul(
+            #         _q, _k.transpose(2, 3)
+            #     ) * self.scaling
+
+            #     # [s, s]
+            #     score = attn.mean(dim=(0, 1))
+
+            #     # importance: [s]
+            #     token_importance[start:end] = score.mean(dim=0)
         # [WT] end
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
@@ -359,7 +381,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         # [WT]predict activation 2025-12-22 22:17:08
-        my_metadata: Optional[dict[str, Any]] = None,
+        my_metadata: Optional[list[Custom_Metadata]] = None,
         activate_predict:Optional[bool]=None,
         # [WT] end
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -444,7 +466,6 @@ class LlamaModel(nn.Module):
                 ["hidden_states", "residual"], config.hidden_size))
         # [WT]predict activation 2025-12-22 22:18:13
         self.kv_transfer_config = vllm_config.kv_transfer_config
-        logger.info(f'[init] llama3Model init')
         if vllm_config.scheduler_config.activation_predict:
             self.gpu_ring_buffer = GPURingBuffer(
                 num_slots=4,
@@ -470,7 +491,7 @@ class LlamaModel(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
         # [WT]predict activation 2025-12-22 22:18:25
-        my_metadata: Optional[dict[str, Any]] = None,
+        my_metadata: Optional[list[Custom_Metadata]] = None,
         activate_predict:Optional[bool]=None,
         # [WT] end
     ) -> Union[torch.Tensor, IntermediateTensors, tuple[torch.Tensor,
@@ -521,6 +542,7 @@ class LlamaModel(nn.Module):
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
+        logger.info(f'[WT] LlamaModel forward output hidden_states: {hidden_states}')
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str,
@@ -702,7 +724,7 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         # [WT]predict activation 2025-12-22 22:20:52
-        my_metadata: Optional[dict[str, Any]] = None,
+        my_metadata: Optional[list[Custom_Metadata]] = None,
         activation_predict: Optional[bool] = None,
         # [WT] end
     ) -> Union[torch.Tensor, IntermediateTensors]:
@@ -715,6 +737,7 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
             model_output = self.model(input_ids, positions, intermediate_tensors,
                                     inputs_embeds)
         # [WT] end
+        logger.info(f'[WT] LlamaForCausalLM forward model_output: {model_output}')
         return model_output
 
     def compute_logits(
