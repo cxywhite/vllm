@@ -15,6 +15,7 @@ sys.path.append('/root/predict-schedule')
 from design_predict_activation_experiment.wt_metadata import Custom_Metadata
 import pickle
 import os
+import zmq
 class BertLengthDistributionModel_B(torch.nn.Module):
     def __init__(self, config, model_name, input_dim, hidden_dim, n_classes):
         super().__init__()
@@ -149,7 +150,15 @@ class PredictorWorker:
         self.predictor.load_state_dict(torch.load('/root/myshare/predict_project/act_predictor_train/results/train_llama3-8b_act-15_max-8192_top-510_bert_H512_cls_10K_20251220-053810/model.pth'))#/root/myshare/predict_project/input_ids_predictor_use/model_weight/qwen_model.pth    
         print(f"✅ PredictorWorker initialized on {next(self.predictor.parameters()).device}")
         print(f"   Model size: {sum(p.numel() for p in self.predictor.parameters()) / 1e6:.2f}M parameters")
+        # -------- ZMQ INIT --------
+        self.zmq_ctx = zmq.Context.instance()
+        self.zmq_sock = self.zmq_ctx.socket(zmq.PUSH)
 
+        # 高吞吐、低延迟配置
+        self.zmq_sock.setsockopt(zmq.LINGER, 0)
+        self.zmq_sock.setsockopt(zmq.SNDHWM, 4096)
+        zmq_proxy_addr = "tcp://0.0.0.0:32323"  # 替换为实际的ZMQ代理地址
+        self.zmq_sock.connect(zmq_proxy_addr)
 
     def start(self):
         for _ in range(self.num_threads):
@@ -170,6 +179,19 @@ class PredictorWorker:
                 self._run_predict(hidden_flat,importance_flat, meta)
             finally:
                 self.ring.release_slot(slot)
+    def _send_metadata_to_proxy(self, meta: list[Custom_Metadata]):
+        """
+        Non-blocking send of predictor metadata to proxy.
+        """
+        try:
+            print(f'[WT] Sending metadata to proxy via ZMQ: {meta}')
+            meta_dicts = [m.to_dict() for m in meta]
+            payload = json.dumps(meta_dicts)
+            self.zmq_sock.send_string(payload, zmq.NOBLOCK)
+        except zmq.Again:
+            # proxy 忙，直接丢弃或计数
+            print("[WT][Predictor] ZMQ send failed: HWM reached")
+
     def _run_predict(self,
                     hidden_flat: torch.Tensor,  # [N,4096]
                     importance_flat: torch.Tensor,  # [N]
@@ -261,6 +283,7 @@ class PredictorWorker:
             for i in range(len(meta)):
                 assert meta[i].predict_output_len==None
                 meta[i].predict_output_len = int(predict_len[i].item())
+            self._send_metadata_to_proxy(meta)
             self.predict_num += batch_size
             print(f'*'*20)
             print(f'[WT] meta:')
