@@ -157,7 +157,7 @@ class PredictorWorker:
         # 高吞吐、低延迟配置
         self.zmq_sock.setsockopt(zmq.LINGER, 0)
         self.zmq_sock.setsockopt(zmq.SNDHWM, 4096)
-        zmq_proxy_addr = "tcp://0.0.0.0:32323"  # 替换为实际的ZMQ代理地址
+        zmq_proxy_addr = "tcp://127.0.0.1:32323"  # 替换为实际的ZMQ代理地址
         self.zmq_sock.connect(zmq_proxy_addr)
 
     def start(self):
@@ -184,13 +184,13 @@ class PredictorWorker:
         Non-blocking send of predictor metadata to proxy.
         """
         try:
-            print(f'[WT] Sending metadata to proxy via ZMQ: {meta}')
+            print(f'[WT] Sending metadata to proxy via ZMQ: {meta} predictor_worker_readyflag.py')
             meta_dicts = [m.to_dict() for m in meta]
             payload = json.dumps(meta_dicts)
             self.zmq_sock.send_string(payload, zmq.NOBLOCK)
         except zmq.Again:
             # proxy 忙，直接丢弃或计数
-            print("[WT][Predictor] ZMQ send failed: HWM reached")
+            print("[WT]ZMQ send failed: HWM reached predictor_worker_readyflag.py")
 
     def _run_predict(self,
                     hidden_flat: torch.Tensor,  # [N,4096]
@@ -261,9 +261,9 @@ class PredictorWorker:
                     }
         with torch.no_grad():
             logits = self.predictor(inputs_embeds, attention_mask, lengths, sampling_params)
-            print(f"[WT] Predictor logits shape: {logits.shape}, values: {logits}")
+            # print(f"[WT] Predictor logits shape: {logits.shape}, values: {logits} predictor_worker_readyflag.py")
             probabilities = F.softmax(logits, dim=-1)
-            print(f"[WT] Predictor probabilities: {probabilities}")
+            print(f"[WT] Predictor probabilities: {probabilities} predictor_worker_readyflag.py")
             # [ 393. 1145. 7775. 8167.]20%, 40%, 60%, 80% 分位数
             # bucket_stats = [
             #     { "low": 0,    "high": 393,  "mean": 219 },
@@ -286,9 +286,9 @@ class PredictorWorker:
             self._send_metadata_to_proxy(meta)
             self.predict_num += batch_size
             print(f'*'*20)
-            print(f'[WT] meta:')
-            print(f'{meta}')
-            print(f"[WT] Total predictions made: {self.predict_num}")
+            # print(f'[WT] meta:')
+            print(f'{meta} predictor_worker_readyflag.py')
+            print(f"[WT] Total predictions made: {self.predict_num} predictor_worker_readyflag.py")
 
 
 # if __name__ == "__main__":
