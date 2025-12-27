@@ -16,7 +16,7 @@
 
 ### 2.1 修改文件
 
-所有修改内容均通过以下标记进行标识：
+基于中间激活和kvcache预测修改内容通过以下标记进行标识：
 
 ```python
 # [WT] predict activation 2025-12-19 13:55:34
@@ -42,6 +42,28 @@
   放置路径：  
   ```
   vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/
+  ```
+
+proxy的p2d分发逻辑中kvcache延迟传输修改内容通过以下标记进行标识：
+
+```python
+# [WT]delay kvcache transfer 2025-12-27 22:09:30
+# 修改内容
+# [WT] end
+```
+
+具体修改文件与路径如下：
+
+- `p2p_nccl_connector.py`  
+  放置路径：  
+  ```
+  vllm/vllm/distributed/kv_transfer/kv_connector/v1/p2p
+  ```
+
+- `disagg_proxy_p2p_nccl_xpyd.py`  
+  放置路径：  
+  ```
+  vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd
   ```
 
 ---
