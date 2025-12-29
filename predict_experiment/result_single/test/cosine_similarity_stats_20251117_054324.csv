@@ -1,0 +1,2 @@
+﻿file1,file2,mean,std,min,max,count
+results_20251110_032721_qwen.csv,results_20251111_075504_deepseek.csv,0.47126175952170785,0.31098466507994516,0.0,1.0,500

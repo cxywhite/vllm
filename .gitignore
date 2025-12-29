@@ -1,5 +1,5 @@
-# 忽略predict_experiment目录
-predict_experiment/
+# # 忽略predict_experiment目录
+# predict_experiment/
 
 # 忽略batchsize_experiment下的oldcode目录
 batchsize_experiment/oldcode/
