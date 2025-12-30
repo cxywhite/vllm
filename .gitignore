@@ -4,13 +4,13 @@
 # 忽略batchsize_experiment下的oldcode目录
 batchsize_experiment/oldcode/
 
-batchsize_experiment/vllm/
 batchsize_experiment/result/
 batchsize_experiment/log/
 batchsize_experiment/dataset/
-vllm/
 baseline_experiment/pastfuture/dataset/llama_train_dataset
 baseline_experiment/pastfuture/dataset/lmsys-50k-filtered
 baseline_experiment/pastfuture/filter_dtaset.py
 
 design_predict_activation_experiment/old_code
+
+vllm/

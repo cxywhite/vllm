@@ -26,6 +26,19 @@
 
 具体修改文件与路径如下：
 
+- `arg_utils.py`  
+  放置路径：  
+  ```
+  vllm/vllm/engine
+
+  ```
+  
+- `scheduler.py`
+  放置路径：  
+  ```
+  vllm/vllm/config
+  ```
+
 - `gpu_model_runner.py`  
   放置路径：  
   ```
@@ -38,7 +51,7 @@
   vllm/vllm/model_executor/models/
   ```
 
-- `wt_predict_activation.sh`  
+- `wt_test.sh`  
   放置路径：  
   ```
   vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/
@@ -84,11 +97,17 @@ proxy的p2d分发逻辑中kvcache延迟传输修改内容通过以下标记进�
   vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/
   ```
 
+- `wt_metadata.py`  
+  放置路径：  
+  ```
+  predict-schedule/design_predict_activation_experiment
+  ```
+
 ---
 
 ## 3. 文件功能说明
 
-### 3.1 wt_predict_activation.sh
+### 3.1 wt_test.sh
 
 该脚本基于如下脚本扩展实现：
 
@@ -122,6 +141,8 @@ predict-schedule/batchsize_experiment/disaggeration_pd_experiment/wt_disagg_p2p_
 - 该设计在当前阶段用于功能验证，后续需要：
   - 动态 slot 管理
   - 与实际 batch size / token 分布解耦
+
+### 3.2 TODO
 
 ---
 
