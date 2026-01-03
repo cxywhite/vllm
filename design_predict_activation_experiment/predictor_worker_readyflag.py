@@ -9,8 +9,8 @@ import torch.nn.functional as F
 from transformers import BertModel,AutoTokenizer,AutoConfig
 import numpy as np
 import sys
-sys.path.append('/root/vllm')
-from examples.online_serving.disaggregated_serving_p2p_nccl_xpyd.wt_shared_gpu_buffer import SharedGPUBufferManager,write_ready_flag,read_ready_flag
+# sys.path.append('/root/vllm')
+# from examples.online_serving.disaggregated_serving_p2p_nccl_xpyd.wt_shared_gpu_buffer import SharedGPUBufferManager,write_ready_flag,read_ready_flag
 sys.path.append('/root/predict-schedule')
 from design_predict_activation_experiment.wt_metadata import Custom_Metadata
 import pickle

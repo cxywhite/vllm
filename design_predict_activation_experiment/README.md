@@ -58,6 +58,12 @@
   vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/
   ```
 
+- `vllm/vllm/v1/metrics/loggers.py`
+
+- `vllm/vllm/v1/metrics/stats.py`
+
+- `vllm/vllm/v1/core/sched/scheduler.py`
+
 proxy的p2d分发逻辑中kvcache延迟传输修改内容通过以下标记进行标识：
 
 ```python
@@ -103,6 +109,7 @@ proxy的p2d分发逻辑中kvcache延迟传输修改内容通过以下标记进�
   ```
   predict-schedule/design_predict_activation_experiment
   ```
+- `vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/test_disagg_proxy.py`
 
 ---
 
