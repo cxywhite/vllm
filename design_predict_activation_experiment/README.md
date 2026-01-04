@@ -16,7 +16,7 @@
 
 ### 2.1 修改文件
 
-基于中间激活和kvcache预测修改内容通过以下标记进行标识：
+#### 2.1.1 基于中间激活和kvcache预测修改内容通过以下标记进行标识
 
 ```python
 # [WT] predict activation 2025-12-19 13:55:34
@@ -58,7 +58,7 @@
   vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/
   ```
 
-proxy的p2d分发逻辑中kvcache延迟传输修改内容通过以下标记进行标识：
+#### 2.1.2 proxy的p2d分发逻辑中kvcache延迟传输修改内容通过以下标记进行标识
 
 ```python
 # [WT]delay kvcache transfer 2025-12-27 22:09:30
@@ -80,13 +80,15 @@ proxy的p2d分发逻辑中kvcache延迟传输修改内容通过以下标记进�
   vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd
   ```
 
-根据prometheus接口从decode实例scheduler传输decode实例信息，从test_disagg_proxy.py传输预测输出长度到decode实例scheduler两者标识：
+#### 2.1.3 根据prometheus接口从decode实例scheduler传输decode实例信息，从test_disagg_proxy.py传输预测输出长度到decode实例scheduler两者标识
 
 ```python
 # [WT]prometheus 2026-01-04 13:10:11
 # 修改内容
 # [WT] end
 ```
+
+具体修改文件与路径如下：
 
 - `vllm/vllm/v1/metrics/loggers.py`
 
