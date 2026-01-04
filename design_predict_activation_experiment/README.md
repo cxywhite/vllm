@@ -58,12 +58,6 @@
   vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/
   ```
 
-- `vllm/vllm/v1/metrics/loggers.py`
-
-- `vllm/vllm/v1/metrics/stats.py`
-
-- `vllm/vllm/v1/core/sched/scheduler.py`
-
 proxy的p2d分发逻辑中kvcache延迟传输修改内容通过以下标记进行标识：
 
 ```python
@@ -85,6 +79,30 @@ proxy的p2d分发逻辑中kvcache延迟传输修改内容通过以下标记进�
   ```
   vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd
   ```
+
+根据prometheus接口从decode实例scheduler传输decode实例信息，从test_disagg_proxy.py传输预测输出长度到decode实例scheduler两者标识：
+
+```python
+# [WT]prometheus 2026-01-04 13:10:11
+# 修改内容
+# [WT] end
+```
+
+- `vllm/vllm/v1/metrics/loggers.py`
+
+- `vllm/vllm/v1/metrics/stats.py`
+
+- `vllm/vllm/v1/core/sched/scheduler.py`
+
+- `vllm/vllm/v1/request.py`
+
+- `vllm/vllm/v1/engine/async_llm.py`
+
+- `vllm/vllm/v1/engine/processor.py`
+
+- `vllm/vllm/v1/engine/__init__.py`
+
+- `vllm/vllm/engine/protocol.py`
 
 ---
 

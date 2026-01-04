@@ -212,6 +212,23 @@ class PrometheusStatLogger(StatLoggerBase):
         self.gauge_running_tokens = make_per_engine(gauge_running_tokens,
                                                          engine_indexes,
                                                             model_name)
+        gauge_running_predict_tokens = self._gauge_cls(
+            name="vllm:running_predict_tokens",
+            documentation="Total number of predicted tokens in running requests.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames)
+        self.gauge_running_predict_tokens = make_per_engine(gauge_running_predict_tokens,
+                                                            engine_indexes,
+                                                            model_name)
+        gauge_waiting_tokens = self._gauge_cls(
+            name="vllm:waiting_tokens",
+            documentation="Total number of tokens in waiting requests.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames)
+        self.gauge_waiting_tokens = make_per_engine(gauge_waiting_tokens,
+                                                    engine_indexes,
+                                                    model_name)
+        
         # GPU cache
         #
         # Deprecated in 0.9.2 - Renamed as vllm:kv_cache_usage_perc
@@ -544,7 +561,10 @@ class PrometheusStatLogger(StatLoggerBase):
             # [WT]prometheus 2026-01-02 21:20:20
             self.gauge_running_tokens[engine_idx].set(
                 scheduler_stats.running_tokens)
-
+            self.gauge_running_predict_tokens[engine_idx].set(
+                scheduler_stats.running_predict_tokens)
+            self.gauge_waiting_tokens[engine_idx].set(
+                scheduler_stats.waiting_tokens)
 
             if self.show_hidden_metrics:
                 self.gauge_gpu_cache_usage[engine_idx].set(

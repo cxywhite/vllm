@@ -48,6 +48,8 @@ class SchedulerStats:
     num_corrupted_reqs: int = 0
     # [WT]prometheus 2026-01-02 20:48:32
     running_tokens: int = 0
+    running_predict_tokens: int = 0
+    waiting_tokens: int = 0
 
 @dataclass
 class LoRAStats:

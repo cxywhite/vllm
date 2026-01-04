@@ -177,7 +177,8 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         # [WT]prometheus 2026-01-02 21:16:18
         self.running_tokens = 0
-
+        self.running_predict_tokens = 0
+        self.waiting_tokens = 0
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -212,7 +213,9 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
-
+            # [WT]prometheus 2026-01-04 13:28:01
+            # if request is not None and request.predictor_meta:
+            #     logger.info("RUNNING request %s", request.predictor_meta)
             num_new_tokens = (request.num_tokens_with_spec +
                               request.num_output_placeholders -
                               request.num_computed_tokens)
@@ -499,6 +502,8 @@ class Scheduler(SchedulerInterface):
                 # Request was already popped from self.waiting
                 # unless it was re-added above due to new_blocks being None.
                 request = self.waiting.pop_request()
+                # if request is not None and request.predictor_meta:
+                #     logger.info(f'WAITING request {request.predictor_meta}')
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -625,7 +630,8 @@ class Scheduler(SchedulerInterface):
         if events:
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
-
+        if len(self.waiting) > 0:
+            logger.info(f'[WT] len(waiting))={len(self.waiting)}, ')
         self._update_after_schedule(scheduler_output)
         return scheduler_output
 
@@ -1013,10 +1019,15 @@ class Scheduler(SchedulerInterface):
                         finished_requests=finished_set)
             finished_req_ids.clear()
         # [WT]prometheus 2026-01-02 21:14:52
-        self.running_tokens = 0
-        for req in self.running:
-            self.running_tokens+= req.num_computed_tokens
-        
+        if self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.kv_role == 'kv_consumer':
+            self.running_tokens = 0
+            self.running_predict_tokens = 0
+            self.waiting_tokens = 0
+            for req in self.running:
+                self.running_tokens+= req.num_computed_tokens
+                self.running_predict_tokens += max(1, req.predictor_meta['predict_output_len']-req.num_computed_tokens)
+            for req in self.waiting:
+                self.waiting_tokens =self.waiting_tokens+req.num_prompt_tokens+req.predictor_meta['predict_output_len']
         if (stats := self.make_stats(spec_decoding_stats,
                                      kv_connector_stats)) is not None:
             # Return stats to only one of the front-ends.
@@ -1199,7 +1210,9 @@ class Scheduler(SchedulerInterface):
                               kv_connector_stats=kv_connector_stats.data
                               if kv_connector_stats else None,
                               # [WT]prometheus 2026-01-02 21:17:03
-                              running_tokens=self.running_tokens
+                              running_tokens=self.running_tokens,
+                              running_predict_tokens=self.running_predict_tokens,
+                              waiting_tokens=self.waiting_tokens
                               )
 
     def make_spec_decoding_stats(
