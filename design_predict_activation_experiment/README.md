@@ -106,6 +106,12 @@
 
 - `vllm/vllm/engine/protocol.py`
 
+#### 2.1.4 decode实例内调度
+
+- `vllm/vllm/v1/core/sched/aimd_queue.py`
+
+- `vllm/vllm/v1/core/sched/aimd_scheduler.py`
+
 ---
 
 ### 2.2 新增文件
