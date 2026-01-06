@@ -45,6 +45,7 @@ class Request:
                                         list["BlockHash"]]] = None,
         # [WT]prometheus 2026-01-04 13:10:11
         predictor_meta: Optional[dict[str, Any]] = None,
+        # [WT] end
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -125,6 +126,7 @@ class Request:
             self.block_hashes = self.get_hash_new_full_blocks()
         # [WT]prometheus 2026-01-04 13:10:37
         self.predictor_meta = predictor_meta
+        # [WT] end
     @classmethod
     def from_engine_core_request(
         cls, request: EngineCoreRequest,
@@ -150,6 +152,7 @@ class Request:
             block_hasher=block_hasher,
             # [WT]prometheus 2026-01-04 13:10:47
             predictor_meta=request.predictor_meta,
+            # [WT] end
         )
 
     def append_output_token_ids(

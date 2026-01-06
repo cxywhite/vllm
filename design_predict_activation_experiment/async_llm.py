@@ -270,6 +270,7 @@ class AsyncLLM(EngineClient):
         data_parallel_rank: Optional[int] = None,
         # [WT]prometheus 2026-01-04 12:28:48
         predictor_meta: Optional[dict[str, Any]] = None,
+        # [WT] end
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
         # logger.info(f'HJT 333')
@@ -286,6 +287,7 @@ class AsyncLLM(EngineClient):
         prompt_str, request = self.processor.process_inputs(
             request_id, prompt, params, arrival_time, lora_request,
             tokenization_kwargs, trace_headers, priority, data_parallel_rank,predictor_meta)
+        # [WT] end
         # if request.predictor_meta is not None:
         #     logger.info(f'###request.predictor_meta: {request.predictor_meta}')
         if is_pooling or params.n == 1:
@@ -334,6 +336,7 @@ class AsyncLLM(EngineClient):
         data_parallel_rank: Optional[int] = None,
         # [WT]prometheus 2026-01-04 11:55:30
         predictor_meta: Optional[dict[str, Any]] = None,
+        # [WT] end
     ) -> AsyncGenerator[RequestOutput, None]:
         """
         Main function called by the API server to kick off a request
@@ -386,6 +389,7 @@ class AsyncLLM(EngineClient):
                 data_parallel_rank=data_parallel_rank,
                 # [WT]prometheus 2026-01-04 12:32:09
                 predictor_meta=predictor_meta
+                # [WT] end
             )
 
             # The output_handler task pushes items into the queue.

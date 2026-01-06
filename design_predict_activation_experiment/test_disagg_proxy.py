@@ -85,7 +85,7 @@ class DecodeLoadModel:
         self.weights_vram = self.total_params * self.precision_bytes
 
         # 激活 buffer（经验上界）
-        self.act_vram = 1024 * L * H * self.precision_bytes * 2
+        # self.act_vram = 1024 * L * H * self.precision_bytes * 2
 
         # -------- FLOPs 系数 --------
         self.linear_flops_coeff = 2 * (L * self.layer_params + V * H)
@@ -96,7 +96,7 @@ class DecodeMonitor:
     def __init__(
         self,
         config_path: str,
-        precision: str = "fp16",
+        precision: str = "bfloat16",
         tpot: float = 50.0,
         check_interval: float = 0.01,
     ):
@@ -106,11 +106,11 @@ class DecodeMonitor:
 
         self.config = self._load_config(config_path)
         self.precision = precision.lower()
-
+        print(f'[WT] DecodeMonitor initialized with precision={self.precision}', flush=True)
         precision_map = {
-            "int8": 1, "fp8": 1,
-            "fp16": 2, "bf16": 2,
-            "fp32": 4
+            "int8": 1, "float8": 1,
+            "float16": 2, "bfloat16": 2,
+            "float32": 4
         }
         self.precision_bytes = precision_map.get(self.precision, 2)
         self.config.bytes_per_param = self.precision_bytes
@@ -120,15 +120,17 @@ class DecodeMonitor:
         self.mem_capacity = 80
         self.tpot = float(tpot)
 
-        if self.precision == "fp32":
+        if self.precision == "float32":
             self.peak_tflops = 19.5
-        elif self.precision in ["fp16", "bf16"]:
+        elif self.precision in ["float16", "bfloat16"]:
             self.peak_tflops = 312
-        elif self.precision in ["int8", "fp8"]:
+        elif self.precision in ["int8", "float8"]:
             self.peak_tflops = 624
         else:
             self.peak_tflops = 312
-
+        # print(f'[WARN]!!! llama-3-8b,gpu_utilization=0.8,max_kv_cache set 382832',flush=True)
+        # print(f'[WARN]!!! if modify model or gpu_utilization need to be changed')
+        # self.kv_cache=382832
         # ✅ 静态建模一次完成
         self.load_model = DecodeLoadModel(
             config=self.config,
@@ -220,7 +222,7 @@ class DecodeMonitor:
         if match: return float(match.group(1))
         return None
     
-    def calculate_load(self, n_requests: int, m_running_tokens: int):
+    def calculate_load(self, n_requests: int, m_running_tokens: int,kv_cache_usage: float):
         lm = self.load_model
 
         # -------- KV Cache --------
@@ -230,7 +232,7 @@ class DecodeMonitor:
             * lm.kv_dim
             * lm.precision_bytes
         )
-        total_vram = lm.weights_vram + kv_cache_vram + lm.act_vram
+        # total_vram = lm.weights_vram + kv_cache_vram + lm.act_vram
 
         # -------- Memory Access --------
         mem_access_bytes = lm.weights_vram + kv_cache_vram
@@ -246,12 +248,13 @@ class DecodeMonitor:
 
         load_compute = t_compute / lm.tpot
         load_memory = t_memory / lm.tpot
-        load_mem_capacity = (total_vram / 1e9) / lm.mem_capacity_gb
+        load_mem_capacity = kv_cache_usage
+        # load_mem_capacity = (total_vram / 1e9) / lm.mem_capacity_gb
 
         load_bottle = max(load_compute, load_memory, load_mem_capacity)
 
         return {
-            "VRAM_Usage_GB": total_vram / 1e9,
+            # "VRAM_Usage_GB": total_vram / 1e9,
             "Mem_Access_Step_GB": mem_access_bytes / 1e9,
             "Compute_Step_TFLOPs": total_flops / 1e12,
             "Arithmetic_Intensity": total_flops / mem_access_bytes,
@@ -261,7 +264,7 @@ class DecodeMonitor:
             "Load_Bottle": load_bottle,
             "kv_cache_vram": kv_cache_vram / 1e9,
             "weights_vram": lm.weights_vram/ 1e9,
-            "act_vram": lm.act_vram/ 1e9,
+            # "act_vram": lm.act_vram/ 1e9,
         }
     def select_best_instance(
         self,
@@ -301,11 +304,12 @@ class DecodeMonitor:
 
             running_tokens = int(stat.get("running_tokens", 0))
             running_requests = int(stat.get("running_requests", 0))
-
+            kv_cache_usage = float(stat.get("kv_usage", 0.0))
             # -------- Stage 1: instantaneous load --------
             load_dict = self.calculate_load(
                 n_requests=running_requests,
                 m_running_tokens=running_tokens,
+                kv_cache_usage=kv_cache_usage
             )
             load_now = load_dict["Load_Bottle"]
 
@@ -466,7 +470,7 @@ class DecodeMonitor:
 # 通过环境读取模型配置
 # global decode_profiler
 # decode_profiler = DecodeProfiler(config_path=os.environ.get("MODEL_CONFIG_PATH", "model_config.json"), precision="fp32",tpot=os.environ.get("TPOT", 50.0))
-monitor = DecodeMonitor(config_path=os.environ.get("MODEL_CONFIG_PATH", "model_config.json"), precision="fp32",tpot=os.environ.get("TPOT", 'tpot:50').split(':')[1],check_interval=0.5)
+monitor = DecodeMonitor(config_path=os.environ.get("MODEL_CONFIG_PATH", "model_config.json"), precision=os.environ.get("VLLM_DTYPE", 'bf16'),tpot=os.environ.get("TPOT", 'tpot:50').split(':')[1],check_interval=0.5)
 
 @app.before_serving
 async def start_monitor():

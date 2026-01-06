@@ -179,7 +179,7 @@ class Scheduler(SchedulerInterface):
         self.running_tokens = 0
         self.running_predict_tokens = 0
         self.waiting_tokens = 0
-
+        # [WT] end
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -213,9 +213,6 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
-            # [WT]prometheus 2026-01-04 13:28:01
-            # if request is not None and request.predictor_meta:
-            #     logger.info("RUNNING request %s", request.predictor_meta)
             num_new_tokens = (request.num_tokens_with_spec +
                               request.num_output_placeholders -
                               request.num_computed_tokens)
@@ -630,8 +627,6 @@ class Scheduler(SchedulerInterface):
         if events:
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
-        if len(self.waiting) > 0:
-            logger.info(f'[WT] len(waiting))={len(self.waiting)}, ')
         self._update_after_schedule(scheduler_output)
         return scheduler_output
 
@@ -1028,6 +1023,7 @@ class Scheduler(SchedulerInterface):
                 self.running_predict_tokens += max(1, req.predictor_meta['predict_output_len']-req.num_computed_tokens)
             for req in self.waiting:
                 self.waiting_tokens =self.waiting_tokens+req.num_prompt_tokens+req.predictor_meta['predict_output_len']
+        # [WT] end
         if (stats := self.make_stats(spec_decoding_stats,
                                      kv_connector_stats)) is not None:
             # Return stats to only one of the front-ends.
@@ -1213,6 +1209,7 @@ class Scheduler(SchedulerInterface):
                               running_tokens=self.running_tokens,
                               running_predict_tokens=self.running_predict_tokens,
                               waiting_tokens=self.waiting_tokens
+                              # [WT] end
                               )
 
     def make_spec_decoding_stats(

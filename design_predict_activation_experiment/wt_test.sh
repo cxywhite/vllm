@@ -4,9 +4,11 @@ set -euo pipefail
 USE_PASTFUTURE_SCHEDULER="false"  # 或者 "false"
 USE_ACTIVATION_PREDICTOR="true"  # 或者 "false"
 USE_CUSTOM_PROXY="true"
+USE_AIMD_SCHEDULER="true"
 #这里设置为float32以匹配预测器
-VLLM_DTYPE=${VLLM_DTYPE:-float32}  # float16 or bfloat16
+VLLM_DTYPE=${VLLM_DTYPE:-bfloat16}  # float16 or bfloat16
 # 这些参数设置是为了在benchmark中测试请求预测时使用
+DECODE_METRICS_PORTS=${DECODE_METRICS_PORTS:-9400,9401,9402,9403}
 BENCH_TEMPERATURE=${BENCH_TEMPERATURE:-0.8}
 BENCH_TOP_P=${BENCH_TOP_P:-0.7}
 BENCH_TOP_K=${BENCH_TOP_K:-50}
@@ -25,7 +27,7 @@ mkdir -p "$CONFIG_DIR" "$LOG_DIR"   "$RESULT_DIR"
 PROXY_PORT=${PROXY_PORT:-28001}
 
 # Prefill instances: comma-separated lists (GPU ids, ports, kv-ports optional)
-PREFILL_GPUS=${PREFILL_GPUS:-5}
+PREFILL_GPUS=${PREFILL_GPUS:-0}
 PREFILL_PORTS=${PREFILL_PORTS:-22002}
 PREFILL_KV_PORTS=${PREFILL_KV_PORTS:-22010}
 PREFILL_GPU_MEMORY_UTILIZATION=${PREFILL_GPU_MEMORY_UTILIZATION:-0.8}
@@ -35,10 +37,10 @@ PREFILL_TENSOR_PARALLEL_SIZE=${PREFILL_TENSOR_PARALLEL_SIZE:-1}
 # DECODE_GPUS=${DECODE_GPUS:-4,6}
 # DECODE_PORTS=${DECODE_PORTS:-22020,22021}
 # DECODE_KV_PORTS=${DECODE_KV_PORTS:-22030,22031}
-DECODE_GPUS=${DECODE_GPUS:-6}
+DECODE_GPUS=${DECODE_GPUS:-1}
 DECODE_PORTS=${DECODE_PORTS:-22020}
 DECODE_KV_PORTS=${DECODE_KV_PORTS:-22030}
-DECODE_GPU_MEMORY_UTILIZATION=${DECODE_GPU_MEMORY_UTILIZATION:-0.7}
+DECODE_GPU_MEMORY_UTILIZATION=${DECODE_GPU_MEMORY_UTILIZATION:-0.8}
 DECODE_TENSOR_PARALLEL_SIZE=${DECODE_TENSOR_PARALLEL_SIZE:-1}
 
 # KV transfer template (can be tuned)
@@ -58,18 +60,21 @@ DECODE_VLLM_MAX_NUM_BATCHED_TOKENS=${DECODE_VLLM_MAX_NUM_BATCHED_TOKENS:-1024}
 VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-1024}
 
 # Benchmark script and parameters
-BENCH_SCRIPT=${BENCH_SCRIPT:-../../../benchmarks/benchmark_serving_baseline.py}
+BENCH_SCRIPT=${BENCH_SCRIPT:-/root/predict-schedule/vllm/benchmarks/benchmark_serving_baseline.py}
 BENCH_PORT=${BENCH_PORT:-22006}
 BENCH_MODEL=${BENCH_MODEL:-$MODEL}
 BENCH_DATASET_NAME=${BENCH_DATASET_NAME:-custom}
 # BENCH_DATASET_PATH=${BENCH_DATASET_PATH:-/root/predict-schedule/baseline_experiment/pastfuture/dataset/lmsys-50k-filtered}
+
 BENCH_DATASET_PATH=${BENCH_DATASET_PATH:-/root/predict-schedule/baseline_experiment/pastfuture/dataset/lmsys-50k-filtered-with-sample}
+# BENCH_DATASET_PATH=${BENCH_DATASET_PATH:-/root/.cache/huggingface/hub/datasets--shibing624--sharegpt_gpt4/snapshots/3fb53354e02a931777556fb1da37e931d73af48a/sharegpt_gpt4.jsonl}
 BENCH_MAX_CONCURRENCY=${BENCH_MAX_CONCURRENCY:-1024}
-BENCH_REQUEST_RATE=${BENCH_REQUEST_RATE:-1}
+BENCH_REQUEST_RATE=${BENCH_REQUEST_RATE:-128}
 BENCH_GOODPUT=${BENCH_GOODPUT:-tpot:50}
 SAVE_OUTPUT=${SAVE_OUTPUT:-True}
 # Batchsize sweep (comma-separated list)
-NUM_PROMPTS_LIST=${NUM_PROMPTS_LIST:-"16,128,256,280,300,320,360,400,440,480,512"}
+# NUM_PROMPTS_LIST=${NUM_PROMPTS_LIST:-"16,128,256,280,300,320,360,400,440,480,512"}
+NUM_PROMPTS_LIST=${NUM_PROMPTS_LIST:-"1024,2048,4096,8192"}
 SLEEP_BETWEEN_RUNS=${SLEEP_BETWEEN_RUNS:-5}
 
 # Misc
@@ -293,6 +298,8 @@ cleanup() {
     # if [ "$USE_ACTIVATION_PREDICTOR" = "true" ]; then
     #     rm /root/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_handle/*
     # fi
+    # rm /root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/experiment_result/log/*
+    # echo "Cleaned up log files."
     echo "Cleanup finished. Exiting."
     exit 0
 }
@@ -333,7 +340,7 @@ start_servers() {
 
     # Start proxy with setsid + bash -c 'exec ...' so $! is the real process PID
     echo "Starting proxy server on port $PROXY_PORT..."
-    setsid bash -c "exec python3 \"$PROXY_SCRIPT\"" &> "${LOG_DIR}/proxy_${timestamp}.log" &
+    setsid env VLLM_DTYPE="${VLLM_DTYPE}" MODEL_CONFIG_PATH="${MODEL}/config.json" TPOT="${BENCH_GOODPUT}" bash -c "exec python3 \"$PROXY_SCRIPT\"" &> "${LOG_DIR}/proxy_${timestamp}.log" &
     proxy_pid=$!
     proxy_pgid=$(ps -o pgid= -p "$proxy_pid" | tr -d ' ')
     echo "  proxy pid=$proxy_pid pgid=$proxy_pgid"
@@ -398,7 +405,7 @@ start_servers() {
         gpu_id=${DECODE_GPU_ARRAY[$i]}
         port=${DECODE_PORT_ARRAY[$i]:-$((20003 + i))}
         kv_port=${DECODE_KV_PORT_ARRAY[$i]:-$((22001 + i))}
-
+        metrics_port=${DECODE_METRICS_PORT_ARRAY[$i]}
         echo "  Decode server $((i+1)): GPU $gpu_id, Port $port, KV Port $kv_port"
         # 构建命令
         CMD="vllm serve \"$MODEL\" \
@@ -415,6 +422,9 @@ start_servers() {
         if [ "$USE_PASTFUTURE_SCHEDULER" = "true" ]; then
             CMD="$CMD --pastfuture-scheduler"
         fi
+        if [ "$USE_AIMD_SCHEDULER" = "true" ]; then
+            CMD="$CMD --aimd-scheduler"
+        fi
         # 条件添加 --activation_predictor 参数
         # if [ "$USE_ACTIVATION_PREDICTOR" = "true" ]; then
         #     CMD="$CMD --activation-predict"
@@ -424,7 +434,7 @@ start_servers() {
             '{\"kv_connector\":\"${KV_CONNECTOR}\",\"kv_role\":\"kv_consumer\",\"kv_buffer_size\":\"${KV_CONSUMER_BUFFER}\",\"kv_port\":\"$kv_port\",\"kv_connector_extra_config\":{\"proxy_ip\":\"0.0.0.0\",\"proxy_port\":\"${PROXY_PORT}\",\"http_port\":\"$port\",\"send_type\":\"${KV_SEND_TYPE}\",\"nccl_num_channels\":\"${KV_NCCL_CHANNELS}\"}}'"
 
         # 启动服务
-        setsid env VLLM_USE_V1=1 CUDA_VISIBLE_DEVICES="$gpu_id" bash -c "exec $CMD" \
+        setsid env DECODE_INSTANCE_ID="decode-${i}" DECODE_METRICS_PORT="$metrics_port" VLLM_USE_V1=1 CUDA_VISIBLE_DEVICES="$gpu_id" bash -c "exec $CMD" \
             > "${LOG_DIR}/decode${i}_$(date +%Y%m%d_%H%M%S).log" 2>&1 &
         pid=$!
         pgid=$(ps -o pgid= -p "$pid" | tr -d ' ')
@@ -457,7 +467,7 @@ IFS=',' read -ra PREFILL_KV_PORT_ARRAY <<< "$PREFILL_KV_PORTS"
 IFS=',' read -ra DECODE_GPU_ARRAY <<< "$DECODE_GPUS"
 IFS=',' read -ra DECODE_PORT_ARRAY <<< "$DECODE_PORTS"
 IFS=',' read -ra DECODE_KV_PORT_ARRAY <<< "$DECODE_KV_PORTS"
-
+IFS=',' read -ra DECODE_METRICS_PORT_ARRAY <<< "$DECODE_METRICS_PORTS"
 # Set traps for signals (SIGINT from Ctrl+C, SIGTERM, EXIT)
 trap cleanup INT TERM EXIT
 

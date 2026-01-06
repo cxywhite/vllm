@@ -336,6 +336,7 @@ class Processor:
         data_parallel_rank: Optional[int] = None,
         # [WT]prometheus 2026-01-04 12:29:43
         predictor_meta: Optional[dict[str, Any]] = None,
+        # [WT] end
     ) -> tuple[Optional[str], EngineCoreRequest]:
         # logger.info(f'HJT 444')
         # TODO(woosuk): Support pooling models.
@@ -460,6 +461,7 @@ class Processor:
             trace_headers=trace_headers,
             # [WT]prometheus 2026-01-04 12:31:32
             predictor_meta=predictor_meta,
+            # [WT] end
         )
 
     def _validate_model_inputs(self, encoder_inputs: Optional[SingletonInputs],

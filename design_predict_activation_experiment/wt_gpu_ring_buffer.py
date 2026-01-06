@@ -29,12 +29,12 @@ class GPURingBuffer:
         self.hidden = torch.empty(
             (num_slots, max_tokens, hidden_dim),
             device=device,
-            dtype=torch.float32
+            dtype=torch.bfloat16
         )
         self.importance = torch.empty(
             (num_slots, max_tokens),
             device=device,
-            dtype=torch.float32
+            dtype=torch.bfloat16
         )
         # ===== CPU control plane =====
         self.num_tokens = np.zeros(num_slots, dtype=np.int32)
@@ -60,7 +60,7 @@ class GPURingBuffer:
                     hidden_states: torch.Tensor,  # [N, hidden_dim]
                     importance: torch.Tensor,      # [N]
                     meta: list[Custom_Metadata]):
-
+        # print(f'[WT] GPURingBuffer {hidden_states.dtype}', flush=True)
         n = hidden_states.shape[0]
         assert n <= self.max_tokens, \
             f"num_tokens {n} > slot capacity {self.max_tokens}"

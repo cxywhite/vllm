@@ -50,7 +50,7 @@ class SchedulerStats:
     running_tokens: int = 0
     running_predict_tokens: int = 0
     waiting_tokens: int = 0
-
+    # [WT] end
 @dataclass
 class LoRAStats:
     waiting_requests: set[str] = field(default_factory=set)

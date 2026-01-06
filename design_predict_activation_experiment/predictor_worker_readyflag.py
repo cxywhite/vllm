@@ -16,13 +16,36 @@ from design_predict_activation_experiment.wt_metadata import Custom_Metadata
 import pickle
 import os
 import zmq
+import logging
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format="%(asctime)s [%(levelname)s] %(message)s",
+#     handlers=[logging.StreamHandler(sys.stderr)]
+# )
 class BertLengthDistributionModel_B(torch.nn.Module):
     def __init__(self, config, model_name, input_dim, hidden_dim, n_classes):
         super().__init__()
         self.config = config
-        self.bert = BertModel.from_pretrained(model_name,local_files_only=True)
-        self.register_buffer('cls_inputs_embeds', self.bert.embeddings.word_embeddings(torch.tensor([101])).detach())
-        self.register_buffer('sep_inputs_embeds', self.bert.embeddings.word_embeddings(torch.tensor([102])).detach())
+        self.bert = BertModel.from_pretrained(
+            model_name,
+            local_files_only=True,
+            torch_dtype=torch.bfloat16
+        )
+        with torch.no_grad():
+            cls_id = torch.tensor([101], device=self.bert.device)
+            sep_id = torch.tensor([102], device=self.bert.device)
+
+            self.register_buffer(
+                'cls_inputs_embeds',
+                self.bert.embeddings.word_embeddings(cls_id)
+                    .to(dtype=torch.bfloat16)
+            )
+            self.register_buffer(
+                'sep_inputs_embeds',
+                self.bert.embeddings.word_embeddings(sep_id)
+                    .to(dtype=torch.bfloat16)
+            )
+
         
         self.proj = nn.Linear(input_dim, self.config.hidden_size)
 
@@ -38,6 +61,7 @@ class BertLengthDistributionModel_B(torch.nn.Module):
         self.embedding_topk = nn.Embedding(6, self.config.hidden_size)
         self.embedding_repetition_penalty = nn.Embedding(6, self.config.hidden_size)
         self.RMSNorm=nn.RMSNorm(normalized_shape=768, eps=1e-6)
+        self.to(dtype=torch.bfloat16)
     def get_index_temperature(self,sampling_params):
         if round(float(sampling_params),2)==0.20:
             return 0
@@ -96,6 +120,11 @@ class BertLengthDistributionModel_B(torch.nn.Module):
             return 5
     
     def forward(self, inputs_embeds, attention_mask, input_length,sampling_params):
+
+        # print(f'[WT]<<<: {inputs_embeds.dtype}')
+        inputs_embeds = inputs_embeds.to(dtype=torch.bfloat16)
+        assert inputs_embeds.dtype == self.proj.weight.dtype, \
+        f"dtype mismatch: inputs {inputs_embeds.dtype}, weight {self.proj.weight.dtype}"
         inputs_embeds = self.proj(inputs_embeds)
         temperature=sampling_params['temperature']
         temperature_indices = torch.tensor([self.get_index_temperature(t) for t in temperature], dtype=torch.long, device=inputs_embeds.device)
@@ -145,9 +174,10 @@ class PredictorWorker:
         self.config = AutoConfig.from_pretrained(self.model_dir,local_files_only=True)
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.predictor = BertLengthDistributionModel_B(self.config, 'bert-base-uncased',self.input_dim, self.hidden_dim, self.num_classes).to(self.device)
+        self.predictor.load_state_dict(torch.load('/root/myshare/predict_project/act_predictor_train/results/train_llama3-8b_act-15_max-8192_top-510_bert_H512_cls_10K_20251220-053810/model.pth'))#/root/myshare/predict_project/input_ids_predictor_use/model_weight/qwen_model.pth    
+        self.predictor = self.predictor.to(dtype=torch.bfloat16)
         self.predictor.eval()
         # 加载预训练权重（如果有）
-        self.predictor.load_state_dict(torch.load('/root/myshare/predict_project/act_predictor_train/results/train_llama3-8b_act-15_max-8192_top-510_bert_H512_cls_10K_20251220-053810/model.pth'))#/root/myshare/predict_project/input_ids_predictor_use/model_weight/qwen_model.pth    
         print(f"✅ PredictorWorker initialized on {next(self.predictor.parameters()).device}")
         print(f"   Model size: {sum(p.numel() for p in self.predictor.parameters()) / 1e6:.2f}M parameters")
         # -------- ZMQ INIT --------
@@ -176,6 +206,7 @@ class PredictorWorker:
 
             try:
                 hidden_flat, importance_flat,meta = self.ring.read_batch(slot)
+                # print(f'[WT] 222 {hidden_flat.dtype}')
                 self._run_predict(hidden_flat,importance_flat, meta)
             finally:
                 self.ring.release_slot(slot)
@@ -237,32 +268,40 @@ class PredictorWorker:
             batch_size,
             max_len + 2,
             hidden_dim,
-            device=device
+            device=device,
+            dtype=torch.bfloat16
+            
         )
-
+        # print(f'[WT] 333: {inputs_embeds.dtype}')
         attention_mask = torch.zeros(
             batch_size,
             max_len + 2,
             device=device,
-            dtype=torch.long
+            dtype=torch.bfloat16
         )
-
+        attention_mask = attention_mask.to(dtype=torch.bfloat16)
         for i, seq in enumerate(req_seqs):
             L = seq.shape[0]
             inputs_embeds[i, 1:1+L] = seq
             attention_mask[i, :L+2] = 1
 
-        lengths = torch.tensor(lengths, device=device)
+        lengths = torch.tensor(lengths, device=device, dtype=torch.long)
         sampling_params = {
                         'temperature': temp_list,
                         'topp': topp_list,
                         'topk': topk_list,
                         'repetition_penalty': repetition_penalty_list
                     }
+        attention_mask = attention_mask.to(
+            device=inputs_embeds.device,
+            dtype=torch.bfloat16
+        )
         with torch.no_grad():
             logits = self.predictor(inputs_embeds, attention_mask, lengths, sampling_params)
             # print(f"[WT] Predictor logits shape: {logits.shape}, values: {logits} predictor_worker_readyflag.py")
-            probabilities = F.softmax(logits, dim=-1)
+            # probabilities = F.softmax(logits, dim=-1)
+            probabilities = F.softmax(logits, dim=-1).to(torch.bfloat16)
+
             print(f"[WT] Predictor probabilities: {probabilities} predictor_worker_readyflag.py")
             # [ 393. 1145. 7775. 8167.]20%, 40%, 60%, 80% 分位数
             # bucket_stats = [
@@ -272,9 +311,9 @@ class PredictorWorker:
             #     { "low": 7775, "high": 8167, "mean": 8078 },
             #     { "low": 8167, "high": 8190, "mean": 8179 },
             # ]
-            bucket_high=torch.tensor([393,1145,7775,8167,8190],device=device)
-            bucket_mean=torch.tensor([219,645,3680,8078,8179],device=device)
-            lambdas=torch.tensor([0.2, 0.2, 0.5, 0.8, 1.0],device=device)
+            bucket_high=torch.tensor([393,1145,7775,8167,8190],device=device,dtype=torch.bfloat16)
+            bucket_mean=torch.tensor([219,645,3680,8078,8179],device=device,dtype=torch.bfloat16)
+            lambdas=torch.tensor([0.2, 0.2, 0.5, 0.8, 1.0],device=device,dtype=torch.bfloat16)
             mu_eff = (1 - lambdas) * bucket_mean + lambdas * bucket_high
             
             predict_len=(probabilities * mu_eff).sum(dim=-1)

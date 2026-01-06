@@ -226,6 +226,7 @@ class LlamaAttention(nn.Module):
         activate_predict:Optional[bool]=None,
         # [WT] end
     ) -> torch.Tensor:
+        # logger.info(f"[HJT]&&& LlamaAttention forward")
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
@@ -239,7 +240,7 @@ class LlamaAttention(nn.Module):
             token_importance = torch.zeros(
                 hidden_states.size(0),
                 device=hidden_states.device,
-                dtype=torch.float32
+                dtype=torch.bfloat16
             )
             for meta in my_metadata:
                 start, end = meta.token_range
@@ -412,7 +413,7 @@ class LlamaDecoderLayer(nn.Module):
 # [WT]predict activation 2025-12-22 22:17:54
 import numpy as np
 import sys
-sys.path.append('/root/vllm')
+sys.path.append('/root/predict-schedule/vllm')
 from examples.online_serving.disaggregated_serving_p2p_nccl_xpyd.wt_gpu_ring_buffer import GPURingBuffer
 from examples.online_serving.disaggregated_serving_p2p_nccl_xpyd.predictor_worker_readyflag import PredictorWorker
 import pickle
@@ -517,7 +518,7 @@ class LlamaModel(nn.Module):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
             # [WT]predict activation 2025-12-22 22:19:42
-            if activate_predict and kv_role is not None and kv_role=='kv_producer'and my_metadata is not None and idx==15 :
+            if activate_predict and kv_role is not None and kv_role=='kv_producer' and my_metadata is not None and idx==15 :
                 hidden_states, residual,token_importance = layer(positions, hidden_states, residual,my_metadata=my_metadata,activate_predict=activate_predict)
                 assert token_importance is not None
                 # 传输hidden_states和my_metadata到gpu buffer
@@ -542,7 +543,7 @@ class LlamaModel(nn.Module):
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
-        logger.info(f'[WT] LlamaModel forward output hidden_states: {hidden_states}')
+        # logger.info(f'[WT] LlamaModel forward output hidden_states: {hidden_states}')
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str,
@@ -737,7 +738,7 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
             model_output = self.model(input_ids, positions, intermediate_tensors,
                                     inputs_embeds)
         # [WT] end
-        logger.info(f'[WT] LlamaForCausalLM forward model_output: {model_output}')
+        # logger.info(f'[WT] LlamaForCausalLM forward model_output: {model_output}')
         return model_output
 
     def compute_logits(
