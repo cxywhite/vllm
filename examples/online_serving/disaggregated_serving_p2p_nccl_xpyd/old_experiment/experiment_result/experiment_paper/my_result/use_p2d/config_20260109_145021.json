@@ -1,0 +1,48 @@
+{
+  "generated_at": "2026-01-09T14:50:21+00:00",
+  "model": "/root/.cache/huggingface/hub/Meta-Llama-3-8B-Instruct",
+  "timeout_seconds": 1200,
+  "proxy_port": 29002,
+  "prefill_gpus": ["4"],
+  "decode_gpus": ["5","6","7"],
+  "prefill_ports": ["25001"],
+  "decode_ports": ["25020","25021","25022"],
+  "prefill_kv_ports": ["25010"],
+  "decode_kv_ports": ["25030","25031","25032"],
+  "prefill_gpu_memory_utilization": 0.8,
+  "decode_gpu_memory_utilization": 0.8,
+  "kv_transfer_config": {
+    "kv_connector": "P2pNcclConnector",
+    "producer_buffer": "1e1",
+    "consumer_buffer": "8e9",
+    "nccl_num_channels": 8,
+    "send_type": "PUT_ASYNC"
+  },
+  "vllm_options": {
+    "enforce_eager": true,
+    "seed": 42,
+    "dtype": "bfloat16",
+    "max_model_len": 8192,
+    "prefill_max_num_batched_tokens": 8192,
+    "decode_max_num_batched_tokens": 1024,
+    "max_num_seqs": 1024
+  },
+  "benchmark": {
+    "bench_script": "/root/predict-schedule/vllm/benchmarks/benchmark_serving_baseline.py",
+    "output_path": "./experiment_result/dataset_result",
+    "bench_port": 25007,
+    "endpoint": "/v1/completions",
+    "dataset_name": "custom",
+    "dataset_path": "/root/predict-schedule/baseline_experiment/pastfuture/dataset/lmsys-50k-filtered
+-with-newid",
+    "max_concurrency": 1024,
+    "request_rate": "4",
+    "temperature": 0.8,
+    "top_p": 0.7,
+    "top_k": 50,
+    "repetition_penalty": 1.0,
+    "goodput": "tpot:50",
+    "num_prompts_list": ["1024","2048","4096","8192"]
+  },
+  "notes": "Config generated from environment / header settings"
+}

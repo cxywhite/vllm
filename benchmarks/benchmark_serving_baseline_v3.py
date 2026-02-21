@@ -1,0 +1,1945 @@
+# # SPDX-License-Identifier: Apache-2.0
+# # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# import sys
+
+# if __name__ == "__main__":
+#     print("""DEPRECATED: This script has been moved to the vLLM CLI.
+
+# Please use the following command instead:
+#     vllm bench serve
+
+# For help with the new command, run:
+#     vllm bench serve --help
+
+# Alternatively, you can run the new command directly with:
+#     python -m vllm.entrypoints.cli.main bench serve --help
+# """)
+#     sys.exit(1)
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+r"""Benchmark online serving throughput.
+
+On the server side, run one of the following commands:
+    vLLM OpenAI API server
+    vllm serve <your_model> \
+        --swap-space 16 \
+        --disable-log-requests
+
+On the client side, run:
+    python benchmarks/benchmark_serving.py \
+        --backend <backend> \
+        --model <your_model> \
+        --dataset-name sharegpt \
+        --dataset-path <path to dataset> \
+        --request-rate <request_rate> \ # By default <request_rate> is inf
+        --num-prompts <num_prompts> # By default <num_prompts> is 1000
+
+    when using tgi backend, add
+        --endpoint /generate_stream
+    to the end of the command above.
+"""
+
+import argparse
+import asyncio
+import gc
+import json
+import os
+import random
+import time
+import warnings
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Literal, Optional
+
+import numpy as np
+from tqdm.asyncio import tqdm
+from transformers import PreTrainedTokenizerBase
+
+from backend_request_func import (
+    ASYNC_REQUEST_FUNCS,
+    OPENAI_COMPATIBLE_BACKENDS,
+    RequestFuncInput,
+    RequestFuncOutput,
+)
+
+try:
+    from vllm.transformers_utils.tokenizer import get_tokenizer
+except ImportError:
+    from backend_request_func import get_tokenizer
+
+try:
+    from vllm.utils import FlexibleArgumentParser
+except ImportError:
+    from argparse import ArgumentParser as FlexibleArgumentParser
+
+from benchmark_dataset import (
+    AIMODataset,
+    ASRDataset,
+    BurstGPTDataset,
+    ConversationDataset,
+    CustomDataset,
+    HuggingFaceDataset,
+    InstructCoderDataset,
+    MTBenchDataset,
+    NextEditPredictionDataset,
+    RandomDataset,
+    SampleRequest,
+    ShareGPTDataset,
+    SonnetDataset,
+    VisionArenaDataset,
+)
+from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
+from vllm.benchmarks.serve import get_request
+
+MILLISECONDS_TO_SECONDS_CONVERSION = 1000
+
+from customfunction import load_and_prepare_dataset,ensure_id_column_from_df,extract_first_human_prompt,save_outputs_grouped_csv_by_base_reqid,save_test_outputs,save_full_outputs,save_sample
+import pdb
+from transformers import AutoTokenizer, AutoConfig
+import csv
+import json
+import os
+import sys
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+from datasets import load_from_disk
+from datasets import load_dataset
+import pandas as pd
+from datasets import concatenate_datasets
+@dataclass
+class BenchmarkMetrics:
+    completed: int
+    total_input: int
+    total_output: int
+    request_throughput: float
+    request_goodput: float
+    output_throughput: float
+    total_token_throughput: float
+    mean_ttft_ms: float
+    median_ttft_ms: float
+    std_ttft_ms: float
+    percentiles_ttft_ms: list[tuple[float, float]]
+    mean_tpot_ms: float
+    median_tpot_ms: float
+    std_tpot_ms: float
+    percentiles_tpot_ms: list[tuple[float, float]]
+    mean_itl_ms: float
+    median_itl_ms: float
+    std_itl_ms: float
+    percentiles_itl_ms: list[tuple[float, float]]
+    # E2EL stands for end-to-end latency per request.
+    # It is the time taken on the client side from sending
+    # a request to receiving a complete response.
+    mean_e2el_ms: float
+    median_e2el_ms: float
+    std_e2el_ms: float
+    percentiles_e2el_ms: list[tuple[float, float]]
+    # [WT] 2025-07-25 17:08:49
+    min_input_len: Optional[float] = None
+    max_input_len: Optional[float] = None
+    mean_input_len: Optional[float] = None
+    p50_input_len: Optional[float] = None
+    p99_input_len: Optional[float] = None
+    min_output_len: Optional[float] = None
+    max_output_len: Optional[float] = None
+    mean_output_len: Optional[float] = None
+    p50_output_len: Optional[float] = None
+    p99_output_len: Optional[float] = None
+    output_token_goodput: Optional[float] = None
+    total_token_goodput: Optional[float] = None
+
+def calculate_metrics(
+    input_requests: list[SampleRequest],
+    outputs: list[RequestFuncOutput],
+    dur_s: float,
+    tokenizer: PreTrainedTokenizerBase,
+    selected_percentile_metrics: list[str],
+    selected_percentiles: list[float],
+    goodput_config_dict: dict[str, float],
+) -> tuple[BenchmarkMetrics, list[int]]:
+    actual_output_lens: list[int] = []
+    total_input = 0
+    completed = 0
+    good_completed = 0
+    itls: list[float] = []
+    tpots: list[float] = []
+    all_tpots: list[float] = []
+    ttfts: list[float] = []
+    e2els: list[float] = []
+    # [WT] 2025-07-25 16:53:03
+    my_input_len_list: list[int] = []
+    input_lens_aligned: list[int] = []
+    for i in range(len(outputs)):
+        if outputs[i].success:
+            output_len = outputs[i].output_tokens
+
+            if not output_len:
+                # We use the tokenizer to count the number of output tokens
+                # for some serving backends instead of looking at
+                # len(outputs[i].itl) since multiple output tokens may be
+                # bundled together
+                # Note : this may inflate the output token count slightly
+                output_len = len(
+                    tokenizer(
+                        outputs[i].generated_text, add_special_tokens=False
+                    ).input_ids
+                )
+            actual_output_lens.append(output_len)
+            total_input += input_requests[i].prompt_len
+            input_lens_aligned.append(input_requests[i].prompt_len)  # aligned entry
+            # [WT] 2025-07-25 16:55:39
+            my_input_len_list.append(input_requests[i].prompt_len)
+            tpot = 0
+            if output_len > 1:
+                latency_minus_ttft = outputs[i].latency - outputs[i].ttft
+                tpot = latency_minus_ttft / (output_len - 1)
+                tpots.append(tpot)
+            # Note: if output_len <= 1, we regard tpot as 0 for goodput
+            all_tpots.append(tpot)
+            itls += outputs[i].itl
+            ttfts.append(outputs[i].ttft)
+            e2els.append(outputs[i].latency)
+            completed += 1
+        else:
+            actual_output_lens.append(0)
+            input_lens_aligned.append(0)  # keep alignment for failed requests
+    # compute per-request "good" flags if goodput SLOs provided
+    good_output_tokens = 0
+    good_total_tokens = 0
+    is_good_list: list[bool] = []
+    if goodput_config_dict:
+        valid_metrics = []
+        slo_values = []
+
+        if "ttft" in goodput_config_dict:
+            valid_metrics.append(ttfts)
+            slo_values.append(
+                goodput_config_dict["ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION
+            )
+        if "tpot" in goodput_config_dict:
+            valid_metrics.append(all_tpots)
+            slo_values.append(
+                goodput_config_dict["tpot"] / MILLISECONDS_TO_SECONDS_CONVERSION
+            )
+        if "e2el" in goodput_config_dict:
+            valid_metrics.append(e2els)
+            slo_values.append(
+                goodput_config_dict["e2el"] / MILLISECONDS_TO_SECONDS_CONVERSION
+            )
+
+        for req_metric in zip(*valid_metrics):
+            is_good_req = all([s >= r for s, r in zip(slo_values, req_metric)])
+            if is_good_req:
+                good_completed += 1
+        
+        success_idx = 0
+        for i in range(len(outputs)):
+            if not outputs[i].success:
+                is_good_list.append(False)
+                continue
+            # build metric tuple for this successful request
+            req_metric_vals = []
+            for metric_arr in valid_metrics:
+                # each metric_arr has entries in the same order as successful outputs
+                req_metric_vals.append(metric_arr[success_idx])
+            success_idx += 1
+            # compare slo_values vs req_metric_vals (SLO values <= metric means success in original logic)
+            is_good = all([s >= r for s, r in zip(slo_values, req_metric_vals)])
+            is_good_list.append(is_good)
+
+        # aggregate token counts for good requests
+        good_completed = sum(1 for g in is_good_list if g)
+        # actual_output_lens and input_lens_aligned are aligned with outputs
+        good_output_tokens = sum(
+            actual_output_lens[i] for i, g in enumerate(is_good_list) if g
+        )
+        good_total_tokens = sum(
+            (input_lens_aligned[i] + actual_output_lens[i])
+            for i, g in enumerate(is_good_list)
+            if g
+        )
+    else:
+        # no goodput SLO: leave is_good_list empty and good_* as zero
+        is_good_list = [False] * len(outputs)
+        good_output_tokens = 0
+        good_total_tokens = 0
+    
+    if completed == 0:
+        warnings.warn(
+            "All requests failed. This is likely due to a misconfiguration "
+            "on the benchmark arguments.",
+            stacklevel=2,
+        )
+    # existing stats for input/output lengths use successful-only lists -- build that:
+    successful_input_lens = [l for l in input_lens_aligned if l > 0]
+    # [WT] 2025-07-25 17:02:39
+    min_input_len=float(np.min(my_input_len_list))
+    max_input_len=float(np.max(my_input_len_list))
+    mean_input_len=float(np.mean(my_input_len_list))
+    p50_input_len=float(np.median(my_input_len_list))
+    p99_input_len=float(np.percentile(my_input_len_list,99))
+    min_output_len=float(np.min(actual_output_lens))
+    max_output_len=float(np.max(actual_output_lens))
+    mean_output_len=float(np.mean(actual_output_lens))
+    p50_output_len=float(np.median(actual_output_lens))
+    p99_output_len=float(np.percentile(actual_output_lens,99))
+    metrics = BenchmarkMetrics(
+        completed=completed,
+        total_input=total_input,
+        total_output=sum(actual_output_lens),
+        request_throughput=completed / dur_s,
+        request_goodput=good_completed / dur_s,
+        output_throughput=sum(actual_output_lens) / dur_s,
+        total_token_throughput=(total_input + sum(actual_output_lens)) / dur_s,
+        mean_ttft_ms=np.mean(ttfts or 0)
+        * 1000,  # ttfts is empty if streaming is not supported by backend
+        std_ttft_ms=np.std(ttfts or 0) * 1000,
+        median_ttft_ms=np.median(ttfts or 0) * 1000,
+        percentiles_ttft_ms=[
+            (p, np.percentile(ttfts or 0, p) * 1000) for p in selected_percentiles
+        ],
+        mean_tpot_ms=np.mean(tpots or 0) * 1000,
+        std_tpot_ms=np.std(tpots or 0) * 1000,
+        median_tpot_ms=np.median(tpots or 0) * 1000,
+        percentiles_tpot_ms=[
+            (p, np.percentile(tpots or 0, p) * 1000) for p in selected_percentiles
+        ],
+        mean_itl_ms=np.mean(itls or 0) * 1000,
+        std_itl_ms=np.std(itls or 0) * 1000,
+        median_itl_ms=np.median(itls or 0) * 1000,
+        percentiles_itl_ms=[
+            (p, np.percentile(itls or 0, p) * 1000) for p in selected_percentiles
+        ],
+        mean_e2el_ms=np.mean(e2els or 0) * 1000,
+        std_e2el_ms=np.std(e2els or 0) * 1000,
+        median_e2el_ms=np.median(e2els or 0) * 1000,
+        percentiles_e2el_ms=[
+            (p, np.percentile(e2els or 0, p) * 1000) for p in selected_percentiles
+        ],
+        # new token-goodput fields (tokens per second)
+        output_token_goodput=(good_output_tokens / dur_s) if dur_s > 0 else 0.0,
+        total_token_goodput=(good_total_tokens / dur_s) if dur_s > 0 else 0.0,
+        min_input_len=min_input_len,
+        max_input_len=max_input_len,
+        mean_input_len=mean_input_len,
+        p50_input_len=p50_input_len,
+        p99_input_len=p99_input_len,
+        min_output_len=min_output_len,
+        max_output_len=max_output_len,
+        mean_output_len=mean_output_len,
+        p50_output_len=p50_output_len,
+        p99_output_len=p99_output_len,
+    )
+
+    return metrics, actual_output_lens
+
+
+async def benchmark(
+    backend: str,
+    api_url: str,
+    base_url: str,
+    model_id: str,
+    model_name: str,
+    tokenizer: PreTrainedTokenizerBase,
+    input_requests: list[SampleRequest],
+    logprobs: Optional[int],
+    request_rate: float,
+    burstiness: float,
+    disable_tqdm: bool,
+    profile: bool,
+    selected_percentile_metrics: list[str],
+    selected_percentiles: list[float],
+    ignore_eos: bool,
+    goodput_config_dict: dict[str, float],
+    max_concurrency: Optional[int],
+    lora_modules: Optional[Iterable[str]],
+    extra_body: Optional[dict],
+    ramp_up_strategy: Optional[Literal["linear", "exponential"]] = None,
+    ramp_up_start_rps: Optional[int] = None,
+    ramp_up_end_rps: Optional[int] = None,
+):
+    if backend in ASYNC_REQUEST_FUNCS:
+        request_func = ASYNC_REQUEST_FUNCS[backend]
+    else:
+        raise ValueError(f"Unknown backend: {backend}")
+
+    # print("Starting initial single prompt test run...")
+    # test_prompt, test_prompt_len, test_output_len, test_mm_content = (
+    #     input_requests[0].prompt,
+    #     input_requests[0].prompt_len,
+    #     10,
+    #     input_requests[0].multi_modal_data,
+    # )
+
+    # assert test_mm_content is None or isinstance(test_mm_content, dict)
+    # test_input = RequestFuncInput(
+    #     model=model_id,
+    #     model_name=model_name,
+    #     prompt=test_prompt,
+    #     api_url=api_url,
+    #     prompt_len=test_prompt_len,
+    #     output_len=test_output_len,
+    #     logprobs=logprobs,
+    #     multi_modal_content=test_mm_content,
+    #     ignore_eos=ignore_eos,
+    #     extra_body=extra_body,
+    # )
+
+    # test_output = await request_func(request_func_input=test_input)
+    # if not test_output.success:
+    #     raise ValueError(
+    #         "Initial test run failed - Please make sure benchmark arguments "
+    #         f"are correctly specified. Error: {test_output.error}"
+    #     )
+    # else:
+    #     print("Initial test run completed. Starting main benchmark run...")
+
+    if lora_modules:
+        # For each input request, choose a LoRA module at random.
+        lora_modules = iter(
+            [random.choice(lora_modules) for _ in range(len(input_requests))]
+        )
+
+    if profile:
+        print("Starting profiler...")
+        profile_input = RequestFuncInput(
+            model=model_id,
+            model_name=model_name,
+            prompt=test_prompt,
+            api_url=base_url + "/start_profile",
+            prompt_len=test_prompt_len,
+            output_len=test_output_len,
+            logprobs=logprobs,
+            multi_modal_content=test_mm_content,
+            ignore_eos=ignore_eos,
+            extra_body=extra_body,
+        )
+        profile_output = await request_func(request_func_input=profile_input)
+        if profile_output.success:
+            print("Profiler started")
+
+    distribution = "Poisson process" if burstiness == 1.0 else "Gamma distribution"
+
+    if ramp_up_strategy is not None:
+        print(
+            f"Traffic ramp-up strategy: {ramp_up_strategy}. Will increase "
+            f"RPS from {ramp_up_start_rps} to {ramp_up_end_rps} RPS over "
+            "the duration of the benchmark."
+        )
+    else:
+        print(f"Traffic request rate: {request_rate} RPS.")
+
+    print(f"Burstiness factor: {burstiness} ({distribution})")
+    print(f"Maximum request concurrency: {max_concurrency}")
+
+    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+
+    # This can be used once the minimum Python version is 3.10 or higher,
+    # and it will simplify the code in limited_request_func.
+    #    semaphore = (asyncio.Semaphore(max_concurrency)
+    #                 if max_concurrency else contextlib.nullcontext())
+    semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
+
+    async def limited_request_func(request_func_input, pbar):
+        if semaphore is None:
+            return await request_func(request_func_input=request_func_input, pbar=pbar)
+        async with semaphore:
+            return await request_func(request_func_input=request_func_input, pbar=pbar)
+
+    benchmark_start_time = time.perf_counter()
+    tasks: list[asyncio.Task] = []
+
+    rps_change_events = []
+    last_int_rps = -1
+    if ramp_up_strategy is not None and ramp_up_start_rps is not None:
+        last_int_rps = ramp_up_start_rps
+        rps_change_events.append(
+            {
+                "rps": last_int_rps,
+                "timestamp": datetime.now().isoformat(),
+            }
+        )
+
+    async for request, current_request_rate in get_request(
+        input_requests,
+        request_rate,
+        burstiness,
+        ramp_up_strategy,
+        ramp_up_start_rps,
+        ramp_up_end_rps,
+    ):
+        if ramp_up_strategy is not None:
+            current_int_rps = int(current_request_rate)
+            if current_int_rps > last_int_rps:
+                timestamp = datetime.now().isoformat()
+                for rps_val in range(last_int_rps + 1, current_int_rps + 1):
+                    rps_change_events.append({"rps": rps_val, "timestamp": timestamp})
+                last_int_rps = current_int_rps
+
+        prompt, prompt_len, output_len, mm_content = (
+            request.prompt,
+            request.prompt_len,
+            request.expected_output_len,
+            request.multi_modal_data,
+        )
+        req_model_id, req_model_name = model_id, model_name
+        if lora_modules:
+            req_lora_module = next(lora_modules)
+            req_model_id, req_model_name = req_lora_module, req_lora_module
+
+        # request_func_input = RequestFuncInput(
+        #     model=req_model_id,
+        #     model_name=req_model_name,
+        #     prompt=prompt,
+        #     api_url=api_url,
+        #     prompt_len=prompt_len,
+        #     output_len=output_len,
+        #     logprobs=logprobs,
+        #     multi_modal_content=mm_content,
+        #     ignore_eos=ignore_eos,
+        #     extra_body=extra_body,
+        #     req_id=request.req_id
+        # )
+        sampling_params = {
+            "max_tokens": request.expected_output_len,
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "top_k": request.top_k,
+            "repetition_penalty": request.repetition_penalty,
+        }
+        request_func_input = RequestFuncInput(
+            model=req_model_id,
+            model_name=req_model_name,
+            prompt=prompt,
+            api_url=api_url,
+            prompt_len=prompt_len,
+            output_len=output_len,
+            logprobs=logprobs,
+            multi_modal_content=mm_content,
+            ignore_eos=ignore_eos,
+            extra_body=sampling_params,
+            req_id=request.req_id
+        )
+        
+        task = limited_request_func(request_func_input=request_func_input, pbar=pbar)
+        tasks.append(asyncio.create_task(task))
+    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+    # if args.save_output:
+    #     result_paths = save_outputs_grouped_csv_by_base_reqid(outputs, out_path=args.out_path,run_config=vars(args))
+    #     print("Saved:", result_paths)
+    if args.save_output:
+        result_paths1 = save_test_outputs(outputs, out_path=args.out_path)
+        result_paths2 = save_outputs_grouped_csv_by_base_reqid(outputs, out_path=args.out_path,run_config=vars(args))
+        print("Saved result_paths1:", result_paths1)
+        print("Saved result_paths2:", result_paths2)
+    if profile:
+        print("Stopping profiler...")
+        profile_input = RequestFuncInput(
+            model=model_id,
+            prompt=test_prompt,
+            api_url=base_url + "/stop_profile",
+            prompt_len=test_prompt_len,
+            output_len=test_output_len,
+            logprobs=logprobs,
+        )
+        profile_output = await request_func(request_func_input=profile_input)
+        if profile_output.success:
+            print("Profiler stopped")
+
+    if pbar is not None:
+        pbar.close()
+
+    benchmark_duration = time.perf_counter() - benchmark_start_time
+
+    metrics, actual_output_lens = calculate_metrics(
+        input_requests=input_requests,
+        outputs=outputs,
+        dur_s=benchmark_duration,
+        tokenizer=tokenizer,
+        selected_percentile_metrics=selected_percentile_metrics,
+        selected_percentiles=selected_percentiles,
+        goodput_config_dict=goodput_config_dict,
+    )
+
+    print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
+    print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+    print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
+    print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
+    print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
+    # [WT] 2025-07-25 16:49:55
+    print("{:<40} {:<10}".format("Min_input_len:", metrics.min_input_len))
+    print("{:<40} {:<10}".format("Max_input_len:", metrics.max_input_len))
+    print("{:<40} {:<10}".format("Mean_input_len:", metrics.mean_input_len))
+    print("{:<40} {:<10}".format("P50_input_len:", metrics.p50_input_len))
+    print("{:<40} {:<10}".format("P99_input_len:", metrics.p99_input_len))
+    print("{:<40} {:<10}".format("Min_output_len:", metrics.min_output_len))
+    print("{:<40} {:<10}".format("Max_output_len:", metrics.max_output_len))
+    print("{:<40} {:<10}".format("Mean_output_len:", metrics.mean_output_len))
+    print("{:<40} {:<10}".format("P50_output_len:", metrics.p50_output_len))
+    print("{:<40} {:<10}".format("P99_output_len:", metrics.p99_output_len))
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Request throughput (req/s):", metrics.request_throughput
+        )
+    )
+    if goodput_config_dict:
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Request goodput (req/s):", metrics.request_goodput
+            )
+        )
+        print("{:<40} {:<10.2f}".format("Output token goodput (tok/s):", metrics.output_token_goodput))
+        print("{:<40} {:<10.2f}".format("Total token goodput (tok/s):", metrics.total_token_goodput))
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Output token throughput (tok/s):", metrics.output_throughput
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Total Token throughput (tok/s):", metrics.total_token_throughput
+        )
+    )
+
+    result = {
+        "duration": benchmark_duration,
+        "completed": metrics.completed,
+        "total_input_tokens": metrics.total_input,
+        "total_output_tokens": metrics.total_output,
+        "request_throughput": metrics.request_throughput,
+        "request_goodput": metrics.request_goodput if goodput_config_dict else None,
+        "output_throughput": metrics.output_throughput,
+        "total_token_throughput": metrics.total_token_throughput,
+        "output_token_goodput": metrics.output_token_goodput,
+        "total_token_goodput": metrics.total_token_goodput,
+        "input_lens": [output.prompt_len for output in outputs],
+        "output_lens": actual_output_lens,
+        "ttfts": [output.ttft for output in outputs],
+        "itls": [output.itl for output in outputs],
+        "generated_texts": [output.generated_text for output in outputs],
+        "errors": [output.error for output in outputs],
+    }
+
+    if rps_change_events:
+        result["rps_change_events"] = rps_change_events
+
+    def process_one_metric(
+        # E.g., "ttft"
+        metric_attribute_name: str,
+        # E.g., "TTFT"
+        metric_name: str,
+        # E.g., "Time to First Token"
+        metric_header: str,
+    ):
+        # This function prints and adds statistics of the specified
+        # metric.
+        if metric_attribute_name not in selected_percentile_metrics:
+            return
+        print("{s:{c}^{n}}".format(s=metric_header, n=50, c="-"))
+        print(
+            "{:<40} {:<10.2f}".format(
+                f"Mean {metric_name} (ms):",
+                getattr(metrics, f"mean_{metric_attribute_name}_ms"),
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                f"Median {metric_name} (ms):",
+                getattr(metrics, f"median_{metric_attribute_name}_ms"),
+            )
+        )
+        result[f"mean_{metric_attribute_name}_ms"] = getattr(
+            metrics, f"mean_{metric_attribute_name}_ms"
+        )
+        result[f"median_{metric_attribute_name}_ms"] = getattr(
+            metrics, f"median_{metric_attribute_name}_ms"
+        )
+        result[f"std_{metric_attribute_name}_ms"] = getattr(
+            metrics, f"std_{metric_attribute_name}_ms"
+        )
+        for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}_ms"):
+            p_word = str(int(p)) if int(p) == p else str(p)
+            print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):", value))
+            result[f"p{p_word}_{metric_attribute_name}_ms"] = value
+
+    process_one_metric("ttft", "TTFT", "Time to First Token")
+    process_one_metric("tpot", "TPOT", "Time per Output Token (excl. 1st token)")
+    process_one_metric("itl", "ITL", "Inter-token Latency")
+    process_one_metric("e2el", "E2EL", "End-to-end Latency")
+
+    print("=" * 50)
+
+    return result
+
+
+def check_goodput_args(args):
+    # Check and parse goodput arguments
+    goodput_config_dict = {}
+    VALID_NAMES = ["ttft", "tpot", "e2el"]
+    if args.goodput:
+        goodput_config_dict = parse_goodput(args.goodput)
+        for slo_name, slo_val in goodput_config_dict.items():
+            if slo_name not in VALID_NAMES:
+                raise ValueError(
+                    f"Invalid metric name found, {slo_name}: {slo_val}. "
+                    "The service level objective name should be one of "
+                    f"{str(VALID_NAMES)}. "
+                )
+            if slo_val < 0:
+                raise ValueError(
+                    f"Invalid value found, {slo_name}: {slo_val}. "
+                    "The service level objective value should be "
+                    "non-negative."
+                )
+    return goodput_config_dict
+
+
+def parse_goodput(slo_pairs):
+    goodput_config_dict = {}
+    try:
+        for slo_pair in slo_pairs:
+            slo_name, slo_val = slo_pair.split(":")
+            goodput_config_dict[slo_name] = float(slo_val)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError(
+            "Invalid format found for service level objectives. "
+            'Specify service level objectives for goodput as "KEY:VALUE" '
+            "pairs, where the key is a metric name, and the value is a "
+            "number in milliseconds."
+        ) from err
+    return goodput_config_dict
+
+
+def save_to_pytorch_benchmark_format(
+    args: argparse.Namespace, results: dict[str, Any], file_name: str
+) -> None:
+    metrics = [
+        "median_ttft_ms",
+        "mean_ttft_ms",
+        "std_ttft_ms",
+        "p99_ttft_ms",
+        "mean_tpot_ms",
+        "median_tpot_ms",
+        "std_tpot_ms",
+        "p99_tpot_ms",
+        "median_itl_ms",
+        "mean_itl_ms",
+        "std_itl_ms",
+        "p99_itl_ms",
+    ]
+    # These raw data might be useful, but they are rather big. They can be added
+    # later if needed
+    ignored_metrics = ["ttfts", "itls", "generated_texts", "errors"]
+    pt_records = convert_to_pytorch_benchmark_format(
+        args=args,
+        metrics={k: [results[k]] for k in metrics},
+        extra_info={
+            k: results[k]
+            for k in results
+            if k not in metrics and k not in ignored_metrics
+        },
+    )
+    if pt_records:
+        # Don't use json suffix here as we don't want CI to pick it up
+        pt_file = f"{os.path.splitext(file_name)[0]}.pytorch.json"
+        write_to_json(pt_file, pt_records)
+
+
+def main(args: argparse.Namespace):
+    print(args)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    backend = args.backend
+    model_id = args.model
+    model_name = args.served_model_name
+    tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
+    tokenizer_mode = args.tokenizer_mode
+
+    # Validate ramp-up arguments
+    if args.ramp_up_strategy is not None:
+        if args.request_rate != float("inf"):
+            raise ValueError(
+                "When using ramp-up, do not specify --request-rate. "
+                "The request rate will be controlled by ramp-up parameters. "
+                "Please remove the --request-rate argument."
+            )
+        if args.ramp_up_start_rps is None or args.ramp_up_end_rps is None:
+            raise ValueError(
+                "When using --ramp-up-strategy, both --ramp-up-start-rps and "
+                "--ramp-up-end-rps must be specified"
+            )
+        if args.ramp_up_start_rps < 0 or args.ramp_up_end_rps < 0:
+            raise ValueError("Ramp-up start and end RPS must be non-negative")
+        if args.ramp_up_start_rps > args.ramp_up_end_rps:
+            raise ValueError("Ramp-up start RPS must be less than end RPS")
+        if args.ramp_up_strategy == "exponential" and args.ramp_up_start_rps == 0:
+            raise ValueError("For exponential ramp-up, the start RPS cannot be 0.")
+
+    if args.base_url is not None:
+        api_url = f"{args.base_url}{args.endpoint}"
+        base_url = f"{args.base_url}"
+    else:
+        api_url = f"http://{args.host}:{args.port}{args.endpoint}"
+        base_url = f"http://{args.host}:{args.port}"
+
+    tokenizer = get_tokenizer(
+        tokenizer_id,
+        tokenizer_mode=tokenizer_mode,
+        trust_remote_code=args.trust_remote_code,
+    )
+
+    if args.dataset_name is None:
+        raise ValueError(
+            "Please specify '--dataset-name' and the corresponding "
+            "'--dataset-path' if required."
+        )
+
+    if args.dataset_name == "custom" or args.dataset_name == "mysharegpt" or args.dataset_name == "lmsyschat" or args.dataset_name == "qwen" or args.dataset_name == "qwen_new":
+        print(f"准备加载数据集: {args.dataset_name}")
+        default_max_pos = 2048
+        max_pos = default_max_pos
+        if AutoConfig is not None and tokenizer_id is not None:
+            try:
+                config = AutoConfig.from_pretrained(tokenizer_id, trust_remote_code=True)
+                max_pos = getattr(config, 'max_position_embeddings', max_pos)
+                print(f'tokenizer_id={tokenizer_id}')
+                print(f"加载模型配置成功，模型声明 max_position_embeddings={max_pos}")
+            except Exception as e:
+                print(f"读取 AutoConfig 失败，使用默认 max_pos={max_pos}: {e}")
+                max_pos = default_max_pos
+        max_pos = min(int(max_pos), 131072)
+        print(f"最终使用 max_pos={max_pos}")
+
+        # max_embedding_pos 可由 args.max_embedding_pos 覆盖
+        max_embedding_pos = getattr(args, 'max_embedding_pos', max_pos)
+        max_embedding_pos = min(int(max_embedding_pos), 131072)
+
+        # 全局 maxtokenscustom（fallback）
+        maxtokenscustom_global = getattr(args, 'maxtokenscustom', None) or 1024
+
+        # ------------------ 2) tokenize_len helper ------------------
+        def tokenize_len(text: str) -> int:
+            if text is None:
+                return 0
+            text = str(text)
+            try:
+                if tokenizer is not None:
+                    maybe = tokenizer(text, add_special_tokens=True)
+                    if isinstance(maybe, dict) and 'input_ids' in maybe:
+                        return len(maybe['input_ids'])
+                    if hasattr(tokenizer, 'encode'):
+                        ids = tokenizer.encode(text, add_special_tokens=True)
+                        return len(ids)
+            except Exception:
+                pass
+
+            try:
+                if AutoTokenizer is None:
+                    raise RuntimeError("transformers.AutoTokenizer 未可用")
+                if tokenizer_id is None:
+                    raise RuntimeError("没有提供 tokenizer_id 用于回退 AutoTokenizer")
+                local_tok = AutoTokenizer.from_pretrained(
+                    tokenizer_id, use_fast=True, trust_remote_code=True
+                )
+                maybe = local_tok(text, add_special_tokens=True)
+                return len(maybe['input_ids'])
+            except Exception:
+                return len(text)
+
+        # ------------------ 3) 加载数据集 ------------------
+        ds_path = getattr(args, 'dataset_path', None)
+        if not ds_path:
+            raise RuntimeError("args.dataset_path 未设置")
+
+        if args.dataset_name == "custom":
+            print(f"加载 HF 本地数据集: {ds_path}")
+            try:
+                ds = load_from_disk(ds_path)
+                print(f"数据集加载成功，样本数: {len(ds)}")
+                # # 随机选择500条
+                # ds = ds.shuffle(seed=args.seed).select(range(min(500, len(ds))))
+            except Exception as e:
+                raise RuntimeError(f"加载 HF 数据集失败: {e}") from e
+
+            try:
+                df = ds.to_pandas()
+            except Exception:
+                rows = []
+                for record in ds:
+                    try:
+                        rows.append(dict(record))
+                    except Exception:
+                        rows.append({"prompt": str(record)})
+                df = pd.DataFrame(rows)
+
+            df['prompt'] = df['prompt'].astype(str)
+            original_count = len(df)
+            df = df[df['prompt'].str.strip() != ''].reset_index(drop=True)
+            valid_count = len(df)
+            print(f"过滤空 prompt: {original_count} -> {valid_count} 条有效记录")
+            if valid_count == 0:
+                raise ValueError("错误: 数据集中未找到有效的 human prompt。")
+
+        elif args.dataset_name == "mysharegpt" or args.dataset_name == "qwen_new":
+            target_file = []
+            if os.path.isdir(ds_path):
+                print(f"检测到目录: {ds_path}，正在查找 json 文件...")
+                priority_files = [
+                    "sharegpt_gpt4.jsonl",
+                    "sharegpt_V3_format.jsonl",
+                    "sharegpt_zh_38K_format.jsonl",
+                ]
+                found = False
+                for fname in priority_files:
+                    fpath = os.path.join(ds_path, fname)
+                    if os.path.exists(fpath):
+                        target_file.append(fpath)
+                        found = True
+                        print(f"找到优先文件: {fpath}")
+
+                if not found:
+                    print("未找到优先文件，正在查找目录下所有json/jsonl文件...")
+                    for fname in os.listdir(ds_path):
+                        if fname.endswith('.json') or fname.endswith('.jsonl'):
+                            fpath = os.path.join(ds_path, fname)
+                            target_file.append(fpath)
+                            print(f"找到文件: {fpath}")
+
+            if not target_file:
+                raise RuntimeError(f"在目录 {ds_path} 中未找到任何 json/jsonl 文件")
+
+            print(f"正在加载 ShareGPT 文件: {target_file}")
+
+            try:
+                total_ds = []
+                for tfile in target_file:
+                    ds0 = load_dataset("json", data_files=tfile, split="train")
+                    print(f"文件 {tfile} 加载成功，样本数: {len(ds0)}")
+                    total_ds.append(ds0)
+
+                if len(total_ds) > 1:
+                    ds = concatenate_datasets(total_ds)
+                    print(f"成功合并 {len(total_ds)} 个数据集，总样本数: {len(ds)}")
+                else:
+                    ds = total_ds[0]
+            except Exception as e:
+                raise RuntimeError(f"加载 JSON 失败: {e}") from e
+            
+            d_temp = getattr(args, 'temperature', 1.0)
+            d_top_p = getattr(args, 'top_p', 1.0)
+            d_top_k = getattr(args, 'top_k', -1)
+            d_rep_pen = getattr(args, 'repetition_penalty', 1.0)
+
+            parsed_rows = []
+            print("正在解析 ShareGPT 对话格式...")
+            for record in ds:
+                convs = record.get('conversations', [])
+                if not convs:
+                    continue
+
+                prompt_text = ""
+                for turn in convs:
+                    if turn.get('from') in ['human', 'user']:
+                        prompt_text = turn.get('value', '')
+                        break
+
+                if not prompt_text.strip():
+                    continue
+                # d_temp在[0.8,1.0]中随机取值
+                d_temp = random.choice([0.80, 1.00])
+                # d_top_p在[0.7,0.9,1.0]中随机取值
+                d_top_p = random.choice([0.70, 0.90, 1.00])
+                # d_top_k在[-1,500,10000]中随机取值
+                d_top_k = random.choice([-1, 500, 10000])
+                # d_rep_pen在[1.0,1.1]
+                d_rep_pen = random.choice([1.00, 1.10])
+                parsed_rows.append({
+                    "id": record.get('id', None),
+                    "prompt": prompt_text,
+                    "temperature": d_temp,
+                    "topp": d_top_p,
+                    "topk": d_top_k,
+                    "repetition_penalty": d_rep_pen
+                })
+
+            df = pd.DataFrame(parsed_rows)
+            valid_count = len(df)
+        elif args.dataset_name == "lmsyschat":
+            # ------------------ 1) 加载 LMSYS-Chat 数据集 ------------------
+            if not os.path.exists(ds_path):
+                raise RuntimeError(f"LMSYS-Chat 数据集路径不存在: {ds_path}")
+
+            print(f"正在从磁盘加载 LMSYS-Chat 数据集: {ds_path}")
+            try:
+                ds = load_from_disk(ds_path)
+                print(f"LMSYS-Chat 数据集加载成功，样本数: {len(ds)}")
+            except Exception as e:
+                raise RuntimeError(f"load_from_disk 失败: {e}") from e
+
+            # ------------------ 2) 采样参数默认值（与 ShareGPT 一致） ------------------
+            d_temp = getattr(args, 'temperature', 1.0)
+            d_top_p = getattr(args, 'top_p', 1.0)
+            d_top_k = getattr(args, 'top_k', -1)
+            d_rep_pen = getattr(args, 'repetition_penalty', 1.0)
+
+            # ------------------ 3) 构造 parsed_rows ------------------
+            parsed_rows = []
+            print("正在解析 LMSYS-Chat 数据集...")
+
+            for record in ds:
+                prompt_text = record.get("prompt", None)
+                if not prompt_text or not str(prompt_text).strip():
+                    continue
+
+                # 优先使用数据集自带的 input_tokens
+                if "input_length" in record and record["input_length"] is not None:
+                    prompt_tokens = int(record["input_length"])
+                else:
+                    # 兜底：极端情况下重新 tokenize
+                    prompt_tokens = tokenize_len(prompt_text)
+
+                # 与 ShareGPT 完全一致的随机策略
+                d_temp = random.choice([0.80, 1.00])
+                d_top_p = random.choice([0.70, 0.90, 1.00])
+                d_top_k = random.choice([-1, 500, 10000])
+                d_rep_pen = random.choice([1.00, 1.10])
+
+                parsed_rows.append({
+                    "id": record.get("id", None),
+                    "prompt": prompt_text,
+                    "prompt_tokens": prompt_tokens,
+                    "temperature": d_temp,
+                    "topp": d_top_p,
+                    "topk": d_top_k,
+                    "repetition_penalty": d_rep_pen,
+                })
+
+            df = pd.DataFrame(parsed_rows)
+            valid_count = len(df)
+            print(f"LMSYS-Chat 有效样本数: {valid_count}")
+
+            if valid_count == 0:
+                raise ValueError("LMSYS-Chat 数据集中未解析出任何有效 prompt。")
+        elif args.dataset_name == "qwen":
+            input_requests: List[SampleRequest] = []
+            print(f'处理 qwen模型 数据集，加载 baseline_csv_path: {args.baseline_csv_path}')
+            maxtokenscustom_global=32768
+            # 1. 获取目录路径
+            baseline_dir = os.path.dirname(args.baseline_csv_path)
+            
+            # 2. 在同目录下查找以 sampled_requests 开头的文件（最初的方法）
+            sampled_files = [f for f in os.listdir(baseline_dir) 
+                            if f.startswith('sampled_requests') and f.endswith('.csv')]
+            
+            if not sampled_files:
+                raise FileNotFoundError(f"No sampled_requests file found in directory: {baseline_dir}")
+            
+            # 取第一个匹配的文件（通常只有一个）
+            sample_filename = sampled_files[0]
+            sample_path = os.path.join(baseline_dir, sample_filename)
+            print(f"Found sampled_requests file: {sample_path}")
+            
+            # 3. 读取两个 CSV 文件
+            test_df = pd.read_csv(args.baseline_csv_path)
+            sample_df = pd.read_csv(sample_path)
+            
+            # 4. 创建高效的映射字典（一次性完成所有映射）
+            # 合并两个 DataFrame 以确保数据一致性
+            merged_df = pd.merge(
+                test_df[['req_id', 'output_tokens']].astype({'req_id': str}),
+                sample_df[['req_id','prompt','temperature', 'top_p', 'top_k', 'repetition_penalty']].astype({'req_id': str}),
+                on='req_id',
+                how='inner'
+            )
+            
+            # 转换为字典映射（性能最优）
+            req_info_map = merged_df.set_index('req_id').to_dict('index')
+            # 遍历req_info_map
+            for rid, info in req_info_map.items():
+                prompt_text = str(info['prompt'])
+                prompt_token_len = tokenize_len(prompt_text)
+                # 更新 expected_output_len 为 custom_max_tokens
+                if args.qwen_vllm:
+                    print(f'使用 qwen_vllm 计算 custom_max_tokens')
+                    custom_max_tokens = max(
+                        1,
+                        min(32 * 1024 - int(prompt_token_len), int(maxtokenscustom_global))
+                    )
+                else:
+                    custom_max_tokens = int(info['output_tokens'])
+                input_requests.append(SampleRequest(
+                    req_id=rid,
+                    prompt=prompt_text,
+                    prompt_len=prompt_token_len,
+                    expected_output_len=int(custom_max_tokens),
+                    temperature=float(info['temperature']),
+                    top_p=float(info['top_p']),
+                    top_k=int(info['top_k']),
+                    repetition_penalty=float(info['repetition_penalty']),
+                ))
+            # #  shuffle input_requests 保持随机性
+            # random.seed(42)
+            # random.shuffle(input_requests)
+            # 随机可复现选择500条进行测试
+            if len(input_requests) > 500:
+                random.seed(42)
+                input_requests = random.sample(input_requests, 500)
+                print(f'随机抽样至 500 条进行测试')
+            # 打印前几条更新结果进行验证
+            for i, req in enumerate(input_requests[:3]):
+                print(f"Updated Request {i}: req_id={req.req_id}, "
+                    f"expected_output_len={req.expected_output_len}, "
+                    f"temperature={req.temperature}, top_p={req.top_p}, "
+                    f"top_k={req.top_k}, repetition_penalty={req.repetition_penalty}")
+        # 如果dataset_name不是qwen继续下面的处理
+        if args.dataset_name != "qwen":
+            print(f'不是qwen数据集，继续后续处理')
+            # ------------------ 5) 计算 prompt_tokens 并按长度区间过滤 ------------------
+            df['prompt_tokens'] = df['prompt'].apply(lambda x: tokenize_len(x))
+
+            # 新增：用户指定的输入长度区间
+            min_prompt_tokens = int(getattr(args, 'min_prompt_tokens', 0))
+            # 修复：将 float('inf') 替换为一个足够大的整数 10**9 表示无限制
+            max_prompt_tokens = int(getattr(args, 'max_prompt_tokens', 32768))
+
+            before_range_count = len(df)
+            df = df[
+                (df['prompt_tokens'] >= min_prompt_tokens) &
+                (df['prompt_tokens'] <= max_prompt_tokens)
+            ].reset_index(drop=True)
+            after_range_count = len(df)
+
+            print(
+                f"按输入长度区间过滤: [{min_prompt_tokens}, {max_prompt_tokens}] "
+                f"{before_range_count} -> {after_range_count}"
+            )
+            if after_range_count == 0:
+                raise ValueError("在指定的 prompt_tokens 长度区间内没有可用样本。")
+
+            # 原有 8192 安全阈值过滤（保持不变）
+            if args.test_model == 'llama':
+                filtered_df = df[df['prompt_tokens'] < 8192].reset_index(drop=True)
+                filtered_count = len(filtered_df)
+                print(f"过滤长 prompt: {after_range_count} -> {filtered_count} 条记录 (阈值=8192)")
+            # 都设置成8192过滤筛选数据可以保证筛选的数据和llama测试时一致
+            elif args.test_model == 'qwen':
+                filtered_df = df[df['prompt_tokens'] < 32768].reset_index(drop=True)
+                filtered_count = len(filtered_df)
+                print(f"过滤长 prompt: {after_range_count} -> {filtered_count} 条记录 (阈值=32768)")
+                # print(f'[error]')
+            else:
+                filtered_df = df[df['prompt_tokens'] < max_embedding_pos].reset_index(drop=True)
+                filtered_count = len(filtered_df)
+                print(f"过滤长 prompt: {after_range_count} -> {filtered_count} 条记录 (阈值={max_embedding_pos})")
+            if filtered_count == 0:
+                raise ValueError("过滤后没有可用的 prompt：所有 prompt 超过模型的最大长度限制。")
+
+            # ------------------ 6) 抽样（按 args.num_prompts） ------------------
+            num_prompts = getattr(args, 'num_prompts', None)
+            if num_prompts is None:
+                sample_size = filtered_count
+                print(f"args.num_prompts 未设置，使用全部 {sample_size} 条样本")
+            else:
+                if filtered_count < int(num_prompts):
+                    print(
+                        f"警告: 过滤后只有 {filtered_count} 条记录，"
+                        f"少于请求的 {num_prompts} 条；将使用所有样本"
+                    )
+                    sample_size = filtered_count
+                else:
+                    sample_size = int(num_prompts)
+
+            sample_df = filtered_df.sample(
+                n=sample_size,
+                random_state=getattr(args, 'seed', 0)
+            ).reset_index(drop=True)
+            print(f"抽样完成: {sample_size} 个样本")
+
+            # ------------------ 7) custom_max_tokens ------------------
+            if args.dataset_name == "qwen_new":
+                maxtokenscustom_global=32768
+                sample_df['custom_max_tokens'] = sample_df['prompt_tokens'].apply(
+                lambda input_len: max(
+                    1,
+                    min(32 * 1024 - int(input_len), int(maxtokenscustom_global))
+                    )
+                )
+            else:
+                sample_df['custom_max_tokens'] = sample_df['prompt_tokens'].apply(
+                    lambda input_len: max(
+                        1,
+                        min(8 * 1024 - int(input_len), int(maxtokenscustom_global))
+                    )
+                )
+
+            # ------------------ 8) 构建 SampleRequest ------------------
+            input_requests: List[SampleRequest] = []
+            for idx, row in sample_df.iterrows():
+                base_id = None
+                if 'id' in row and row['id'] is not None:
+                    try:
+                        base_id = str(_to_int_safe(row['id']))
+                    except Exception:
+                        base_id = str(row['id'])
+                if not base_id:
+                    base_id = f"row{idx}"
+
+                input_requests.append(
+                    SampleRequest(
+                        req_id=base_id,
+                        prompt=str(row['prompt']),
+                        prompt_len=int(row['prompt_tokens']),
+                        expected_output_len=int(row['custom_max_tokens']),
+                        temperature=round(row['temperature'], 2),
+                        top_p=round(row['topp'], 2),
+                        top_k=int(row['topk']),
+                        repetition_penalty=round(row['repetition_penalty'], 2),
+                    )
+                )
+            
+
+        if args.save_sample:
+            save_sample_path=save_sample(input_requests, args.out_path)
+            print(f"已保存采样参数样本至: {save_sample_path}")
+        print(f"构建 input_requests 完成：{len(input_requests)} 条请求")
+
+        if (args.all or args.ablation_p2d or args.ablation_decode or args.reproduce_baseline) and args.baseline_csv_path and args.dataset_name != "qwen":
+            print(f'不是qwen baseline，继续后续处理')
+            # 1. 获取目录路径
+            baseline_dir = os.path.dirname(args.baseline_csv_path)
+            
+            # 2. 在同目录下查找以 sampled_requests 开头的文件（最初的方法）
+            sampled_files = [f for f in os.listdir(baseline_dir) 
+                            if f.startswith('sampled_requests') and f.endswith('.csv')]
+            
+            if not sampled_files:
+                raise FileNotFoundError(f"No sampled_requests file found in directory: {baseline_dir}")
+            
+            # 取第一个匹配的文件（通常只有一个）
+            sample_filename = sampled_files[0]
+            sample_path = os.path.join(baseline_dir, sample_filename)
+            print(f"Found sampled_requests file: {sample_path}")
+            
+            # 3. 读取两个 CSV 文件
+            test_df = pd.read_csv(args.baseline_csv_path)
+            sample_df = pd.read_csv(sample_path)
+            
+            # 4. 创建高效的映射字典（一次性完成所有映射）
+            # 合并两个 DataFrame 以确保数据一致性
+            merged_df = pd.merge(
+                test_df[['req_id', 'output_tokens']].astype({'req_id': str}),
+                sample_df[['req_id', 'temperature', 'top_p', 'top_k', 'repetition_penalty']].astype({'req_id': str}),
+                on='req_id',
+                how='inner'
+            )
+            
+            # 转换为字典映射（性能最优）
+            req_info_map = merged_df.set_index('req_id').to_dict('index')
+            
+            # 5. 直接更新原始 input_requests 中的每个请求对象（关键：不创建副本）
+            not_found_reqs = []
+            for request in input_requests:
+                rid = str(request.req_id)
+                
+                if rid not in req_info_map:
+                    not_found_reqs.append(rid)
+                    continue
+                
+                info = req_info_map[rid]
+                
+                # 直接更新原始请求对象的属性（不是副本！）
+                request.expected_output_len = int(info['output_tokens'])
+                request.temperature = float(info['temperature'])
+                request.top_p = float(info['top_p'])
+                request.top_k = int(info['top_k'])
+                request.repetition_penalty = float(info['repetition_penalty'])
+            
+            # 6. 处理未找到的请求
+            if not_found_reqs:
+                print(f"Warning: {len(not_found_reqs)} req_ids not found in merged data: {not_found_reqs[:5]}...")
+                # 可选：只验证找到的请求数量
+                assert len(not_found_reqs) < len(input_requests), "Too many req_ids not found in baseline data"
+            else:
+                # 5. 验证所有请求都被更新
+                assert len(input_requests) == len(req_info_map), (
+                    f"Mismatch: input_requests has {len(input_requests)} requests, "
+                    f"but merged data has {len(req_info_map)} entries"
+                )
+            
+            # 打印前几条更新结果进行验证
+            for i, req in enumerate(input_requests[:3]):
+                print(f"Updated Request {i}: req_id={req.req_id}, "
+                    f"expected_output_len={req.expected_output_len}, "
+                    f"temperature={req.temperature}, top_p={req.top_p}, "
+                    f"top_k={req.top_k}, repetition_penalty={req.repetition_penalty}")
+            
+            print(f"✅ 成功更新 {len(input_requests) - len(not_found_reqs)} 个原始请求对象的所有属性")
+            if not_found_reqs:
+                print(f"⚠️  Warning: {len(not_found_reqs)} 个请求未找到对应数据")
+        
+    elif args.dataset_name == "sonnet":
+        dataset = SonnetDataset(dataset_path=args.dataset_path)
+        # For the "sonnet" dataset, formatting depends on the backend.
+        if args.backend == "openai-chat":
+            input_requests = dataset.sample(
+                num_requests=args.num_prompts,
+                input_len=args.sonnet_input_len,
+                output_len=args.sonnet_output_len,
+                prefix_len=args.sonnet_prefix_len,
+                tokenizer=tokenizer,
+                return_prompt_formatted=False,
+            )
+        else:
+            assert tokenizer.chat_template or tokenizer.default_chat_template, (
+                "Tokenizer/model must have chat template for sonnet dataset."
+            )
+            input_requests = dataset.sample(
+                num_requests=args.num_prompts,
+                input_len=args.sonnet_input_len,
+                output_len=args.sonnet_output_len,
+                prefix_len=args.sonnet_prefix_len,
+                tokenizer=tokenizer,
+                return_prompt_formatted=True,
+            )
+
+    elif args.dataset_name == "hf":
+        # all following datasets are implemented from the
+        # HuggingFaceDataset base class
+        if args.dataset_path in VisionArenaDataset.SUPPORTED_DATASET_PATHS:
+            dataset_class = VisionArenaDataset
+            args.hf_split = "train"
+            args.hf_subset = None
+        elif args.dataset_path in InstructCoderDataset.SUPPORTED_DATASET_PATHS:
+            dataset_class = InstructCoderDataset
+            args.hf_split = "train"
+        elif args.dataset_path in MTBenchDataset.SUPPORTED_DATASET_PATHS:
+            dataset_class = MTBenchDataset
+            args.hf_split = "train"
+        elif args.dataset_path in ConversationDataset.SUPPORTED_DATASET_PATHS:
+            dataset_class = ConversationDataset
+        elif args.dataset_path in AIMODataset.SUPPORTED_DATASET_PATHS:
+            dataset_class = AIMODataset
+            args.hf_split = "train"
+        elif args.dataset_path in NextEditPredictionDataset.SUPPORTED_DATASET_PATHS:  # noqa: E501
+            dataset_class = NextEditPredictionDataset
+            args.hf_split = "train"
+        elif args.dataset_path in ASRDataset.SUPPORTED_DATASET_PATHS:
+            dataset_class = ASRDataset
+            args.hf_split = "train"
+        else:
+            supported_datasets = set(
+                [
+                    dataset_name
+                    for cls in HuggingFaceDataset.__subclasses__()
+                    for dataset_name in cls.SUPPORTED_DATASET_PATHS
+                ]
+            )
+            raise ValueError(
+                f"Unsupported dataset path: {args.dataset_path}. "
+                "Huggingface dataset only supports dataset_path"
+                f" from one of following: {supported_datasets}. "
+                "Please consider contributing if you would "
+                "like to add support for additional dataset formats."
+            )
+
+        if dataset_class.IS_MULTIMODAL and backend not in [
+            "openai-chat",
+            "openai-audio",
+        ]:
+            # multi-modal benchmark is only available on OpenAI Chat backend.
+            raise ValueError(
+                "Multi-modal content is only supported on 'openai-chat' and "
+                "'openai-audio' backend."
+            )
+        input_requests = dataset_class(
+            dataset_path=args.dataset_path,
+            dataset_subset=args.hf_subset,
+            dataset_split=args.hf_split,
+            random_seed=args.seed,
+            no_stream=args.no_stream,
+        ).sample(
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            output_len=args.hf_output_len,
+        )
+
+    else:
+        # For datasets that follow a similar structure, use a mapping.
+        dataset_mapping = {
+            "sharegpt": lambda: ShareGPTDataset(
+                random_seed=args.seed, dataset_path=args.dataset_path
+            ).sample(
+                tokenizer=tokenizer,
+                num_requests=args.num_prompts,
+                output_len=args.sharegpt_output_len,
+            ),
+            "burstgpt": lambda: BurstGPTDataset(
+                random_seed=args.seed, dataset_path=args.dataset_path
+            ).sample(tokenizer=tokenizer, num_requests=args.num_prompts),
+            "random": lambda: RandomDataset(dataset_path=args.dataset_path).sample(
+                tokenizer=tokenizer,
+                num_requests=args.num_prompts,
+                prefix_len=args.random_prefix_len,
+                input_len=args.random_input_len,
+                output_len=args.random_output_len,
+                range_ratio=args.random_range_ratio,
+            ),
+        }
+
+        try:
+            input_requests = dataset_mapping[args.dataset_name]()
+            
+        except KeyError as err:
+            raise ValueError(f"Unknown dataset: {args.dataset_name}") from err
+    goodput_config_dict = check_goodput_args(args)
+
+    # Collect the sampling parameters.
+    sampling_params = {
+        k: v
+        for k, v in {
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "min_p": args.min_p,
+            "temperature": args.temperature,
+            "repetition_penalty":args.repetition_penalty
+        }.items()
+        if v is not None
+    }
+
+    # Sampling parameters are only supported by openai-compatible backend.
+    if sampling_params and args.backend not in OPENAI_COMPATIBLE_BACKENDS:
+        raise ValueError(
+            "Sampling parameters are only supported by openai-compatible backends."
+        )
+
+    if "temperature" not in sampling_params:
+        sampling_params["temperature"] = 0.0  # Default to greedy decoding.
+
+    if args.backend == "llama.cpp":
+        # Disable prompt caching in llama.cpp backend
+        sampling_params["cache_prompt"] = False
+
+    # Avoid GC processing "static" data - reduce pause times.
+    gc.collect()
+    gc.freeze()
+
+    benchmark_result = asyncio.run(
+        benchmark(
+            backend=backend,
+            api_url=api_url,
+            base_url=base_url,
+            model_id=model_id,
+            model_name=model_name,
+            tokenizer=tokenizer,
+            input_requests=input_requests,
+            logprobs=args.logprobs,
+            request_rate=args.request_rate,
+            burstiness=args.burstiness,
+            disable_tqdm=args.disable_tqdm,
+            profile=args.profile,
+            selected_percentile_metrics=args.percentile_metrics.split(","),
+            selected_percentiles=[float(p) for p in args.metric_percentiles.split(",")],
+            ignore_eos=args.ignore_eos,
+            goodput_config_dict=goodput_config_dict,
+            max_concurrency=args.max_concurrency,
+            lora_modules=args.lora_modules,
+            extra_body=sampling_params,
+            ramp_up_strategy=args.ramp_up_strategy,
+            ramp_up_start_rps=args.ramp_up_start_rps,
+            ramp_up_end_rps=args.ramp_up_end_rps,
+        )
+    )
+
+    # Save config and results to json
+    if args.save_result or args.append_result:
+        result_json: dict[str, Any] = {}
+
+        # Setup
+        current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+        result_json["date"] = current_dt
+        result_json["backend"] = backend
+        result_json["model_id"] = model_id
+        result_json["tokenizer_id"] = tokenizer_id
+        result_json["num_prompts"] = args.num_prompts
+
+        # Metadata
+        if args.metadata:
+            for item in args.metadata:
+                if "=" in item:
+                    kvstring = item.split("=")
+                    result_json[kvstring[0].strip()] = kvstring[1].strip()
+                else:
+                    raise ValueError(
+                        "Invalid metadata format. Please use KEY=VALUE format."
+                    )
+        # Traffic
+        result_json["request_rate"] = (
+            args.request_rate if args.request_rate < float("inf") else "inf"
+        )
+        result_json["burstiness"] = args.burstiness
+        result_json["max_concurrency"] = args.max_concurrency
+
+        if args.ramp_up_strategy is not None:
+            result_json["ramp_up_strategy"] = args.ramp_up_strategy
+            result_json["ramp_up_start_rps"] = args.ramp_up_start_rps
+            result_json["ramp_up_end_rps"] = args.ramp_up_end_rps
+
+        # Merge with benchmark result
+        result_json = {**result_json, **benchmark_result}
+
+        if not args.save_detailed:
+            # Remove fields with too many data points
+            for field in [
+                "input_lens",
+                "output_lens",
+                "ttfts",
+                "itls",
+                "generated_texts",
+                "errors",
+            ]:
+                if field in result_json:
+                    del result_json[field]
+                if field in benchmark_result:
+                    del benchmark_result[field]
+
+        # Save to file
+        base_model_id = model_id.split("/")[-1]
+        max_concurrency_str = (
+            f"-concurrency{args.max_concurrency}"
+            if args.max_concurrency is not None
+            else ""
+        )
+        if args.ramp_up_strategy is not None:
+            file_name = f"{backend}-ramp-up-{args.ramp_up_strategy}-{args.ramp_up_start_rps}qps-{args.ramp_up_end_rps}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"  # noqa
+        else:
+            file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"  # noqa
+        if args.result_filename:
+            file_name = args.result_filename
+        if args.result_dir:
+            os.makedirs(args.result_dir, exist_ok=True)
+            file_name = os.path.join(args.result_dir, file_name)
+        with open(
+            file_name, mode="a+" if args.append_result else "w", encoding="utf-8"
+        ) as outfile:
+            # Append a newline.
+            if args.append_result and outfile.tell() != 0:
+                outfile.write("\n")
+            json.dump(result_json, outfile)
+        save_to_pytorch_benchmark_format(args, result_json, file_name)
+
+
+def create_argument_parser():
+    parser = FlexibleArgumentParser(
+        description="Benchmark the online serving throughput."
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="vllm",
+        choices=list(ASYNC_REQUEST_FUNCS.keys()),
+    )
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        default=None,
+        help="Server or API base url if not using http host and port.",
+    )
+    # Use 127.0.0.1 here instead of localhost to force the use of ipv4
+    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--endpoint",
+        type=str,
+        default="/v1/completions",
+        help="API endpoint.",
+    )
+    parser.add_argument(
+        "--dataset-name",
+        type=str,
+        default="sharegpt",
+        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf", "custom","mysharegpt","lmsyschat","qwen","qwen_new"],
+        help="Name of the dataset to benchmark on.",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default=None,
+        help="Path to the sharegpt/sonnet dataset. "
+        "Or the huggingface dataset ID if using HF dataset.",
+    )
+    parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        help="Do not load the dataset in streaming mode.",
+    )
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=None,
+        help="Maximum number of concurrent requests. This can be used "
+        "to help simulate an environment where a higher level component "
+        "is enforcing a maximum number of concurrent requests. While the "
+        "--request-rate argument controls the rate at which requests are "
+        "initiated, this argument will control how many are actually allowed "
+        "to execute at a time. This means that when used in combination, the "
+        "actual request rate may be lower than specified with --request-rate, "
+        "if the server is not processing requests fast enough to keep up.",
+    )
+
+    parser.add_argument(
+        "--model",
+        type=str,
+        required=True,
+        help="Name of the model.",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        help="Name or path of the tokenizer, if not using the default tokenizer.",  # noqa: E501
+    )
+    parser.add_argument("--use-beam-search", action="store_true")
+    parser.add_argument(
+        "--num-prompts",
+        type=int,
+        default=1000,
+        help="Number of prompts to process.",
+    )
+    parser.add_argument(
+        "--logprobs",
+        type=int,
+        default=None,
+        help=(
+            "Number of logprobs-per-token to compute & return as part of "
+            "the request. If unspecified, then either (1) if beam search "
+            "is disabled, no logprobs are computed & a single dummy "
+            "logprob is returned for each token; or (2) if beam search "
+            "is enabled 1 logprob per token is computed"
+        ),
+    )
+    parser.add_argument(
+        "--request-rate",
+        type=float,
+        default=float("inf"),
+        help="Number of requests per second. If this is inf, "
+        "then all the requests are sent at time 0. "
+        "Otherwise, we use Poisson process or gamma distribution "
+        "to synthesize the request arrival times.",
+    )
+    parser.add_argument(
+        "--burstiness",
+        type=float,
+        default=1.0,
+        help="Burstiness factor of the request generation. "
+        "Only take effect when request_rate is not inf. "
+        "Default value is 1, which follows Poisson process. "
+        "Otherwise, the request intervals follow a gamma distribution. "
+        "A lower burstiness value (0 < burstiness < 1) results in more "
+        "bursty requests. A higher burstiness value (burstiness > 1) "
+        "results in a more uniform arrival of requests.",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust remote code from huggingface",
+    )
+    parser.add_argument(
+        "--disable-tqdm",
+        action="store_true",
+        help="Specify to disable tqdm progress bar.",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Use Torch Profiler. The endpoint must be launched with "
+        "VLLM_TORCH_PROFILER_DIR to enable profiler.",
+    )
+    parser.add_argument(
+        "--save-result",
+        action="store_true",
+        help="Specify to save benchmark results to a json file",
+    )
+    parser.add_argument(
+        "--save-detailed",
+        action="store_true",
+        help="When saving the results, whether to include per request "
+        "information such as response, error, ttfs, tpots, etc.",
+    )
+    parser.add_argument(
+        "--append-result",
+        action="store_true",
+        help="Append the benchmark result to the existing json file.",
+    )
+    parser.add_argument(
+        "--metadata",
+        metavar="KEY=VALUE",
+        nargs="*",
+        help="Key-value pairs (e.g, --metadata version=0.3.3 tp=1) "
+        "for metadata of this run to be saved in the result JSON file "
+        "for record keeping purposes.",
+    )
+    parser.add_argument(
+        "--result-dir",
+        type=str,
+        default=None,
+        help="Specify directory to save benchmark json results."
+        "If not specified, results are saved in the current directory.",
+    )
+    parser.add_argument(
+        "--result-filename",
+        type=str,
+        default=None,
+        help="Specify the filename to save benchmark json results."
+        "If not specified, results will be saved in "
+        "{backend}-{args.request_rate}qps-{base_model_id}-{current_dt}.json"
+        " format.",
+    )
+    parser.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="Set ignore_eos flag when sending the benchmark request."
+        "Warning: ignore_eos is not supported in deepspeed_mii and tgi.",
+    )
+    parser.add_argument(
+        "--percentile-metrics",
+        type=str,
+        default="ttft,tpot,itl,e2el",
+        help="Comma-separated list of selected metrics to report percentils. "
+        "This argument specifies the metrics to report percentiles. "
+        'Allowed metric names are "ttft", "tpot", "itl", "e2el". '
+        'Default value is "ttft,tpot,itl".',
+    )
+    parser.add_argument(
+        "--metric-percentiles",
+        type=str,
+        default="99",
+        help="Comma-separated list of percentiles for selected metrics. "
+        'To report 25-th, 50-th, and 75-th percentiles, use "25,50,75". '
+        'Default value is "99". '
+        'Use "--percentile-metrics" to select metrics.',
+    )
+    parser.add_argument(
+        "--goodput",
+        nargs="+",
+        required=False,
+        help='Specify service level objectives for goodput as "KEY:VALUE" '
+        "pairs, where the key is a metric name, and the value is in "
+        'milliseconds. Multiple "KEY:VALUE" pairs can be provided, '
+        "separated by spaces. Allowed request level metric names are "
+        '"ttft", "tpot", "e2el". For more context on the definition of '
+        "goodput, refer to DistServe paper: https://arxiv.org/pdf/2401.09670 "
+        "and the blog: https://hao-ai-lab.github.io/blogs/distserve",
+    )
+
+    # group for dataset specific arguments
+    custom_group = parser.add_argument_group("custom dataset options")
+    custom_group.add_argument(
+        "--custom-output-len",
+        type=int,
+        default=256,
+        help="Number of output tokens per request, used only for custom dataset.",
+    )
+    custom_group.add_argument(
+        "--custom-skip-chat-template",
+        action="store_true",
+        help="Skip applying chat template to prompt, used only for custom dataset.",
+    )
+
+    sonnet_group = parser.add_argument_group("sonnet dataset options")
+    sonnet_group.add_argument(
+        "--sonnet-input-len",
+        type=int,
+        default=550,
+        help="Number of input tokens per request, used only for sonnet dataset.",
+    )
+    sonnet_group.add_argument(
+        "--sonnet-output-len",
+        type=int,
+        default=150,
+        help="Number of output tokens per request, used only for sonnet dataset.",
+    )
+    sonnet_group.add_argument(
+        "--sonnet-prefix-len",
+        type=int,
+        default=200,
+        help="Number of prefix tokens per request, used only for sonnet dataset.",
+    )
+
+    sharegpt_group = parser.add_argument_group("sharegpt dataset options")
+    sharegpt_group.add_argument(
+        "--sharegpt-output-len",
+        type=int,
+        default=None,
+        help="Output length for each request. Overrides the output length "
+        "from the ShareGPT dataset.",
+    )
+
+    random_group = parser.add_argument_group("random dataset options")
+    random_group.add_argument(
+        "--random-input-len",
+        type=int,
+        default=1024,
+        help="Number of input tokens per request, used only for random sampling.",
+    )
+    random_group.add_argument(
+        "--random-output-len",
+        type=int,
+        default=128,
+        help="Number of output tokens per request, used only for random sampling.",
+    )
+    random_group.add_argument(
+        "--random-range-ratio",
+        type=float,
+        default=0.0,
+        help="Range ratio for sampling input/output length, "
+        "used only for random sampling. Must be in the range [0, 1) to define "
+        "a symmetric sampling range"
+        "[length * (1 - range_ratio), length * (1 + range_ratio)].",
+    )
+    random_group.add_argument(
+        "--random-prefix-len",
+        type=int,
+        default=0,
+        help=(
+            "Number of fixed prefix tokens before the random context "
+            "in a request. "
+            "The total input length is the sum of `random-prefix-len` and "
+            "a random "
+            "context length sampled from [input_len * (1 - range_ratio), "
+            "input_len * (1 + range_ratio)]."
+        ),
+    )
+
+    hf_group = parser.add_argument_group("hf dataset options")
+    hf_group.add_argument(
+        "--hf-subset", type=str, default=None, help="Subset of the HF dataset."
+    )
+    hf_group.add_argument(
+        "--hf-split", type=str, default=None, help="Split of the HF dataset."
+    )
+    hf_group.add_argument(
+        "--hf-output-len",
+        type=int,
+        default=None,
+        help="Output length for each request. Overrides the output lengths "
+        "from the sampled HF dataset.",
+    )
+
+    sampling_group = parser.add_argument_group("sampling parameters")
+    sampling_group.add_argument(
+        "--top-p",
+        type=float,
+        default=None,
+        help="Top-p sampling parameter. Only has effect on openai-compatible backends.",
+    )
+    sampling_group.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help="Top-k sampling parameter. Only has effect on openai-compatible backends.",
+    )
+    sampling_group.add_argument(
+        "--min-p",
+        type=float,
+        default=None,
+        help="Min-p sampling parameter. Only has effect on openai-compatible backends.",
+    )
+    sampling_group.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Temperature sampling parameter. Only has effect on "
+        "openai-compatible backends. If not specified, default to greedy "
+        "decoding (i.e. temperature==0.0).",
+    )
+    sampling_group.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--tokenizer-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "slow", "mistral", "custom"],
+        help='The tokenizer mode.\n\n* "auto" will use the '
+        'fast tokenizer if available.\n* "slow" will '
+        "always use the slow tokenizer. \n* "
+        '"mistral" will always use the `mistral_common` tokenizer. \n*'
+        '"custom" will use --tokenizer to select the preregistered tokenizer.',
+    )
+
+    parser.add_argument(
+        "--served-model-name",
+        type=str,
+        default=None,
+        help="The model name used in the API. "
+        "If not specified, the model name will be the "
+        "same as the ``--model`` argument. ",
+    )
+
+    parser.add_argument(
+        "--lora-modules",
+        nargs="+",
+        default=None,
+        help="A subset of LoRA module names passed in when "
+        "launching the server. For each request, the "
+        "script chooses a LoRA module at random.",
+    )
+
+    parser.add_argument(
+        "--ramp-up-strategy",
+        type=str,
+        default=None,
+        choices=["linear", "exponential"],
+        help="The ramp-up strategy. This would be used to "
+        "ramp up the request rate from initial RPS to final "
+        "RPS rate (specified by --ramp-up-start-rps and --ramp-up-end-rps). "
+        "over the duration of the benchmark.",
+    )
+    parser.add_argument(
+        "--ramp-up-start-rps",
+        type=int,
+        default=None,
+        help="The starting request rate for ramp-up (RPS). "
+        "Needs to be specified when --ramp-up-strategy is used.",
+    )
+    parser.add_argument(
+        "--ramp-up-end-rps",
+        type=int,
+        default=None,
+        help="The ending request rate for ramp-up (RPS). "
+        "Needs to be specified when --ramp-up-strategy is used.",
+    )
+    parser.add_argument(
+        "--maxtokenscustom",
+        type=int,
+        default=8192,
+    )
+    parser.add_argument("--m", type=int, default=1, help="每个请求复制次数（默认 1，不复制）")
+    parser.add_argument("--save-output",type=bool,default=False)
+    parser.add_argument("--out-path",type=str,default='/root/predict/predict_experiment/dataset_result/benchmarkserving_result')
+    # 添加一个参数，如果true就加载自定义路径的.csv文件，根据文件中的req_id从原数据集中筛选数据作为输入数据集，如果false就按原有逻辑走
+    parser.add_argument("--use-custom-csv",type=bool,default=False)
+    # parser.add_argument("--save-test",type=bool,default=True)
+    parser.add_argument("--ablation-p2d",action='store_true',help="p2d or not")
+    parser.add_argument("--ablation-decode",action='store_true',help="decode or not")
+    parser.add_argument("--all",action='store_true',help="run all experiments")
+    parser.add_argument("--baseline-csv-path",type=str,default='/root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/experiment_result/experiment_paper/my_result/use_p2d/test_results_20260109_150617.csv')
+    parser.add_argument("--min-prompt-tokens",type=int,default=1,help="最小输入长度")
+    parser.add_argument("--max-prompt-tokens",type=int,default=32768,help="最大输入长度")
+    parser.add_argument("--reproduce-baseline",action='store_true',help="复现baseline结果")
+    parser.add_argument("--save-sample",action='store_true',help="保存采样后的输入样本")
+    parser.add_argument("--test-model",type=str,default='llama',help="测试模型名称")
+    parser.add_argument("--qwen-vllm",action='store_true',help="qwen vllm or not")
+    return parser
+
+
+if __name__ == "__main__":
+    parser = create_argument_parser()
+    args = parser.parse_args()
+    main(args)

@@ -1,0 +1,602 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import socket
+import threading
+import time
+import uuid
+from typing import Any,Dict, List
+import aiohttp
+import msgpack
+import zmq
+from quart import Quart, make_response, request
+import json
+import asyncio
+from dataclasses import dataclass
+import httpx
+import re
+import os
+import sys
+from typing import Any, Dict, List, Optional
+from wt_metadata import Custom_Metadata
+# 导入ModelConfig
+AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+app = Quart(__name__)
+
+
+count = 0
+prefill_instances: dict[str, Any] = {}  # http_address: (zmq_address, stamp)
+decode_instances: dict[str, Any] = {}  # http_address: (zmq_address, stamp)
+
+prefill_cv = threading.Condition()
+decode_cv = threading.Condition()
+latest_load_cv = threading.Condition()
+DEFAULT_PING_SECONDS = 5
+
+# [WT]delay kvcache transfer 2025-12-27 22:09:30
+# Predictor metadata 接收（ZMQ）
+PREDICTOR_ZMQ_ADDR = "tcp://127.0.0.1:32323"
+predictor_ctx = zmq.Context.instance()
+predictor_sock = predictor_ctx.socket(zmq.PULL)
+predictor_sock.bind(PREDICTOR_ZMQ_ADDR)
+# prefilled_finished_cv=threading.Condition()
+prefilled_finished_requests: dict[str, Any] = {}  # request_id: metadata
+# 新增：路由广播端口 (Proxy -> Prefill Connector)
+ROUTING_PUB_ADDR = "tcp://127.0.0.1:32324"  # 新增端口
+routing_ctx = zmq.Context.instance()
+routing_pub = routing_ctx.socket(zmq.PUB)
+routing_pub.bind(ROUTING_PUB_ADDR)
+# [WT] end
+@dataclass
+class ModelConfig:
+    hidden_size: int
+    num_hidden_layers: int
+    vocab_size: int
+    intermediate_size: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    bytes_per_param: int = 2
+
+
+@dataclass
+class DecodeLoadModel:
+    config: ModelConfig
+    precision_bytes: int
+    peak_tflops: float
+    bandwidth_gbs: float
+    mem_capacity_gb: float
+    tpot: float
+
+    def __post_init__(self):
+        c = self.config
+        H = c.hidden_size
+        I = c.intermediate_size
+        V = c.vocab_size
+        L = c.num_hidden_layers
+
+        # KV 真实维度（GQA）
+        self.kv_dim = (H // c.num_attention_heads) * c.num_key_value_heads
+
+        # -------- 参数量 --------
+        self.layer_params = (
+            H * (H + 2 * self.kv_dim)  # QKV
+            + H * H                    # Output proj
+            + 3 * H * I                # FFN
+        )
+        self.total_params = L * self.layer_params + V * H
+        self.weights_vram = self.total_params * self.precision_bytes
+
+        self.linear_flops_coeff = 2 * (L * self.layer_params + V * H)
+        self.attn_flops_coeff = 4 * L * H
+
+
+# =========================
+# Decode Monitor
+# =========================
+
+class DecodeMonitor:
+    def __init__(
+        self,
+        config_path: str,
+        precision: str = "bfloat16",
+        tpot: float = 50.0,
+        check_interval: float = 0.01,
+        enable_monitor_log: bool = True,
+    ):
+        self.check_interval = check_interval
+        self.enable_monitor_log = enable_monitor_log
+
+        self.stats: Dict[str, dict] = {}
+        self.latest_load: Dict[str, dict] = {}
+        self.is_running = True
+
+        self.config = self._load_config(config_path)
+        self.precision = precision.lower()
+
+        precision_map = {
+            "int8": 1,
+            "float8": 1,
+            "float16": 2,
+            "bfloat16": 2,
+            "float32": 4,
+        }
+        self.precision_bytes = precision_map.get(self.precision, 2)
+        self.config.bytes_per_param = self.precision_bytes
+
+        # 硬件参数（A800）
+        self.bandwidth_gbs = 1935
+        self.mem_capacity = 80
+        self.tpot = float(tpot)
+
+        if self.precision == "float32":
+            peak = 19.5
+        elif self.precision in ("float16", "bfloat16"):
+            peak = 312
+        else:
+            peak = 624
+
+        self.load_model = DecodeLoadModel(
+            config=self.config,
+            precision_bytes=self.precision_bytes,
+            peak_tflops=peak,
+            bandwidth_gbs=self.bandwidth_gbs,
+            mem_capacity_gb=self.mem_capacity,
+            tpot=self.tpot,
+        )
+
+        self.log_interval = 1.0
+        self._last_log_time = 0.0
+
+    def _load_config(self, path: str) -> ModelConfig:
+        with open(path, "r") as f:
+            raw = json.load(f)
+        return ModelConfig(
+            hidden_size=raw.get("hidden_size", 4096),
+            num_hidden_layers=raw.get("num_hidden_layers", 32),
+            vocab_size=raw.get("vocab_size", 32000),
+            intermediate_size=raw.get("intermediate_size", 11008),
+            num_attention_heads=raw.get("num_attention_heads", 32),
+            num_key_value_heads=raw.get(
+                "num_key_value_heads", raw.get("num_attention_heads", 32)
+            ),
+        )
+
+    async def fetch_metrics(self):
+        limits = httpx.Limits(
+            max_connections=100,
+            max_keepalive_connections=50,
+            keepalive_expiry=10.0,
+        )
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(0.2),
+            limits=limits,
+        ) as client:
+            while self.is_running:
+                urls = list(decode_instances.keys())
+                if not urls:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                await asyncio.gather(
+                    *[self._update_instance(client, u) for u in urls]
+                )
+                self._compute_all_loads()
+                await asyncio.sleep(self.check_interval)
+
+    async def _update_instance(self, client: httpx.AsyncClient, addr: str):
+        try:
+            r = await client.get(f"http://{addr}/metrics")
+            if r.status_code != 200:
+                return
+
+            def p(name):
+                m = re.search(rf"{name}\{{.*?\}}\s+([\d\.e\+]+)", r.text)
+                return float(m.group(1)) if m else 0.0
+
+            self.stats[addr] = {
+                "kv_usage": p("vllm:kv_cache_usage_perc"),
+                "running_tokens": int(p("vllm:running_tokens")),
+                "running_requests": int(p("vllm:num_requests_running")),
+                "running_predict_tokens": int(p("vllm:running_predict_tokens")),
+                "waiting_tokens": int(p("vllm:waiting_tokens")),
+                "status": "healthy",
+                "dirty": True,
+            }
+        except Exception:
+            self.stats.setdefault(addr, {})["status"] = "unhealthy"
+
+    def _compute_all_loads(self):
+        now = time.time()
+        do_log = self.enable_monitor_log and (
+            now - self._last_log_time >= self.log_interval
+        )
+        global latest_load_cv
+        for addr, stat in self.stats.items():
+            if stat.get("status") != "healthy" or not stat.get("dirty"):
+                continue
+
+            stat["dirty"] = False
+            load = self._calculate_load(
+                stat["running_requests"],
+                stat["running_tokens"],
+                stat["kv_usage"],
+                stat["running_predict_tokens"],
+                stat["waiting_tokens"],
+            )
+            # with latest_load_cv:
+            #     self.latest_load[addr] = load
+            self.latest_load[addr] = load
+
+            if do_log:
+                print(
+                    f"[WT][MONITOR] decode={addr} "
+                    f"requests={stat['running_requests']} "
+                    f"tokens={stat['running_tokens']} "
+                    f"bottle={load['Load_Bottle']:.3f} "
+                    f"compute={load['Load_Compute']:.3f} "
+                    f"memory={load['Load_Memory']:.3f} "
+                    f"capacity={load['Load_Memory_Capacity']:.3f}",
+                    f"Future_Tokens={load['Future_Tokens']}",
+                    flush=True,
+                )
+
+        if do_log:
+            self._last_log_time = now
+
+    def _calculate_load(self, n_req, m_tok, kv_usage,running_predict_tokens,waiting_tokens):
+        lm = self.load_model
+        kv_vram = (
+            2
+            * lm.config.num_hidden_layers
+            * m_tok
+            * lm.kv_dim
+            * lm.precision_bytes
+        )
+        if n_req==0 and m_tok==0:
+            mem_bytes=0
+        else:
+            mem_bytes = lm.weights_vram + kv_vram
+        flops = (
+            n_req * lm.linear_flops_coeff
+            + lm.attn_flops_coeff * m_tok
+        )
+
+        t_compute = (flops / 1e12) / lm.peak_tflops * 1000
+        t_memory = (mem_bytes / 1e9) / lm.bandwidth_gbs * 1000
+
+        lc = t_compute / lm.tpot
+        lm_ = t_memory / lm.tpot
+        lcap = kv_usage
+        Future_Tokens = running_predict_tokens + waiting_tokens
+        return {
+            "Load_Compute": lc,
+            "Load_Memory": lm_,
+            "Load_Memory_Capacity": lcap,
+            "Load_Bottle": max(lc, lm_, lcap),
+            "Future_Tokens": Future_Tokens,
+        }
+
+    def select_best_instance(self, instances, predictor_meta: Optional[dict]=None):
+        if not instances:
+            return None, None, float("inf")
+        
+        # 一次遍历收集有效实例
+        valid_instances = []
+        global latest_load_cv
+        for addr, zmq_addr in instances:
+            # with latest_load_cv:
+            #     load = self.latest_load.get(addr)
+
+            load = self.latest_load.get(addr)
+            if load and "Load_Bottle" in load and "Future_Tokens" in load:
+                valid_instances.append((
+                    load["Future_Tokens"]+predictor_meta['predict_output_len'],  # 用于第一轮排序
+                    load["Load_Bottle"],   # 用于第二轮排序
+                    addr,
+                    zmq_addr[0]            # zmq地址
+                ))
+        
+        if not valid_instances:
+            return None, None, float("inf")
+        
+        # 按Future_tokens排序取top2/3
+        valid_instances.sort(key=lambda x: x[0])  # 按Future_tokens升序
+        top3_instances = valid_instances[:3]
+        
+        # 在top2/3中按Load_Bottle排序取最小
+        top3_instances.sort(key=lambda x: x[1])   # 按Load_Bottle升序
+        best_future, best_bottle, best_addr, best_zmq_addr = top3_instances[0]
+        # with latest_load_cv:
+        #     self.latest_load.get(best_addr)["Future_Tokens"]=self.latest_load.get(best_addr)["Future_Tokens"]+predictor_meta['predict_output_len']
+        self.latest_load.get(best_addr)["Future_Tokens"]=self.latest_load.get(best_addr)["Future_Tokens"]+predictor_meta['predict_output_len']
+        return best_addr, best_zmq_addr, best_bottle
+    # def select_best_instance(self, instances,predictor_meta: Optional[dict]=None,):
+    #     """
+    #     选择最佳实例：
+    #     1. 首先根据load["Load_Bottle"]选择最小的top2实例
+    #     2. 在top2最小实例中选择load["Future_Tokens"]最小的实例
+    #     """
+    #     if not instances:
+    #         print(f'[Error1]',flush=True)
+    #         return None, None, float("inf")
+        
+    #     # 收集所有有效实例的信息
+    #     candidate_instances = []
+    #     for addr, zmq_addr in instances:
+    #         load = self.latest_load.get(addr)
+    #         if not load or "Load_Bottle" not in load or "Future_Tokens" not in load:
+    #             continue
+            
+    #         # zmq_addr[0] 获取第一个地址
+    #         candidate_instances.append((
+    #             load["Load_Bottle"],    # 用于第一轮排序
+    #             load["Future_Tokens"]+predictor_meta['predict_output_len'],  # 用于第二轮排序
+    #             addr,                   # 实例地址
+    #             zmq_addr[0]             # zmq地址
+    #         ))
+        
+    #     if not candidate_instances:
+    #         print(f'[Error2]',flush=True)
+    #         return None, None, float("inf")
+        
+    #     # 第一轮：按Load_Bottle升序排序，取top2
+    #     candidate_instances.sort(key=lambda x: x[0])  # 按Load_Bottle排序
+    #     top2_instances = candidate_instances[:2]      # 取前2个
+        
+    #     # 第二轮：在top2中按Future_tokens升序排序，取最小的
+    #     top2_instances.sort(key=lambda x: x[1])       # 按Future_tokens排序
+    #     best_instance = top2_instances[0]
+        
+    #     best_load_bottle, best_future_tokens, best_addr, best_zmq_addr = best_instance
+        
+    #     return best_addr, best_zmq_addr, best_load_bottle
+    
+    # def select_best_instance(self, instances,predictor_meta: Optional[Custom_Metadata]=None,):
+    #     candidates = []
+    #     best_addr,best_zmq_addr, best_load = None,None, float("inf")
+    #     for addr, zmq_addr in instances:
+    #         load = self.latest_load.get(addr)
+    #         if not load:
+    #             continue
+    #         # 选择load["Load_Bottle"]top2最小的实例
+    #         if load["Load_Bottle"] < best_load:
+    #             best_addr = addr
+    #             best_load = load["Load_Bottle"]
+    #             best_zmq_addr = zmq_addr[0]
+    #     return best_addr,best_zmq_addr, best_load
+
+monitor = DecodeMonitor(
+    config_path=os.environ.get("MODEL_CONFIG_PATH", "model_config.json"),
+    precision=os.environ.get("VLLM_DTYPE", "bf16"),
+    tpot=os.environ.get("TPOT", 'tpot:50').split(':')[1],
+    check_interval=0.01,
+    enable_monitor_log=True,
+)
+
+
+@app.before_serving
+async def start_monitor():
+    asyncio.create_task(monitor.fetch_metrics())
+    
+def _remove_oldest_instances(instances: dict[str, Any]) -> None:
+    oldest_key = next(iter(instances), None)
+    while oldest_key is not None:
+        value = instances[oldest_key]
+        if value[1] > time.time():
+            break
+        print(f"🔴Remove [HTTP:{oldest_key}, ZMQ:{value[0]}, stamp:{value[1]}]")
+        instances.pop(oldest_key, None)
+        oldest_key = next(iter(instances), None)
+
+
+def _listen_for_register(poller, router_socket):
+    while True:
+        socks = dict(poller.poll())
+        if router_socket in socks:
+            remote_address, message = router_socket.recv_multipart()
+            data = msgpack.loads(message)
+            if data["type"] == "P":
+                global prefill_instances
+                global prefill_cv
+                with prefill_cv:
+                    node = prefill_instances.get(data["http_address"], None)
+                    prefill_instances[data["http_address"]] = (
+                        data["zmq_address"],
+                        time.time() + DEFAULT_PING_SECONDS,
+                    )
+                    _remove_oldest_instances(prefill_instances)
+
+            elif data["type"] == "D":
+                global decode_instances
+                global decode_cv
+                with decode_cv:
+                    node = decode_instances.get(data["http_address"], None)
+                    decode_instances[data["http_address"]] = (
+                        data["zmq_address"],
+                        time.time() + DEFAULT_PING_SECONDS,
+                    )
+                    _remove_oldest_instances(decode_instances)
+            else:
+                print(
+                    "Unexpected, Received message from %s, data: %s",
+                    remote_address,
+                    data,
+                )
+                return
+
+            if node is None:
+                print(f"🔵Add [HTTP:{data['http_address']}, ZMQ:{data['zmq_address']}]")
+
+# [WT]delay kvcache transfer 2025-12-27 22:10:39
+# 监听predictor发送预测后metadata
+def _listen_predictor_metadata():
+    global prefilled_finished_requests
+    # global prefilled_finished_cv
+    while True:
+        try:
+            msg = predictor_sock.recv_string()
+            meta_list = json.loads(msg)
+            for meta in meta_list:
+                # req_id只包含prefill_add信息 例如：cmpl-___prefill_addr_10.10.111.36:22010__5a13bb3bc84f45dbb48cffd13f321689-0
+                req_id = meta.get("req_id")
+                # with prefilled_finished_cv:
+                prefilled_finished_requests[req_id] = meta
+                # print(f"[WT][Proxy] 222 Received predictor meta for {req_id}: {meta}",flush=True)
+                    # prefilled_finished_cv.notify_all()  # [WT][FIX] 唤醒等待者
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+# [WT] end
+def start_service_discovery(hostname, port):
+    if not hostname:
+        hostname = socket.gethostname()
+    if port == 0:
+        raise ValueError("Port cannot be 0")
+    context = zmq.Context()
+    router_socket = context.socket(zmq.ROUTER)
+    router_socket.bind(f"tcp://{hostname}:{port}")
+    poller = zmq.Poller()
+    poller.register(router_socket, zmq.POLLIN)
+    _listener_thread = threading.Thread(
+        target=_listen_for_register, args=[poller, router_socket], daemon=True
+    )
+    _listener_thread.start()
+    return _listener_thread
+
+def random_uuid() -> str:
+    return str(uuid.uuid4().hex)
+async def forward_request(url, data, request_id):
+    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+        headers = {
+            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+            "X-Request-Id": request_id,
+        }
+        async with session.post(url=url, json=data, headers=headers) as response:
+            if response.status == 200:
+                if True:
+                    async for chunk_bytes in response.content.iter_chunked(1024):
+                        yield chunk_bytes
+                else:
+                    content = await response.read()
+                    yield content
+# [WT]delay kvcache transfer 2025-12-27 22:14:21
+# 重新设计 handle_request
+# 1. 选择 prefill 实例，发起 prefill 请求
+# 2. 等待 predictor metadata 回传
+# 3. 根据 metadata 选择 decode 实例，发起 decode 请求
+# 4. 返回 decode 响应
+@app.route("/v1/completions", methods=["POST"])
+@app.route("/v1/chat/completions", methods=["POST"])
+async def handle_request():
+    try:
+        original_request_data = await request.get_json()
+        # print(f'[WT]>>> Received original request data: {original_request_data}',flush=True)
+        prefill_request = original_request_data.copy()
+        prefill_request["max_tokens"] = 1
+        # [WT]prometheus 2026-01-04 12:14:48
+        prefill_request["predictor_meta"] = None
+        # [WT] end
+        if "max_completion_tokens" in prefill_request:
+            prefill_request["max_completion_tokens"] = 1
+        global count
+        global prefill_instances
+        global prefill_cv
+        with prefill_cv:
+            prefill_list = list(prefill_instances.items())
+            prefill_addr, prefill_zmq_addr = prefill_list[count % len(prefill_list)]
+            prefill_zmq_addr = prefill_zmq_addr[0]
+        
+        request_id = (
+            f"___prefill_addr_{prefill_zmq_addr}__{random_uuid()}"
+        )
+        # print(f'[WT]333 handle_request request_id: {request_id}',flush=True)
+        # finish prefill
+        async for _ in forward_request(
+            f"http://{prefill_addr}{request.path}", prefill_request, request_id
+        ):
+            continue
+        global prefilled_finished_requests
+        original_req_id = request_id  # [WT][FIX] 保存 KV 使用的 request_id
+        predictor_req_id = 'cmpl-' + request_id + '-0'  # predictor 使用
+        predictor_meta = None
+        timeout_limit = 180.0
+        start_wait = asyncio.get_event_loop().time()
+        # with prefilled_finished_cv:
+        while True:
+            # predictor_req_id 例如：cmpl-___prefill_addr_10.10.111.36:22010__5a13bb3bc84f45dbb48cffd13f321689-0
+            if predictor_req_id in prefilled_finished_requests:
+                predictor_meta = prefilled_finished_requests.pop(predictor_req_id)
+                # print(
+                #     f"[WT][Proxy] 444 Found meta for {predictor_req_id}",
+                #     flush=True
+                # )
+                break
+            if (asyncio.get_event_loop().time() - start_wait) > timeout_limit:
+                # print(
+                #     f"[WT][Proxy] 555 Timeout waiting for {predictor_req_id}",
+                #     flush=True
+                # )
+                break
+
+            await asyncio.sleep(0.001)
+
+        
+        
+        global decode_instances
+        global decode_cv
+
+        with decode_cv:
+            
+            decode_list = list(decode_instances.items())
+            decode_addr,decode_zmq_addr, min_score = monitor.select_best_instance(decode_list,predictor_meta)
+            
+        count += 1
+        # [WT]广播路由决策
+        # 消息格式: "predictor_req_id|decode_zmq_addr"
+        routing_msg = f"{predictor_req_id}|{decode_zmq_addr}"
+        routing_pub.send_string(routing_msg)
+        # 更新predictor_req_id和request_id，加入decode地址信息
+        predictor_req_id = predictor_req_id.replace(
+            f"___prefill_addr_{prefill_zmq_addr}__",
+            f"___prefill_addr_{prefill_zmq_addr}___decode_addr_{decode_zmq_addr}_"
+        )
+        request_id=request_id.replace(
+            f"___prefill_addr_{prefill_zmq_addr}__",
+            f"___prefill_addr_{prefill_zmq_addr}___decode_addr_{decode_zmq_addr}_"
+        )
+        # print(f'[WT] 888 request_id after update: {predictor_req_id}',flush=True)
+        # print(f'[WT] 999 request_id after update: {request_id}',flush=True)
+        # 发起 decode 请求
+        original_request_data["predictor_meta"]= predictor_meta
+        # print(f'[WT]<<<original_request_data: {original_request_data}',flush=True)
+        generator = forward_request(
+            f"http://{decode_addr}{request.path}", original_request_data, request_id
+        )
+        # 返回 decode 响应
+        response = await make_response(generator)
+        response.timeout = None
+        return response
+    except Exception as e:
+        import sys
+        import traceback
+        exc_info = sys.exc_info()
+        print("Error occurred in disagg prefill proxy server",flush=True)
+        print(e)
+        print("".join(traceback.format_exception(*exc_info)))
+# [WT] end
+
+# [WT]delay kvcache transfer 2025-12-27 22:20:14
+if __name__ == "__main__":
+    proxy_port=os.environ.get("PROXY_PORT", "28001")
+    bench_port=os.environ.get("BENCH_PORT", "22006")
+    t1 = start_service_discovery("0.0.0.0", proxy_port)
+    t2 = threading.Thread(
+        target=_listen_predictor_metadata,
+        daemon=True,
+    )
+    t2.start()
+    app.run(host="0.0.0.0", port=bench_port)
+    t1.join()
+    t2.join()
+# [WT] end

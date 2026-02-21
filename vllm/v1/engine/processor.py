@@ -334,8 +334,10 @@ class Processor:
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
+        # [WT]prometheus 2026-01-04 12:29:43
+        predictor_meta: Optional[dict[str, Any]] = None,
     ) -> tuple[Optional[str], EngineCoreRequest]:
-
+        # logger.info(f'HJT 444')
         # TODO(woosuk): Support pooling models.
         self._validate_lora(lora_request)
         self._validate_params(params)
@@ -456,6 +458,8 @@ class Processor:
             priority=priority,
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
+            # [WT]prometheus 2026-01-04 12:31:32
+            predictor_meta=predictor_meta,
         )
 
     def _validate_model_inputs(self, encoder_inputs: Optional[SingletonInputs],

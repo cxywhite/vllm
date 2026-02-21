@@ -1,0 +1,47 @@
+{
+"generated_at": "2026-01-15T03:21:14+00:00",
+"model": "/root/.cache/huggingface/hub/Meta-Llama-3-8B-Instruct",
+"timeout_seconds": 1200,
+"proxy_port": 28002,
+"prefill_gpus": ["1"],
+"decode_gpus": ["2"],
+"prefill_ports": ["31001"],
+"decode_ports": ["31021"],
+"prefill_kv_ports": ["31011"],
+"decode_kv_ports": ["31031"],
+"prefill_gpu_memory_utilization": 0.8,
+"decode_gpu_memory_utilization": 0.3,
+"kv_transfer_config": {
+    "kv_connector": "P2pNcclConnector",
+    "producer_buffer": "1e1",
+    "consumer_buffer": "8e9",
+    "nccl_num_channels": 8,
+    "send_type": "PUT_ASYNC"
+},
+"vllm_options": {
+    "enforce_eager": true,
+    "seed": 42,
+    "dtype": "bfloat16",
+    "max_model_len": 8192,
+    "prefill_max_num_batched_tokens": 8192,
+    "decode_max_num_batched_tokens": 1024,
+    "max_num_seqs": 1024
+},
+"benchmark": {
+    "bench_script": "/root/predict-schedule/vllm/benchmarks/benchmark_serving_baseline.py",
+    "output_path": "./experiment_result/experiment_paper/tmp/preempt_115/benchmark_np1_rr1_mt512_20260115_032114_1p1d/dataset_result",
+    "bench_port": 22007,
+    "endpoint": "/v1/completions",
+    "dataset_name": "random",
+    "max_concurrency": 1024,
+    "request_rate": "1",
+    "maxtokenscustom": 512,
+    "temperature": 0.8,
+    "top_p": 0.7,
+    "top_k": 50,
+    "repetition_penalty": 1.0,
+    "goodput": "tpot:50",
+    "num_prompts": 1,
+    "timestamp": "20260115_032114"
+}
+}

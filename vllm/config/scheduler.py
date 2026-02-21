@@ -10,13 +10,13 @@ from pydantic.dataclasses import dataclass
 from typing_extensions import Self
 
 from vllm.config.utils import config
-from vllm.logger import init_logger
+
 from vllm.utils import (DEFAULT_MAX_NUM_BATCHED_TOKENS,
                         MULTIMODAL_MODEL_MAX_NUM_BATCHED_TOKENS,
                         POOLING_MODEL_MAX_NUM_BATCHED_TOKENS)
-
+from vllm.logger import init_logger
 logger = init_logger(__name__)
-
+from typing import Optional
 RunnerType = Literal["generate", "pooling", "draft"]
 SchedulerPolicy = Literal["fcfs", "priority"]
 
@@ -141,7 +141,12 @@ class SchedulerConfig:
     async scheduling is currently not supported with some features such as
     structured outputs, speculative decoding, and pipeline parallelism.
     """
-
+    # [WT]custom schedule 2025-09-09 20:42:07
+    pastfuture_scheduler: Optional[bool] = None
+    activation_predict: Optional[bool] = None
+    aimd_scheduler: Optional[bool] = None
+    test_p2d: Optional[bool] = None
+    test_model: Optional[str] = None
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -229,7 +234,28 @@ class SchedulerConfig:
         if self.async_scheduling:
             self.scheduler_cls = (
                 "vllm.v1.core.sched.async_scheduler.AsyncScheduler")
-
+        # [WT]custom schedule 2025-09-08 20:10:01
+        if self.pastfuture_scheduler is not None and self.pastfuture_scheduler:
+            logger.info(f"[test]&&& pastfuture_scheduler")
+            self.scheduler_cls = "vllm.v1.core.sched.pastfuture_scheduler.FuturePastScheduler"
+        else:
+            logger.info(f"[test]&&& no pastfuture_scheduler")
+        if self.activation_predict is not None and self.activation_predict:
+            logger.info(f"[test]&&& activation_predict")
+            # self.scheduler_cls = "vllm.v1.core.sched.pastfuture_scheduler.FuturePastScheduler"
+        else:
+            logger.info(f"[test]&&& no activation_predict")
+        if self.aimd_scheduler is not None and self.aimd_scheduler:
+            logger.info(f"[test]&&& aimd_scheduler")
+            self.scheduler_cls = "vllm.v1.core.sched.aimd_scheduler.AIMDScheduler"
+        else:
+            logger.info(f"[test]&&& no aimd_scheduler")
+        if self.test_p2d is not None and self.test_p2d:
+            logger.info(f"[test]&&& test_p2d")
+        else:
+            logger.info(f"[test]&&& no test_p2d")
+        if self.test_model is not None and self.test_model != "":
+            logger.info(f"[test]&&& test_model: {self.test_model}")
     @model_validator(mode='after')
     def _verify_args(self) -> Self:
         if (self.max_num_batched_tokens < self.max_model_len

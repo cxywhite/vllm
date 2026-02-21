@@ -1,0 +1,599 @@
+set -euo pipefail
+# 定义是否使用pastfuture scheduler的变量，可以根据需要设置为"true"或"false"
+USE_PASTFUTURE_SCHEDULER="false"  # 或者 "false"
+USE_ACTIVATION_PREDICTOR="false"  # 或者 "false"
+USE_CUSTOM_PROXY="false"  # 是否使用自定义的proxy脚本
+USE_AIMD_SCHEDULER="false"
+
+TEST_ABLATION_P2D="false"  # 是否测试请求感知调度的消融实验
+IGNORE="false"  # 是否忽略EOS标记
+SAVE_OUTPUT=${SAVE_OUTPUT:-True}
+#这里设置为float32以匹配预测器
+VLLM_DTYPE=${VLLM_DTYPE:-bfloat16}  # float16 or bfloat16
+# DECODE_METRICS_PORTS=${DECODE_METRICS_PORTS:-9400,9401,9402,9403,9404,9405,8406,9407}
+BENCH_TEMPERATURE=${BENCH_TEMPERATURE:-0.8}
+BENCH_TOP_P=${BENCH_TOP_P:-0.7}
+BENCH_TOP_K=${BENCH_TOP_K:-50}
+BENCH_REPETITION_PENALTY=${BENCH_REPETITION_PENALTY:-1.0}
+# Model and general
+MODEL=${MODEL:-/root/.cache/huggingface/hub/Meta-Llama-3-8B-Instruct} #/root/.cache/huggingface/hub/Qwen2.5-7B-Instruct   # local path or HF id
+TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
+
+# Logging / output
+CONFIG_DIR=${CONFIG_DIR:-./experiment_result/experiment_paper/tmp/baseline/config}
+LOG_DIR=${LOG_DIR:-./experiment_result/experiment_paper/tmp/baseline/log}
+RESULT_DIR=${RESULT_DIR:-./experiment_result/experiment_paper/tmp/baseline/dataset_result}
+mkdir -p "$CONFIG_DIR" "$LOG_DIR"   "$RESULT_DIR"
+
+# Proxy
+PROXY_PORT=${PROXY_PORT:-28002}
+BENCH_PORT=${BENCH_PORT:-22007}
+# Prefill instances: comma-separated lists (GPU ids, ports, kv-ports optional)
+PREFILL_GPUS=${PREFILL_GPUS:-3}
+PREFILL_PORTS=${PREFILL_PORTS:-22001}
+PREFILL_KV_PORTS=${PREFILL_KV_PORTS:-22010}
+PREFILL_GPU_MEMORY_UTILIZATION=${PREFILL_GPU_MEMORY_UTILIZATION:-0.8}
+PREFILL_TENSOR_PARALLEL_SIZE=${PREFILL_TENSOR_PARALLEL_SIZE:-1}
+
+# Decode instances: comma-separated lists (GPU ids, ports, kv-ports optional)
+# DECODE_GPUS=${DECODE_GPUS:-4,6}
+# DECODE_PORTS=${DECODE_PORTS:-22020,22021}
+# DECODE_KV_PORTS=${DECODE_KV_PORTS:-22030,22031}
+DECODE_GPUS=${DECODE_GPUS:-4,5,6,7}
+DECODE_PORTS=${DECODE_PORTS:-22020,22021,22022,22023}
+DECODE_KV_PORTS=${DECODE_KV_PORTS:-22030,22031,22032,22033}
+DECODE_GPU_MEMORY_UTILIZATION=${DECODE_GPU_MEMORY_UTILIZATION:-0.8}
+DECODE_TENSOR_PARALLEL_SIZE=${DECODE_TENSOR_PARALLEL_SIZE:-1}
+
+# KV transfer template (can be tuned)
+KV_CONNECTOR=${KV_CONNECTOR:-P2pNcclConnector}
+KV_PRODUCER_BUFFER=${KV_PRODUCER_BUFFER:-1e1}
+KV_CONSUMER_BUFFER=${KV_CONSUMER_BUFFER:-8e9}
+KV_NCCL_CHANNELS=${KV_NCCL_CHANNELS:-8}
+KV_SEND_TYPE=${KV_SEND_TYPE:-PUT_ASYNC}
+
+# vLLM options (will be recorded to config JSON)
+VLLM_ENFORCE_EAGER=${VLLM_ENFORCE_EAGER:-1}   # 1=true, 0=false
+VLLM_SEED=${VLLM_SEED:-42}
+
+VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-8192} #32768
+PREFILL_VLLM_MAX_NUM_BATCHED_TOKENS=${PREFILL_VLLM_MAX_NUM_BATCHED_TOKENS:-8192} #prefill传给predictor的slot一般是8192
+DECODE_VLLM_MAX_NUM_BATCHED_TOKENS=${DECODE_VLLM_MAX_NUM_BATCHED_TOKENS:-1024}
+VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-1024}
+
+# Benchmark script and parameters
+BENCH_SCRIPT=${BENCH_SCRIPT:-/root/predict-schedule/vllm/benchmarks/benchmark_serving_baseline.py}
+
+BENCH_MODEL=${BENCH_MODEL:-$MODEL}
+BENCH_DATASET_NAME=${BENCH_DATASET_NAME:-custom}
+# BENCH_DATASET_PATH=${BENCH_DATASET_PATH:-/root/predict-schedule/baseline_experiment/pastfuture/dataset/lmsys-50k-filtered}
+
+BENCH_DATASET_PATH=${BENCH_DATASET_PATH:-/root/predict-schedule/baseline_experiment/pastfuture/dataset/lmsys-50k-filtered-with-newid}
+# BENCH_DATASET_PATH=${BENCH_DATASET_PATH:-/root/.cache/huggingface/hub/datasets--shibing624--sharegpt_gpt4/snapshots/3fb53354e02a931777556fb1da37e931d73af48a/sharegpt_gpt4.jsonl}
+BENCH_MAX_CONCURRENCY=${BENCH_MAX_CONCURRENCY:-1024}
+BENCH_REQUEST_RATE=${BENCH_REQUEST_RATE:-4}
+BENCH_GOODPUT=${BENCH_GOODPUT:-tpot:50}
+
+# Batchsize sweep (comma-separated list)
+# NUM_PROMPTS_LIST=${NUM_PROMPTS_LIST:-"16,128,256,280,300,320,360,400,440,480,512"}
+NUM_PROMPTS_LIST=${NUM_PROMPTS_LIST:-"4000,6000,8000,1000,2000"}
+SLEEP_BETWEEN_RUNS=${SLEEP_BETWEEN_RUNS:-5}
+
+# Misc
+if [ "$USE_CUSTOM_PROXY" = "true" ]; then
+    PROXY_SCRIPT=${PROXY_SCRIPT:-test_disagg_proxy.py}
+elif [ "$TEST_ABLATION_P2D" = "true" ]; then
+    PROXY_SCRIPT=${PROXY_SCRIPT:-test_disagg_proxy_p2d.py}
+else
+    PROXY_SCRIPT=${PROXY_SCRIPT:-disagg_proxy_p2p_nccl_xpyd.py}
+fi
+# ---------------------------
+# End USER CONFIG
+# ---------------------------
+
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+# Tracks per-run process pids and process group ids
+PIDS=()     # individual PIDs for checking / logging
+PGIDS=()    # process group IDs (negative kills will use these)
+
+check_required_files() {
+    local files=("$PROXY_SCRIPT")
+    for file in "${files[@]}"; do
+        if [[ ! -f "$file" ]]; then
+            echo "Required file $file not found in $(pwd)"
+            exit 1
+        fi
+    done
+}
+
+check_num_gpus() {
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "nvidia-smi not found in PATH. Please ensure NVIDIA drivers are installed."
+        exit 1
+    fi
+    num_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+    if [ "$num_gpus" -lt 2 ]; then
+        echo "You need at least 2 GPUs to run disaggregated prefill. Found $num_gpus."
+        exit 1
+    else
+        echo "Found $num_gpus GPUs."
+    fi
+}
+
+ensure_python_library_installed() {
+    echo "Checking if $1 is installed..."
+    if ! python3 -c "import $1" > /dev/null 2>&1; then
+        echo "$1 is not installed. Please install it via pip install $1."
+        exit 1
+    else
+        echo "$1 is installed."
+    fi
+}
+
+# Convert a comma-separated string into a JSON array string
+array_to_json() {
+    local s="$1"
+    if [[ -z "$s" ]]; then
+        printf '[]'
+        return
+    fi
+    IFS=',' read -ra _arr <<< "$s"
+    printf '['
+    local first=1
+    for v in "${_arr[@]}"; do
+        v="$(echo "$v" | sed -e 's/^\s*//' -e 's/\s*$//')"
+        if [[ $first -eq 1 ]]; then
+            printf '"%s"' "$v"
+            first=0
+        else
+            printf ',"%s"' "$v"
+        fi
+    done
+    printf ']'
+}
+
+dump_config_json() {
+    now_ts=$(date +%Y%m%d_%H%M%S)
+    cfgfile="${CONFIG_DIR}/config_${now_ts}.json"
+
+    cat > "$cfgfile" <<EOF
+{
+  "generated_at": "$(date --iso-8601=seconds)",
+  "model": "${MODEL}",
+  "timeout_seconds": ${TIMEOUT_SECONDS},
+  "proxy_port": ${PROXY_PORT},
+  "prefill_gpus": $(array_to_json "$PREFILL_GPUS"),
+  "decode_gpus": $(array_to_json "$DECODE_GPUS"),
+  "prefill_ports": $(array_to_json "$PREFILL_PORTS"),
+  "decode_ports": $(array_to_json "$DECODE_PORTS"),
+  "prefill_kv_ports": $(array_to_json "$PREFILL_KV_PORTS"),
+  "decode_kv_ports": $(array_to_json "$DECODE_KV_PORTS"),
+  "prefill_gpu_memory_utilization": ${PREFILL_GPU_MEMORY_UTILIZATION},
+  "decode_gpu_memory_utilization": ${DECODE_GPU_MEMORY_UTILIZATION},
+  "kv_transfer_config": {
+    "kv_connector": "${KV_CONNECTOR}",
+    "producer_buffer": "${KV_PRODUCER_BUFFER}",
+    "consumer_buffer": "${KV_CONSUMER_BUFFER}",
+    "nccl_num_channels": ${KV_NCCL_CHANNELS},
+    "send_type": "${KV_SEND_TYPE}"
+  },
+  "vllm_options": {
+    "enforce_eager": $( [[ "$VLLM_ENFORCE_EAGER" -eq 1 ]] && echo true || echo false ),
+    "seed": ${VLLM_SEED},
+    "dtype": "${VLLM_DTYPE}",
+    "max_model_len": ${VLLM_MAX_MODEL_LEN},
+    "prefill_max_num_batched_tokens": ${PREFILL_VLLM_MAX_NUM_BATCHED_TOKENS},
+    "decode_max_num_batched_tokens": ${DECODE_VLLM_MAX_NUM_BATCHED_TOKENS},
+    "max_num_seqs": ${VLLM_MAX_NUM_SEQS}
+  },
+  "benchmark": {
+    "bench_script": "${BENCH_SCRIPT}",
+    "output_path": "${RESULT_DIR}",
+    "bench_port": ${BENCH_PORT},
+    "endpoint": "/v1/completions",
+    "dataset_name": "${BENCH_DATASET_NAME}",
+    "dataset_path": "${BENCH_DATASET_PATH}",
+    "max_concurrency": ${BENCH_MAX_CONCURRENCY},
+    "request_rate": "${BENCH_REQUEST_RATE}",
+    "temperature": ${BENCH_TEMPERATURE},
+    "top_p": ${BENCH_TOP_P},
+    "top_k": ${BENCH_TOP_K},
+    "repetition_penalty": ${BENCH_REPETITION_PENALTY},
+    "goodput": "${BENCH_GOODPUT}",
+    "num_prompts_list": $(array_to_json "$NUM_PROMPTS_LIST")
+  },
+  "notes": "Config generated from environment / header settings"
+}
+EOF
+
+    echo "Wrote config JSON to: $cfgfile"
+}
+
+# helper: wait until port is free (no LISTEN) or timeout (secs)
+wait_for_port_free() {
+    local port=$1
+    local timeout=${2:-10}
+    local start=$(date +%s)
+    while true; do
+        if ! ss -ltn "( sport = :$port )" 2>/dev/null | tail -n +2 | grep -q .; then
+            return 0
+        fi
+        now=$(date +%s)
+        if (( now - start >= timeout )); then
+            return 1
+        fi
+        sleep 0.5
+    done
+}
+
+# stop_servers: try graceful group-terminate for all PGIDS, then force kill if needed.
+# ---------- 替换：stop_servers ----------
+stop_servers() {
+    if [[ ${#PGIDS[@]} -eq 0 && ${#PIDS[@]} -eq 0 ]]; then
+        return
+    fi
+
+    echo "Stopping servers: PGIDS = ${PGIDS[*]} (and PIDs = ${PIDS[*]})"
+
+    # 1) send TERM to process groups (negative PGID)
+    for pg in "${PGIDS[@]}"; do
+        if [[ -n "$pg" ]]; then
+            echo " -> TERM to pgid $pg"
+            kill -TERM -"$pg" 2>/dev/null || true
+        fi
+    done
+
+    # 2) wait small grace period
+    sleep 3
+
+    # 3) force kill remaining process groups
+    for pg in "${PGIDS[@]}"; do
+        if pgrep -g "$pg" >/dev/null 2>&1; then
+            echo " -> KILL pgid $pg"
+            kill -KILL -"$pg" 2>/dev/null || true
+        fi
+    done
+
+    # 4) explicit kill any remaining tracked PIDs (fallback)
+    for pid in "${PIDS[@]}"; do
+        if ps -p "$pid" > /dev/null 2>&1; then
+            echo " -> explicit KILL pid $pid"
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
+
+    # 5) final fallback: pattern kill
+    pkill -9 -f "$PROXY_SCRIPT" >/dev/null 2>&1 || true
+    pkill -9 -f vllm >/dev/null 2>&1 || true
+    # if [ "$USE_ACTIVATION_PREDICTOR" = "true" ]; then
+    #     rm /root/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_handle/*
+    # fi
+    # 6) clear arrays
+    PIDS=()
+    PGIDS=()
+}
+# ---------- end stop_servers ----------
+
+
+# cleanup (trap handler) - will be called on SIGINT/SIGTERM/EXIT
+cleanup() {
+    echo "Received termination signal. Cleaning up..."
+    # Stop any servers launched for this run
+    stop_servers
+
+    # Wait for important ports to free (proxy + prefill + decode lists)
+    # Build a list of ports to check
+    ports_to_check=()
+    IFS=',' read -ra PREFILL_PORT_ARRAY <<< "$PREFILL_PORTS"
+    IFS=',' read -ra DECODE_PORT_ARRAY <<< "$DECODE_PORTS"
+    ports_to_check+=("${PROXY_PORT}")
+    for p in "${PREFILL_PORT_ARRAY[@]}"; do ports_to_check+=("$p"); done
+    for p in "${DECODE_PORT_ARRAY[@]}"; do ports_to_check+=("$p"); done
+
+    for port in "${ports_to_check[@]}"; do
+        echo "Waiting for port ${port} to be released..."
+        if wait_for_port_free "$port" 10; then
+            echo "Port ${port} free."
+        else
+            echo "Port ${port} may still be in use after timeout."
+        fi
+    done
+    # if [ "$USE_ACTIVATION_PREDICTOR" = "true" ]; then
+    #     rm /root/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_handle/*
+    # fi
+    # rm /root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/experiment_result/log/*
+    # echo "Cleaned up log files."
+    echo "Cleanup finished. Exiting."
+    exit 0
+}
+
+# Wait for server on localhost:port to be ready (HTTP)
+wait_for_server() {
+  local port=$1
+  local timeout_seconds=$TIMEOUT_SECONDS
+  local start_time=$(date +%s)
+
+  echo "Waiting for server on port $port..."
+
+  while true; do
+    if curl -s "localhost:${port}" > /dev/null 2>&1; then
+      echo "Server on port $port is ready."
+      return 0
+    fi
+
+    local now=$(date +%s)
+    if (( now - start_time >= timeout_seconds )); then
+      echo "Timeout waiting for server on port $port"
+      return 1
+    fi
+
+    sleep 1
+  done
+}
+
+# start_servers: launches proxy + prefill + decode for this iteration and
+# records both PIDs and PGIDs (process group ids).
+# ---------- 替换：start_servers ----------
+start_servers() {
+    PIDS=()
+    PGIDS=()
+
+    echo "Launching disaggregated serving components for this run..."
+    echo "Logs: ${LOG_DIR}/*.log"
+
+    # Start proxy with setsid + bash -c 'exec ...' so $! is the real process PID
+    echo "Starting proxy server on port $PROXY_PORT..."
+    setsid env PROXY_PORT="${PROXY_PORT}" BENCH_PORT="${BENCH_PORT}" VLLM_DTYPE="${VLLM_DTYPE}" MODEL_CONFIG_PATH="${MODEL}/config.json" TPOT="${BENCH_GOODPUT}" bash -c "exec python3 \"$PROXY_SCRIPT\"" &> "${LOG_DIR}/proxy_${timestamp}.log" &
+    proxy_pid=$!
+    proxy_pgid=$(ps -o pgid= -p "$proxy_pid" | tr -d ' ')
+    echo "  proxy pid=$proxy_pid pgid=$proxy_pgid"
+    PIDS+=("$proxy_pid")
+    PGIDS+=("$proxy_pgid")
+
+    # Launch Prefill servers
+    echo "Starting ${#PREFILL_GPU_ARRAY[@]} prefill server(s)..."
+    for i in "${!PREFILL_GPU_ARRAY[@]}"; do
+        gpu_id=${PREFILL_GPU_ARRAY[$i]}
+        port=${PREFILL_PORT_ARRAY[$i]:-$((20002 + i))}
+        kv_port=${PREFILL_KV_PORT_ARRAY[$i]:-$((21001 + i))}
+
+        echo "  Prefill server $((i+1)): GPU $gpu_id, Port $port, KV Port $kv_port"
+
+        # 构建命令
+        CMD="vllm serve \"$MODEL\" \
+            --enforce-eager --host 0.0.0.0 --port \"$port\" \
+            --tensor-parallel-size ${PREFILL_TENSOR_PARALLEL_SIZE} \
+            --seed ${VLLM_SEED} --dtype ${VLLM_DTYPE} \
+            --max-model-len ${VLLM_MAX_MODEL_LEN} \
+            --max-num-batched-tokens ${PREFILL_VLLM_MAX_NUM_BATCHED_TOKENS} \
+            --max-num-seqs ${VLLM_MAX_NUM_SEQS} \
+            --gpu-memory-utilization ${PREFILL_GPU_MEMORY_UTILIZATION}"
+            
+        # 条件添加 --activation_predictor 参数
+        if [ "$USE_ACTIVATION_PREDICTOR" = "true" ]; then
+            CMD="$CMD --activation-predict"
+        fi
+        
+        # 添加 KV 转移配置
+        CMD="$CMD --kv-transfer-config \
+            '{\"kv_connector\":\"${KV_CONNECTOR}\",\"kv_role\":\"kv_producer\",\"kv_buffer_size\":\"${KV_PRODUCER_BUFFER}\",\"kv_port\":\"$kv_port\",\"kv_connector_extra_config\":{\"proxy_ip\":\"0.0.0.0\",\"proxy_port\":\"${PROXY_PORT}\",\"http_port\":\"$port\",\"send_type\":\"${KV_SEND_TYPE}\",\"nccl_num_channels\":\"${KV_NCCL_CHANNELS}\"}}'"
+        # 启动服务
+        setsid env CUDA_VISIBLE_DEVICES="$gpu_id" VLLM_USE_V1=1 bash -c "exec $CMD" \
+            > "${LOG_DIR}/prefill${i}_$(date +%Y%m%d_%H%M%S).log" 2>&1 &
+        pid=$!
+        pgid=$(ps -o pgid= -p "$pid" | tr -d ' ')
+        echo "    prefill pid=$pid pgid=$pgid"
+        PIDS+=("$pid")
+        PGIDS+=("$pgid")
+
+        # PREDICTOR_SCRIPT="/root/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/predictor_worker_readyflag.py"
+        # if [ "$USE_ACTIVATION_PREDICTOR" = "true" ]; then
+        #     # ----- 启动 PredictorWorker -----
+        #     echo "Starting PredictorWorker..."
+        #     PREDICTOR_LOG="${LOG_DIR}/predictor_${timestamp}.log"
+        #     setsid env CUDA_VISIBLE_DEVICES="$gpu_id" bash -c "exec python3 -u \"$PREDICTOR_SCRIPT\"" > "$PREDICTOR_LOG" 2>&1 &
+        #     predictor_pid=$!
+        #     predictor_pgid=$(ps -o pgid= -p "$predictor_pid" | tr -d ' ')
+        #     echo "predictor pid=$predictor_pid pgid=$predictor_pgid (log: $PREDICTOR_LOG)"
+        #     # ----- PredictorWorker 启动完成 -----
+        #     PIDS+=("$predictor_pid")
+        #     PGIDS+=("$predictor_pgid")
+        # fi
+    done
+
+    # Launch Decode servers
+    # Decode servers
+    echo "Starting ${#DECODE_GPU_ARRAY[@]} decode server(s)..."
+    for i in "${!DECODE_GPU_ARRAY[@]}"; do
+        gpu_id=${DECODE_GPU_ARRAY[$i]}
+        port=${DECODE_PORT_ARRAY[$i]:-$((20003 + i))}
+        kv_port=${DECODE_KV_PORT_ARRAY[$i]:-$((22001 + i))}
+        # metrics_port=${DECODE_METRICS_PORT_ARRAY[$i]}
+        echo "  Decode server $((i+1)): GPU $gpu_id, Port $port, KV Port $kv_port"
+        # 构建命令
+        CMD="vllm serve \"$MODEL\" \
+            --enforce-eager --host 0.0.0.0 --port \"$port\" \
+            --tensor-parallel-size ${DECODE_TENSOR_PARALLEL_SIZE} \
+            --seed ${VLLM_SEED} --dtype ${VLLM_DTYPE} \
+            --max-model-len ${VLLM_MAX_MODEL_LEN} \
+            --max-num-batched-tokens ${DECODE_VLLM_MAX_NUM_BATCHED_TOKENS} \
+            --max-num-seqs ${VLLM_MAX_NUM_SEQS} \
+            --gpu-memory-utilization ${DECODE_GPU_MEMORY_UTILIZATION} \
+            --swap-space 0"
+        # 条件添加 --pastfuture-scheduler 参数
+        if [ "$USE_PASTFUTURE_SCHEDULER" = "true" ]; then
+            CMD="$CMD --pastfuture-scheduler"
+        fi
+        if [ "$USE_AIMD_SCHEDULER" = "true" ]; then
+            CMD="$CMD --aimd-scheduler"
+        fi
+        if [ "$TEST_ABLATION_P2D" = "true" ]; then
+            CMD="$CMD --test_p2d"
+        fi
+        # 条件添加 --activation_predictor 参数
+        # if [ "$USE_ACTIVATION_PREDICTOR" = "true" ]; then
+        #     CMD="$CMD --activation-predict"
+        # fi
+        # 添加 KV 转移配置
+        CMD="$CMD --kv-transfer-config \
+            '{\"kv_connector\":\"${KV_CONNECTOR}\",\"kv_role\":\"kv_consumer\",\"kv_buffer_size\":\"${KV_CONSUMER_BUFFER}\",\"kv_port\":\"$kv_port\",\"kv_connector_extra_config\":{\"proxy_ip\":\"0.0.0.0\",\"proxy_port\":\"${PROXY_PORT}\",\"http_port\":\"$port\",\"send_type\":\"${KV_SEND_TYPE}\",\"nccl_num_channels\":\"${KV_NCCL_CHANNELS}\"}}'"
+
+        # 启动服务
+        setsid env DECODE_INSTANCE_ID="decode-${i}" VLLM_USE_V1=1 CUDA_VISIBLE_DEVICES="$gpu_id" bash -c "exec $CMD" \
+            > "${LOG_DIR}/decode${i}_$(date +%Y%m%d_%H%M%S).log" 2>&1 &
+        pid=$!
+        pgid=$(ps -o pgid= -p "$pid" | tr -d ' ')
+        echo "    decode pid=$pid pgid=$pgid"
+        PIDS+=("$pid")
+        PGIDS+=("$pgid")
+    done
+
+
+    # Wait for servers to become ready
+    echo "Waiting for all servers to start..."
+    for port in "${PREFILL_PORT_ARRAY[@]}" "${DECODE_PORT_ARRAY[@]}"; do
+        if ! wait_for_server $port; then
+            echo "Failed to start server on port $port"
+            stop_servers
+            return 1
+        fi
+    done
+
+    echo "All servers are up for this run."
+    return 0
+}
+# ---------- end start_servers ----------
+
+
+# Parse comma-separated lists into arrays (done once)
+IFS=',' read -ra PREFILL_GPU_ARRAY <<< "$PREFILL_GPUS"
+IFS=',' read -ra PREFILL_PORT_ARRAY <<< "$PREFILL_PORTS"
+IFS=',' read -ra PREFILL_KV_PORT_ARRAY <<< "$PREFILL_KV_PORTS"
+IFS=',' read -ra DECODE_GPU_ARRAY <<< "$DECODE_GPUS"
+IFS=',' read -ra DECODE_PORT_ARRAY <<< "$DECODE_PORTS"
+IFS=',' read -ra DECODE_KV_PORT_ARRAY <<< "$DECODE_KV_PORTS"
+# IFS=',' read -ra DECODE_METRICS_PORT_ARRAY <<< "$DECODE_METRICS_PORTS"
+# Set traps for signals (SIGINT from Ctrl+C, SIGTERM, EXIT)
+trap cleanup INT TERM EXIT
+
+main() {
+    check_required_files
+    check_num_gpus
+
+    ensure_python_library_installed pandas
+    ensure_python_library_installed datasets
+    ensure_python_library_installed vllm
+    ensure_python_library_installed quart
+
+    dump_config_json
+
+    # Prepare NUM_PROMPTS array
+    IFS=',' read -ra NUM_PROMPTS_ARRAY <<< "$NUM_PROMPTS_LIST"
+
+    for num_prompts in "${NUM_PROMPTS_ARRAY[@]}"; do
+        timestamp=$(date +%Y%m%d_%H%M%S)
+        echo "========================================"
+        echo "Run timestamp=${timestamp}  num-prompts=${num_prompts}"
+        echo "========================================"
+
+        # start servers for this run
+        if ! start_servers; then
+            echo "Failed to start servers for num_prompts=${num_prompts}. Check logs in ${LOG_DIR}."
+            cleanup
+            exit 1
+        fi
+        # PREDICTOR_SCRIPT="/root/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/predictor_worker_readyflag.py"
+        # if [ "$USE_ACTIVATION_PREDICTOR" = "true" ]; then
+        #     # ----- 启动 PredictorWorker -----
+        #     for i in "${!PREFILL_GPU_ARRAY[@]}"; do
+        #         gpu_id=${PREFILL_GPU_ARRAY[$i]}
+        #         echo "Starting PredictorWorker..."
+        #         PREDICTOR_LOG="${LOG_DIR}/predictor_${timestamp}.log"
+        #         setsid env CUDA_VISIBLE_DEVICES="$gpu_id" bash -c "exec python3 -u \"$PREDICTOR_SCRIPT\"" > "$PREDICTOR_LOG" 2>&1 &
+        #         predictor_pid=$!
+        #         predictor_pgid=$(ps -o pgid= -p "$predictor_pid" | tr -d ' ')
+        #         echo "predictor pid=$predictor_pid pgid=$predictor_pgid (log: $PREDICTOR_LOG)"
+        #         # ----- PredictorWorker 启动完成 -----
+        #         PIDS+=("$predictor_pid")
+        #         PGIDS+=("$predictor_pgid")
+        #     done
+        # fi
+        # Launch benchmark in background and wait
+        log_file="${LOG_DIR}/benchmark_np${num_prompts}_${timestamp}.log"
+        echo "Starting benchmark: num-prompts=${num_prompts}, max-concurrency=${num_prompts}"
+
+        # 构建基准测试命令
+        CMD="python3 \"$BENCH_SCRIPT\" \
+                    --backend vllm --port \"${BENCH_PORT}\" --endpoint '/v1/completions' \
+                    --model \"${BENCH_MODEL}\" --dataset-name ${BENCH_DATASET_NAME} \
+                    --dataset-path ${BENCH_DATASET_PATH} \
+                    --save-output ${SAVE_OUTPUT} --out-path \"${RESULT_DIR}\" \
+                    --maxtokenscustom ${VLLM_MAX_MODEL_LEN} --seed ${VLLM_SEED} \
+                    --num-prompts ${num_prompts} --max-concurrency ${num_prompts} \
+                    --temperature ${BENCH_TEMPERATURE} \
+                    --top-p ${BENCH_TOP_P} --top-k ${BENCH_TOP_K} --repetition-penalty ${BENCH_REPETITION_PENALTY} \
+                    --request-rate ${BENCH_REQUEST_RATE}"
+
+        # 条件参数示例（根据需要添加）
+        if [ "$IGNORE" = "true" ]; then
+            CMD="$CMD --ignore-eos"
+        fi
+        if [ "$TEST_ABLATION_P2D" = "true" ]; then
+            CMD="$CMD --ablation_p2d"
+        fi
+        CMD="$CMD --goodput ${BENCH_GOODPUT}"
+
+        # 启动基准测试
+        setsid env BENCHMARK_INSTANCE_ID="benchmark-${num_prompts}" CUDA_VISIBLE_DEVICES="$gpu_id" bash -c "exec $CMD" \
+            > "$log_file" 2>&1 &
+
+        client_pid=$!
+        client_pgid=$(ps -o pgid= -p "$client_pid" | tr -d ' ')
+        echo "Benchmark client started pid=$client_pid pgid=$client_pgid"
+
+        # Wait for benchmark to finish
+        wait "$client_pid"
+        client_exit_code=$?
+
+        echo "Benchmark completed for num-prompts=${num_prompts} (exit code: ${client_exit_code})"
+        echo "Log file: ${log_file}"
+
+        # Verify servers still running (optional)
+        for pid in "${PIDS[@]}"; do
+            if ! ps -p "$pid" > /dev/null 2>&1; then
+                echo "ERROR: a server process (PID $pid) is no longer running. Check logs in ${LOG_DIR}."
+                stop_servers
+                cleanup
+                exit 1
+            fi
+        done
+
+        # stop servers for this run
+        stop_servers
+
+        # ---------- 在这里加入：等待端口释放 ----------
+        # 等待 proxy / prefill / decode 的监听端口真正释放，避免下一轮 start bind 失败
+        all_ports=("${PROXY_PORT}" "${PREFILL_PORT_ARRAY[@]}" "${DECODE_PORT_ARRAY[@]}")
+        for p in "${all_ports[@]}"; do
+            echo "Waiting for port $p to be free..."
+            if ! wait_for_port_free "$p" 15; then
+                echo "Warning: port $p still in use after timeout"
+            else
+                echo "Port $p is free."
+            fi
+        done
+        # ---------- 等待端口释放结束 ----------
+
+        echo "Waiting ${SLEEP_BETWEEN_RUNS}s before next run..."
+        sleep ${SLEEP_BETWEEN_RUNS}
+    done
+
+    echo "Benchmark loop finished."
+    exit 0
+}
+
+
+main "$@"
+
+

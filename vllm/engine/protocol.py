@@ -55,6 +55,9 @@ class EngineClient(ABC):
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
+        # [WT]prometheus 2026-01-04 12:05:33
+        predictor_meta: Optional[dict[str, Any]] = None,
+        # [WT] end
     ) -> AsyncGenerator[RequestOutput, None]:
         """Generate outputs for a request."""
         ...

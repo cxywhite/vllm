@@ -86,6 +86,7 @@ class OpenAIBaseModel(BaseModel):
                 field_names.add(field_name)
                 if alias := getattr(field, "alias", None):
                     field_names.add(alias)
+                # [WT]prometheus 2026-01-04 11:23:13 
             cls.field_names = field_names
 
         # Compare against both field names and aliases

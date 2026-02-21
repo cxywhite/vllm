@@ -46,8 +46,12 @@ class SchedulerStats:
     kv_connector_stats: Optional[dict[str, Any]] = None
 
     num_corrupted_reqs: int = 0
-
-
+    # [WT]prometheus 2026-01-02 20:48:32
+    running_tokens: int = 0
+    running_predict_tokens: int = 0
+    waiting_tokens: int = 0
+    # [WT] end
+    
 @dataclass
 class LoRAStats:
     waiting_requests: set[str] = field(default_factory=set)
@@ -104,7 +108,6 @@ class IterationStats:
         self.inter_token_latencies_iter: list[float] = []
         self.waiting_lora_adapters: dict[str, int] = {}
         self.running_lora_adapters: dict[str, int] = {}
-
     def _time_since(self, start: float) -> float:
         """Calculate an interval relative to this iteration's timestamp."""
         return self.iteration_timestamp - start

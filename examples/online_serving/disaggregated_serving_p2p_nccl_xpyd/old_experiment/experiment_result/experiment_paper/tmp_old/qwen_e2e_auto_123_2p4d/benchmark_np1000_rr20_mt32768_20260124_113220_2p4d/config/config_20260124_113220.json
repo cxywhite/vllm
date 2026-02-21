@@ -1,0 +1,51 @@
+{
+"generated_at": "2026-01-24T11:32:20+00:00",
+"model": "/root/.cache/huggingface/hub/Qwen2.5-7B-Instruct",
+"test_model": "qwen",
+"timeout_seconds": 1200,
+"proxy_port": 29002,
+"prefill_gpus": ["2","3"],
+"decode_gpus": ["4","5","6","7"],
+"prefill_ports": ["25001","25002"],
+"decode_ports": ["25021","25022","25023","25024"],
+"prefill_kv_ports": ["25011","25012"],
+"decode_kv_ports": ["25031","25032","25033","25034"],
+"prefill_gpu_memory_utilization": 0.8,
+"decode_gpu_memory_utilization": 0.8,
+"kv_transfer_config": {
+    "kv_connector": "P2pNcclConnector",
+    "producer_buffer": "1e1",
+    "consumer_buffer": "8e9",
+    "nccl_num_channels": 8,
+    "send_type": "PUT_ASYNC",
+    "prefill_tensor_pool_memory": 8,
+    "decode_tensor_pool_memory": 16
+},
+"vllm_options": {
+"enforce_eager": true,
+"seed": 42,
+"dtype": "bfloat16",
+"max_model_len": 32768,
+"prefill_max_num_batched_tokens": 40960,
+"decode_max_num_batched_tokens": 8192,
+"max_num_seqs": 1024
+},
+"benchmark": {
+"bench_script": "/root/predict-schedule/vllm/benchmarks/benchmark_serving_baseline.py",
+"output_path": "./experiment_result/experiment_paper/tmp/qwen_e2e_auto_123_2p4d/benchmark_np1000_rr20_mt32768_20260124_113220_2p4d/dataset_result",
+"bench_port": 25007,
+"endpoint": "/v1/completions",
+"dataset_name": "qwen",
+"dataset_path": "/root/.cache/huggingface/hub/datasets--shibing624--sharegpt_gpt4/snapshots/3fb53354e02a931777556fb1da37e931d73af48a",
+"max_concurrency": 1024,
+"request_rate": "20",
+"maxtokenscustom": 32768,
+"temperature": 0.8,
+"top_p": 0.7,
+"top_k": 50,
+"repetition_penalty": 1.0,
+"goodput": "ttft:1000 tpot:50",
+    "num_prompts": 1000,
+    "timestamp": "20260124_113220"
+}
+}

@@ -24,8 +24,18 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
-
-
+# [WT]delay kvcache transfer 2025-12-27 22:06:19
+import zmq
+import threading
+import time
+import re
+from collections import deque
+@dataclass
+class SendQueueItem:
+    tensor_id: str
+    remote_address: str
+    tensor: torch.Tensor
+# [WT] end
 @dataclass
 class ReqMeta:
     # Request Id
@@ -63,7 +73,6 @@ class P2pNcclConnectorMetadata(KVConnectorMetadata):
         self.requests.append(
             ReqMeta.make_meta(request_id, token_ids, block_ids, block_size))
 
-
 class P2pNcclConnector(KVConnectorBase_V1):
 
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
@@ -85,7 +94,87 @@ class P2pNcclConnector(KVConnectorBase_V1):
             hostname="",
             port_offset=self._rank,
         ) if role == KVConnectorRole.WORKER else None
+        # [WT]delay kvcache transfer 2025-12-27 21:47:07
+        self.defer_kv_send = False
+        if vllm_config.scheduler_config is not None and vllm_config.kv_transfer_config is not None:
+            if vllm_config.scheduler_config.activation_predict and vllm_config.kv_transfer_config.kv_role=='kv_producer':  
+                self.defer_kv_send = True
+                # KV 缓存
+                self.pending_layers: deque[SendQueueItem] = deque()
+                #路由表：req_id -> decode_addr 每一项例如：{'cmpl-___prefill_addr_10.10.111.36:22010__db20a9c11814424abc9913fe7471112b-0': '10.10.111.36:22030'}
+                self.routing_table = {}
+                self.routing_lock = threading.Lock()
+                # 启动 KV flush 线程
+                self._start_kv_flush_thread()
+                self.start_routing_listener("tcp://127.0.0.1:32324")
+                logger.info(f"[test]P2pNcclConnector initialized with defer_kv_send")
+        # [WT] end
+    # [WT]delay kvcache transfer 2025-12-27 21:48:52
+    def start_routing_listener(self, zmq_addr: str):
 
+        '''负责监听来自proxy的decode实例决策，更新路由表self.routing_table'''
+        
+        ctx = zmq.Context()
+        sock = ctx.socket(zmq.SUB)
+        sock.connect(zmq_addr)
+        sock.setsockopt_string(zmq.SUBSCRIBE, "")
+        def listen():
+            while True:
+                msg = sock.recv_string()
+                # 格式：request_id|ip:port 例如：cmpl-___prefill_addr_10.10.111.36:22010__58241b5d91a941038a5e948b36b3f35c-0|10.10.111.36:22030
+                req_id, decode_addr = msg.split("|", 1)
+                with self.routing_lock:
+                    self.routing_table[req_id] = decode_addr
+        t = threading.Thread(target=listen, daemon=True)
+        t.start()
+    def _start_kv_flush_thread(self):
+        def loop():
+            while True:
+                self._flush_ready_kv()
+                time.sleep(0.001)
+
+        t = threading.Thread(target=loop, daemon=True)
+        t.start()
+    def _flush_ready_kv(self):
+        '''负责读取路由表，将缓存的KV发送到对应decode实例'''
+        if not self.pending_layers:
+            return
+        remaining = deque()
+        while self.pending_layers:
+            item = self.pending_layers.popleft()
+            # 只经过prefill实例tensor_id 格式：req_id#layer_name 例如：tensor_id: cmpl-___prefill_addr_10.10.111.36:22010___decode_addr_10.10.111.36:22030_58241b5d91a941038a5e948b36b3f35c-0#model.layers.0.self_attn.attn
+            req_id = item.tensor_id.split("#")[0]
+            layer_name=item.tensor_id.split("#")[1]
+            with self.routing_lock:
+                # decode_addr 格式：ip:port 例如：10.10.111.36:22030
+                decode_addr = self.routing_table.get(req_id)
+            if decode_addr is None:
+                remaining.append(item)
+                continue
+            else:
+                # logger.info(f'[test]Flushing req_id: {req_id} to decode_addr: {decode_addr} p2p_nccl_connector.py')
+                # logger.info(f'[test]routing_table: {self.routing_table} p2p_nccl_connector.py')
+                pass
+            ip, port = decode_addr.split(":")
+            target = f"{ip}:{int(port) + self._rank}"
+            separator = "__"
+            last_index = req_id.rfind(separator)
+            if last_index != -1:
+                part1 = req_id[:last_index + len(separator)]  # 包含分隔符
+                part2 = req_id[last_index + len(separator):]
+            else:
+                logger.error(f"[test]Unexpected request_id format: {req_id} p2p_nccl_connector.py")
+            # 经过proxy负载均衡后的 tensor_id 格式：cmpl- + ___prefill_addr_ + {prefill_ip:prefill_kv_port} + ___decode_addr_ + {decode_ip:decode_kv_port} + _ + uuid + -0 例如：tensor_id: cmpl-___prefill_addr_10.10.111.36:22010___decode_addr_10.10.111.36:22030_58241b5d91a941038a5e948b36b3f35c-0
+            tensor_id= part1 +"_decode_addr_"+ decode_addr + "_" + part2+ "#" +layer_name
+            # logger.info(f'[test] Sending tensor_id: {tensor_id} p2p_nccl_connector.py')
+            self.p2p_nccl_engine.send_tensor(
+                tensor_id=tensor_id,
+                tensor=item.tensor,
+                remote_address=target,
+            )
+        self.pending_layers = remaining
+    
+    # [WT] end
     # ==============================
     # Worker-side methods
     # ==============================
@@ -103,7 +192,6 @@ class P2pNcclConnector(KVConnectorBase_V1):
             The number of elements in kv_caches and layer_names should be
             the same.
         """
-
         # Only consumer/decode loads KV Cache
         if self.is_producer:
             return
@@ -172,7 +260,6 @@ class P2pNcclConnector(KVConnectorBase_V1):
         metadata: KVConnectorMetadata = \
             self._get_connector_metadata()
         assert isinstance(metadata, P2pNcclConnectorMetadata)
-
         if metadata is None:
             return
 
@@ -213,27 +300,13 @@ class P2pNcclConnector(KVConnectorBase_V1):
             layer_name: the name of that layer
         """
         return
-
+    # [WT]delay kvcache transfer 2025-12-27 22:02:52
+    # 修改原来save_kv_layer函数，仅缓存不发送
     def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
                       attn_metadata: "AttentionMetadata",
                       **kwargs: Any) -> None:
-        """Start saving the KV cache of the layer from vLLM's paged buffer
-        to the connector.
-
-        Args:
-            layer_name (str): the name of the layer.
-            kv_layer (torch.Tensor): the paged KV buffer of the current
-                layer in vLLM.
-            attn_metadata (AttentionMetadata): the attention metadata.
-            **kwargs: additional arguments for the save operation.
-        """
-
-        # Only producer/prefill saves KV Cache
         if not self.is_producer:
             return
-
-        assert self.p2p_nccl_engine is not None
-
         def extract_kv_from_layer(
             layer: torch.Tensor,
             block_ids: torch.Tensor,
@@ -258,28 +331,42 @@ class P2pNcclConnector(KVConnectorBase_V1):
             if (isinstance(attn_metadata, MLACommonMetadata)
                     or layer.shape[1] == 2):  # MLA or FlashInfer
                 return layer[block_ids, ...]
-
             if layer.shape[0] == 2:  # FlashAttention
                 return layer[:, block_ids, ...]
-
             return None
-
         connector_metadata = self._get_connector_metadata()
         assert isinstance(connector_metadata, P2pNcclConnectorMetadata)
-        for request in connector_metadata.requests:
-            request_id = request.request_id
-            ip, port = self.parse_request_id(request_id, True)
-            remote_address = ip + ":" + str(port + self._rank)
+        # [WT][MOD]仅缓存，不发送
+        if self.defer_kv_send:
+            for request in connector_metadata.requests:
+                kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
+                
+                self.pending_layers.append(
+                    SendQueueItem(request.request_id + "#" + layer_name,None,kv_cache)
+                )
+        else:
+            for request in connector_metadata.requests:
+                request_id = request.request_id
+                ip, port = self.parse_request_id(request_id, True)
+                remote_address = ip + ":" + str(port + self._rank)
 
-            kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
-            self.p2p_nccl_engine.send_tensor(request_id + "#" + layer_name,
-                                             kv_cache, remote_address)
+                kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
+                self.p2p_nccl_engine.send_tensor(request_id + "#" + layer_name,
+                                                kv_cache, remote_address)
+        
+    # [WT] end
 
+
+    # [WT]delay kvcache transfer 2025-12-27 22:04:22
+    # 修改原来wait_for_save 函数，仅等待发送完成 
     def wait_for_save(self):
+        # [WT][MOD]Prefill 阶段不阻塞
         if self.is_producer:
-            assert self.p2p_nccl_engine is not None
-            self.p2p_nccl_engine.wait_for_sent()
-
+            if not self.defer_kv_send:
+                assert self.p2p_nccl_engine is not None
+                self.p2p_nccl_engine.wait_for_sent()
+    # [WT] end
+    
     def get_finished(
             self, finished_req_ids: set[str],
             **kwargs: Any) -> tuple[Optional[set[str]], Optional[set[str]]]:
@@ -293,7 +380,6 @@ class P2pNcclConnector(KVConnectorBase_V1):
             The finished saves/sends req ids must belong to a set provided in a
             call to this method (this call or a prior one).
         """
-
         assert self.p2p_nccl_engine is not None
 
         no_compile_layers = (
@@ -356,7 +442,6 @@ class P2pNcclConnector(KVConnectorBase_V1):
         Args:
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
-
         meta = P2pNcclConnectorMetadata()
 
         for new_req in scheduler_output.scheduled_new_reqs:

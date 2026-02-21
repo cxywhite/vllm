@@ -35,7 +35,7 @@ from vllm.distributed.parallel_state import (
     prepare_communication_buffer_for_model)
 from vllm.forward_context import (BatchDescriptor, DPMetadata,
                                   set_forward_context)
-from vllm.logger import init_logger
+
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
@@ -117,9 +117,41 @@ from .utils import (AttentionGroup, MultiModalBudget,
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.core.sched.output import SchedulerOutput
-
+# [WT]predict activation 2025-12-17 19:16:31
+from vllm.logger import init_logger
 logger = init_logger(__name__)
+# import sys
+# sys.path.append('/root/predict-schedule')
+# from design_predict_activation_experiment.wt_metadata import Custom_Metadata
+import sys
+import os
 
+# 1. 获取当前文件所在目录的绝对路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+# 2. 向上回溯到 /root/predict-schedule/vllm/（即 vLLM 项目根目录）
+#    路径: vllm/v1/worker/ -> vllm/v1/ -> vllm/ -> 项目根（/root/predict-schedule/vllm）
+vllm_project_root = os.path.dirname(
+    os.path.dirname(
+        os.path.dirname(current_dir)
+    )
+)
+
+# 3. 拼接 wt_metadata.py 所在目录
+wt_metadata_dir = os.path.join(
+    vllm_project_root,
+    "examples",
+    "online_serving",
+    "disaggregated_serving_p2p_nccl_xpyd"
+)
+
+# 4. 确保该路径在 sys.path 中（避免重复）
+if wt_metadata_dir not in sys.path:
+    sys.path.insert(0, wt_metadata_dir)
+
+# 5. 导入类
+from wt_metadata import Custom_Metadata
+# [WT] end
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = Union[list[AttnMetadataDict],
@@ -440,6 +472,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dtype=torch.int64,
             device="cpu",
             pin_memory=self.pin_memory)
+        
 
     def _make_buffer(self,
                      *size: Union[int, torch.SymInt],
@@ -2255,7 +2288,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                  num_scheduled_tokens_np, spec_decode_common_attn_metadata,
                  max_query_len, ubatch_slices, num_tokens_after_padding
                  ) = self._prepare_inputs(scheduler_output)
-
+                
             (
                 num_scheduled_tokens,
                 num_input_tokens,
@@ -2283,7 +2316,43 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_input_tokens = ubatch_slices[0].num_tokens
 
         # Run the model.
-        # Use persistent buffers for CUDA graphs.
+        # [WT]predict activation 2025-12-19 13:55:34
+        if self.scheduler_config.activation_predict or self.scheduler_config.test_p2d:
+            # scheduler 输出
+            
+            scheduled_new_reqs = scheduler_output.scheduled_new_reqs
+            num_scheduled_tokens_map = scheduler_output.num_scheduled_tokens
+            # 构造映射：req_id -> (range, num_tokens, temperature,top_p,top_k,repetition_penalty,expected_output_length)
+            # my_metadata: dict[str, tuple[tuple[int, int], int, float, float, int, float,int]] = {}
+            my_metadata: list[Custom_Metadata]=[]
+            start_idx = 0
+            for req in scheduled_new_reqs:
+                full_req_id = req.req_id
+                simplified_req_id = full_req_id
+                # 获取调度的 token 数量
+                num_tokens = num_scheduled_tokens_map.get(full_req_id, 0)
+                # 计算 exclusive 区间
+                end_idx = start_idx + num_tokens
+                # 提取 SamplingParams
+                sampling_params = req.sampling_params
+                temp = sampling_params.temperature
+                top_p = sampling_params.top_p
+                top_k = sampling_params.top_k
+                rep_penalty = sampling_params.repetition_penalty
+                my_metadata.append(Custom_Metadata(
+                    req_id=simplified_req_id,
+                    token_range=(start_idx, end_idx),
+                    num_tokens=num_tokens,
+                    temperature=temp,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=rep_penalty,
+                    predict_output_len=None  # 占位符，暂时不需要
+                ))
+                # 更新 start_idx
+                start_idx = end_idx
+        # [WT] end
+        
         with (set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -2295,14 +2364,24 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         ), record_function_or_nullcontext("Forward"),
               self.maybe_get_kv_connector_output(scheduler_output) as
               kv_connector_output):
-            model_output = self.model(
+            # [WT]predict activation 2025-12-16 19:25:31
+            if self.scheduler_config.activation_predict or self.scheduler_config.test_p2d:
+                model_output = self.model(
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
-
+                my_metadata=my_metadata,
+                activation_predict=True,
+                )            
+            else:
+                model_output = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    )
+            # [WT] end
         with record_function_or_nullcontext("Postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -3154,7 +3233,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     positions=positions,
                     intermediate_tensors=intermediate_tensors,
                     inputs_embeds=inputs_embeds,
-                    **model_kwargs,
                 )
 
             if self.use_aux_hidden_state_outputs:
@@ -3801,7 +3879,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     ) -> dict[str, torch.Tensor]:
         """
         Reshape the KV cache tensors to the desired shape and dtype.
-
+        
         Args:
             kv_cache_config: The KV cache config
             kv_cache_raw_tensors: The KV cache buffer of each layer, with
@@ -3985,7 +4063,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
-
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
             # validate all draft model layers belong to the same kv cache

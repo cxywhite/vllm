@@ -48,7 +48,6 @@ from vllm.v1.metrics.stats import IterationStats
 
 logger = init_logger(__name__)
 
-
 class AsyncLLM(EngineClient):
 
     def __init__(
@@ -269,9 +268,12 @@ class AsyncLLM(EngineClient):
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
+        # [WT]prometheus 2026-01-04 12:28:48
+        predictor_meta: Optional[dict[str, Any]] = None,
+        # [WT] end
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
-
+        # logger.info(f'HJT 333')
         if self.errored:
             raise EngineDeadError()
 
@@ -281,10 +283,13 @@ class AsyncLLM(EngineClient):
         queue = RequestOutputCollector(output_kind=params.output_kind)
 
         # Convert Input --> Request.
+        # [WT]prometheus 2026-01-04 12:29:25
         prompt_str, request = self.processor.process_inputs(
             request_id, prompt, params, arrival_time, lora_request,
-            tokenization_kwargs, trace_headers, priority, data_parallel_rank)
-
+            tokenization_kwargs, trace_headers, priority, data_parallel_rank,predictor_meta)
+        # [WT] end
+        # if request.predictor_meta is not None:
+        #     logger.info(f'###request.predictor_meta: {request.predictor_meta}')
         if is_pooling or params.n == 1:
             await self._add_request(request, prompt_str, None, 0, queue)
             return queue
@@ -329,6 +334,9 @@ class AsyncLLM(EngineClient):
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
+        # [WT]prometheus 2026-01-04 11:55:30
+        predictor_meta: Optional[dict[str, Any]] = None,
+        # [WT] end
     ) -> AsyncGenerator[RequestOutput, None]:
         """
         Main function called by the API server to kick off a request
@@ -344,7 +352,10 @@ class AsyncLLM(EngineClient):
         The caller of generate() iterates the returned AsyncGenerator,
         returning the RequestOutput back to the caller.
         """
-
+        # logger.info(f'HJT 222')
+        # if predictor_meta is not None:
+        #     logger.info(f'HJT 555 predictor_meta: {predictor_meta}')
+        # logger.info(f'predictor_meta: {predictor_meta}')
         if (self.vllm_config.cache_config.kv_sharing_fast_prefill
                 and sampling_params.prompt_logprobs):
             raise ValueError(
@@ -376,6 +387,9 @@ class AsyncLLM(EngineClient):
                 priority=priority,
                 tokenization_kwargs=tokenization_kwargs,
                 data_parallel_rank=data_parallel_rank,
+                # [WT]prometheus 2026-01-04 12:32:09
+                predictor_meta=predictor_meta
+                # [WT] end
             )
 
             # The output_handler task pushes items into the queue.
@@ -466,7 +480,7 @@ class AsyncLLM(EngineClient):
                         # 3) Abort any reqs that finished due to stop strings.
                         await engine_core.abort_requests_async(
                             processed_outputs.reqs_to_abort)
-
+                    # [WT]prometheus 2026-01-02 20:47:29
                     # 4) Logging.
                     # TODO(rob): make into a coroutine and launch it in
                     # background thread once Prometheus overhead is non-trivial.

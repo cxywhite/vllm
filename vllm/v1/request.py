@@ -43,6 +43,11 @@ class Request:
         trace_headers: Optional[Mapping[str, str]] = None,
         block_hasher: Optional[Callable[["Request"],
                                         list["BlockHash"]]] = None,
+        # [WT]prometheus 2026-01-04 13:10:11
+        predictor_meta: Optional[dict[str, Any]] = None,
+        preempt_count: Optional[int] = 0,
+        preempt_latency: Optional[list[float]] = None,
+        # [WT] end
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -121,7 +126,10 @@ class Request:
         if block_hasher is not None:
             self.get_hash_new_full_blocks = partial(block_hasher, self)
             self.block_hashes = self.get_hash_new_full_blocks()
-
+        # [WT]prometheus 2026-01-04 13:10:37
+        self.predictor_meta = predictor_meta
+        self.preempt_count = preempt_count
+        self.preempt_latency = preempt_latency if preempt_latency is not None else []
     @classmethod
     def from_engine_core_request(
         cls, request: EngineCoreRequest,
@@ -145,6 +153,8 @@ class Request:
             priority=request.priority,
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
+            # [WT]prometheus 2026-01-04 13:10:47
+            predictor_meta=request.predictor_meta,
         )
 
     def append_output_token_ids(

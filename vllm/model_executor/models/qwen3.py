@@ -140,7 +140,10 @@ class Qwen3Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        my_metadata: Optional[list[Any]] = None,
+        activate_predict: Optional[bool] = None,
     ) -> torch.Tensor:
+        token_importance = None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # Add qk-norm
@@ -155,7 +158,7 @@ class Qwen3Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
-        return output
+        return output, token_importance
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -218,7 +221,9 @@ class Qwen3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        my_metadata: Optional[list[Any]] = None,
+        activate_predict: Optional[bool] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -226,16 +231,24 @@ class Qwen3DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
+        if activate_predict and my_metadata is not None:
+            hidden_states, token_importance = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                my_metadata=my_metadata,
+                activate_predict=activate_predict,
+            )
+        else:
+            hidden_states, token_importance = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        return hidden_states, residual, token_importance
 
 
 ALL_DECODER_LAYER_TYPES = {

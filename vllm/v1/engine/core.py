@@ -437,9 +437,11 @@ class EngineCore:
             request.mm_features = (
                 self.mm_receiver_cache.get_and_update_features(
                     request.mm_features))
-
+        # [WT]prometheus 2026-01-04 12:45:05
+        # logger.info(f'###Engine core request: {request}')
         req = Request.from_engine_core_request(request,
                                                self.request_block_hasher)
+        
         if req.use_structured_output:
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For

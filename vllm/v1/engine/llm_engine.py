@@ -273,7 +273,7 @@ class LLMEngine:
 
         # 3) Abort any reqs that finished due to stop strings.
         self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
-
+           
         # 4) Record stats
         if self.logger_manager is not None:
             assert outputs.scheduler_stats is not None

@@ -61,7 +61,7 @@ class Scheduler(SchedulerInterface):
         self.log_stats = log_stats
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
-
+        # logger.info(f'[test]--- num_gpu_blocks: {self.cache_config.num_gpu_blocks}')
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
         # by update_from_outputs(). This is currently used in the multi-engine
@@ -175,7 +175,11 @@ class Scheduler(SchedulerInterface):
             dcp_world_size=self.dcp_world_size,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
-
+        # [WT]prometheus 2026-01-02 21:16:18
+        self.running_tokens = 0
+        self.running_predict_tokens = 0
+        self.waiting_tokens = 0
+        # [WT] end
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -210,6 +214,8 @@ class Scheduler(SchedulerInterface):
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
+            if request is not None and request.predictor_meta:
+                logger.info("RUNNING request %s", request.predictor_meta)
             num_new_tokens = (request.num_tokens_with_spec +
                               request.num_output_placeholders -
                               request.num_computed_tokens)
@@ -234,7 +240,6 @@ class Scheduler(SchedulerInterface):
                  ) = self._try_schedule_encoder_inputs(
                      request, request.num_computed_tokens, num_new_tokens,
                      encoder_compute_budget)
-
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
                 # reasons:
@@ -250,7 +255,7 @@ class Scheduler(SchedulerInterface):
                 # allow the lower-priority requests to be scheduled.
                 req_index += 1
                 continue
-
+            # logger.info(f'[test] num_new_tokens:{num_new_tokens} for running request {request.request_id}')
             while True:
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -269,7 +274,11 @@ class Scheduler(SchedulerInterface):
                             scheduled_running_reqs.remove(preempted_req)
                     else:
                         preempted_req = self.running.pop()
-
+                        # [WT]test preempted 2026-01-19 21:27:26
+                        timenow=time.time()
+                        preempted_req.preempt_count += 1
+                        preempted_req.preempt_latency.append(timenow)
+                        # logger.info(f'[test] Preempting request:{preempted_req.request_id} arrival time: {preempted_req.arrival_time} preempted at: {timenow} preempted count:{preempted_req.preempt_count}')
                     self.kv_cache_manager.free(preempted_req)
                     self.encoder_cache_manager.free(preempted_req)
                     preempted_req.status = RequestStatus.PREEMPTED
@@ -298,7 +307,6 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
-
             # Speculative decode related.
             if request.spec_token_ids:
                 num_scheduled_spec_tokens = (num_new_tokens +
@@ -496,6 +504,8 @@ class Scheduler(SchedulerInterface):
                 # Request was already popped from self.waiting
                 # unless it was re-added above due to new_blocks being None.
                 request = self.waiting.pop_request()
+                # if request is not None and request.predictor_meta:
+                #     logger.info(f'WAITING request {request.predictor_meta}')
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -505,6 +515,8 @@ class Scheduler(SchedulerInterface):
 
                 req_index += 1
                 self.running.append(request)
+                if request.preempt_count > 0:
+                    logger.info(f"[test] Resuming preempted request:{request.request_id} num_prompt_tokens:{request.num_prompt_tokens} num_computed_tokens:{request.num_computed_tokens}  preempted count:{request.preempt_count}")
                 if self.log_stats:
                     request.record_event(EngineCoreEventType.SCHEDULED,
                                          scheduled_timestamp)
@@ -522,6 +534,7 @@ class Scheduler(SchedulerInterface):
                     self.kv_cache_manager.get_blocks(request.request_id))
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                logger.info(f'[test] Scheduled WAITING request {request.request_id} for {num_new_tokens} tokens. Token budget left: {token_budget}')
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
@@ -933,6 +946,11 @@ class Scheduler(SchedulerInterface):
                 kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
+                    # [WT]preempt 2026-01-20 10:29:45
+                    if self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.kv_role == 'kv_consumer':
+                        if len(request.preempt_latency)>0:
+                            timestop=time.time()
+                            logger.info(f'Request {request.request_id} finished. Total time: {timestop - request.arrival_time:.2f} seconds, arrival time: {request.arrival_time:.2f}, preempted time: {request.preempt_latency}, preempted count: {request.preempt_count}, stop time: {timestop}')
                 else:
                     stopped_preempted_reqs.add(request)
 
@@ -1009,7 +1027,29 @@ class Scheduler(SchedulerInterface):
                     engine_core_outputs[client_index] = EngineCoreOutputs(
                         finished_requests=finished_set)
             finished_req_ids.clear()
-
+        # [WT]prometheus 2026-01-02 21:14:52
+        if self.vllm_config.scheduler_config is not None and self.vllm_config.kv_transfer_config is not None:
+           if self.vllm_config.kv_transfer_config.kv_role == 'kv_consumer' or self.vllm_config.scheduler_config.test_p2d:
+                if self.vllm_config.scheduler_config.activation_predict:
+                    self.running_tokens = 0
+                    self.running_predict_tokens = 0
+                    self.waiting_tokens = 0
+                    for req in self.running:
+                        self.running_tokens+= req.num_computed_tokens
+                        self.running_predict_tokens += max(1, req.num_prompt_tokens+req.predictor_meta['predict_output_len']-req.num_computed_tokens)
+                    for req in self.waiting:
+                        self.waiting_tokens =self.waiting_tokens+req.num_prompt_tokens+req.predictor_meta['predict_output_len']
+                        logger.info(f'[test] WAITING request {req.request_id} predictor_meta: {req.predictor_meta}, num_prompt_tokens: {req.num_prompt_tokens}, num_computed_tokens: {req.num_computed_tokens}, waiting_tokens: {self.waiting_tokens}')
+                else:
+                    self.running_tokens = 0
+                    self.running_predict_tokens = 0
+                    self.waiting_tokens = 0
+                    for req in self.running:
+                        self.running_tokens+= req.num_computed_tokens
+                    for req in self.waiting:
+                        self.waiting_tokens+= req.num_prompt_tokens
+                    # logger.info(f'[test] WAITING request {req.request_id} , num_prompt_tokens: {req.num_prompt_tokens}, num_computed_tokens: {req.num_computed_tokens}, waiting_tokens: {self.waiting_tokens}')
+        # [WT] end
         if (stats := self.make_stats(spec_decoding_stats,
                                      kv_connector_stats)) is not None:
             # Return stats to only one of the front-ends.
@@ -1190,7 +1230,13 @@ class Scheduler(SchedulerInterface):
                               num_corrupted_reqs=sum(req.is_output_corrupted
                                                      for req in self.running),
                               kv_connector_stats=kv_connector_stats.data
-                              if kv_connector_stats else None)
+                              if kv_connector_stats else None,
+                              # [WT]prometheus 2026-01-02 21:17:03
+                              running_tokens=self.running_tokens,
+                              running_predict_tokens=self.running_predict_tokens,
+                              waiting_tokens=self.waiting_tokens
+                              # [WT] end
+                              )
 
     def make_spec_decoding_stats(
         self,

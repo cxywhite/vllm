@@ -69,6 +69,8 @@ class EngineCoreRequest(
     priority: int = 0
 
     trace_headers: Optional[Mapping[str, str]] = None
+    # [WT]prometheus 2026-01-04 12:30:54
+    predictor_meta: Optional[dict[str, Any]] = None
 
 
 class EngineCoreEventType(enum.IntEnum):

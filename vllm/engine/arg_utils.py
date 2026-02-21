@@ -485,6 +485,12 @@ class EngineArgs:
     kv_sharing_fast_prefill: bool = \
         CacheConfig.kv_sharing_fast_prefill
 
+    # [WT]custom schedule 2025-09-09 19:09:12 
+    pastfuture_scheduler: Optional[bool] = None
+    activation_predict:Optional[bool] = None
+    aimd_scheduler:Optional[bool] = None
+    test_p2d:Optional[bool] = None
+    test_model:Optional[str] = None
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -942,7 +948,22 @@ class EngineArgs:
         parser.add_argument('--disable-log-stats',
                             action='store_true',
                             help='Disable logging statistics.')
-
+        # [WT]custom schedule 
+        parser.add_argument('--pastfuture-scheduler',
+                            action='store_true',
+                            help='Use custom scheduler.')
+        parser.add_argument('--activation-predict',
+                            action='store_true',
+                            help='Use activation predict.')
+        parser.add_argument('--aimd-scheduler',
+                            action='store_true',
+                            help='Use aimd scheduler.')
+        parser.add_argument('--test-p2d',
+                            action='store_true',
+                            help='Use test p2d.')
+        parser.add_argument('--test-model',
+                            type=str,
+                            help='Use test model.')
         return parser
 
     @classmethod
@@ -1377,6 +1398,12 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.
             disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
+            # [WT]custom schedule 2025-09-09 21:16:10
+            pastfuture_scheduler=self.pastfuture_scheduler,
+            activation_predict=self.activation_predict,
+            aimd_scheduler=self.aimd_scheduler,
+            test_p2d=self.test_p2d,
+            test_model=self.test_model,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

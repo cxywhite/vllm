@@ -203,8 +203,33 @@ class PrometheusStatLogger(StatLoggerBase):
         self.gauge_scheduler_waiting = make_per_engine(gauge_scheduler_waiting,
                                                        engine_indexes,
                                                        model_name)
-
-        #
+        # [WT]prometheus 2026-01-02 21:20:20
+        gauge_running_tokens = self._gauge_cls(
+            name="vllm:running_tokens",
+            documentation="Total number of tokens in running requests.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames)
+        self.gauge_running_tokens = make_per_engine(gauge_running_tokens,
+                                                         engine_indexes,
+                                                            model_name)
+        gauge_running_predict_tokens = self._gauge_cls(
+            name="vllm:running_predict_tokens",
+            documentation="Total number of predicted tokens in running requests.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames)
+        self.gauge_running_predict_tokens = make_per_engine(gauge_running_predict_tokens,
+                                                            engine_indexes,
+                                                            model_name)
+        gauge_waiting_tokens = self._gauge_cls(
+            name="vllm:waiting_tokens",
+            documentation="Total number of tokens in waiting requests.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames)
+        self.gauge_waiting_tokens = make_per_engine(gauge_waiting_tokens,
+                                                    engine_indexes,
+                                                    model_name)
+        # [WT] end
+        
         # GPU cache
         #
         # Deprecated in 0.9.2 - Renamed as vllm:kv_cache_usage_perc
@@ -497,6 +522,8 @@ class PrometheusStatLogger(StatLoggerBase):
                         self.labelname_running_lora_adapters,
                     ],
                 )
+        
+
 
     def log_metrics_info(self, type: str, config_obj: SupportsMetricsInfo):
         metrics_info = config_obj.metrics_info()
@@ -532,7 +559,14 @@ class PrometheusStatLogger(StatLoggerBase):
                 scheduler_stats.num_running_reqs)
             self.gauge_scheduler_waiting[engine_idx].set(
                 scheduler_stats.num_waiting_reqs)
-
+            # [WT]prometheus 2026-01-02 21:20:20
+            self.gauge_running_tokens[engine_idx].set(
+                scheduler_stats.running_tokens)
+            self.gauge_running_predict_tokens[engine_idx].set(
+                scheduler_stats.running_predict_tokens)
+            self.gauge_waiting_tokens[engine_idx].set(
+                scheduler_stats.waiting_tokens)
+            # [WT] end
             if self.show_hidden_metrics:
                 self.gauge_gpu_cache_usage[engine_idx].set(
                     scheduler_stats.kv_cache_usage)
@@ -613,6 +647,8 @@ class PrometheusStatLogger(StatLoggerBase):
             }
             self.gauge_lora_info.labels(**lora_info_labels)\
                                 .set_to_current_time()
+        
+
 
     def log_engine_initialized(self):
         self.log_metrics_info("cache_config", self.vllm_config.cache_config)

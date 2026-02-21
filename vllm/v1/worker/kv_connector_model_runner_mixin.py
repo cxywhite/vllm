@@ -87,6 +87,8 @@ class KVConnectorModelRunnerMixin:
     def maybe_get_kv_connector_output(
         scheduler_output: "SchedulerOutput"
     ) -> AbstractContextManager[Optional[KVConnectorOutput]]:
+        # logger.info(f'[test]+++ 3 KVConnectorModelRunnerMixin maybe_get_kv_connector_output')
+        # logger.info(f'[test]+++ KVConnectorModelRunnerMixin maybe_get_kv_connector_output')
         return KVConnectorModelRunnerMixin._get_kv_connector_output(
             scheduler_output) if has_kv_transfer_group() else nullcontext()
 
@@ -98,6 +100,8 @@ class KVConnectorModelRunnerMixin:
         scheduler_output: "SchedulerOutput",
         wait_for_save: bool = True
     ) -> Generator[KVConnectorOutput, None, None]:
+        # logger.info(f'[test]+++ 4 KVConnectorModelRunnerMixin _get_kv_connector_output')
+        # logger.info(f'[test]+++ KVConnectorModelRunnerMixin _get_kv_connector_output')
         output = KVConnectorOutput()
 
         # Update KVConnector with the KVConnector metadata forward().
