@@ -74,7 +74,7 @@
   vllm/vllm/distributed/kv_transfer/kv_connector/v1/p2p
   ```
 
-- `disagg_proxy_p2p_nccl_xpyd.py`  
+- `test_disagg_proxy.py`  
   放置路径：  
   ```
   vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd
