@@ -40,6 +40,7 @@ predictor_sock.bind(PREDICTOR_ZMQ_ADDR)
 
 # request_id -> asyncio.Future
 pending_predictor_futures: dict[str, asyncio.Future] = {}
+future_aliases: dict[asyncio.Future, set[str]] = {}
 prefilled_finished_requests: dict[str, Any] = {}
 
 # Routing PUB
@@ -47,6 +48,47 @@ ROUTING_PUB_ADDR = "tcp://127.0.0.1:32324"
 routing_ctx = zmq.Context.instance()
 routing_pub = routing_ctx.socket(zmq.PUB)
 routing_pub.bind(ROUTING_PUB_ADDR)
+
+
+def _predictor_id_aliases(req_id: str) -> set[str]:
+    aliases = {req_id}
+    if req_id.endswith("-0"):
+        aliases.add(req_id[:-2])
+    else:
+        aliases.add(f"{req_id}-0")
+
+    if req_id.startswith("chatcmpl-"):
+        tail = req_id[len("chatcmpl-"):]
+        aliases.add(f"cmpl-{tail}")
+        aliases.add(f"cmpl-{tail}-0")
+    elif req_id.startswith("cmpl-"):
+        tail = req_id[len("cmpl-"):]
+        aliases.add(f"chatcmpl-{tail}")
+        aliases.add(f"chatcmpl-{tail}-0")
+    return aliases
+
+
+def _register_predictor_future(fut: asyncio.Future, req_id: str) -> None:
+    aliases = _predictor_id_aliases(req_id)
+    future_aliases[fut] = aliases
+    for alias in aliases:
+        pending_predictor_futures[alias] = fut
+
+
+def _unregister_predictor_future(fut: asyncio.Future) -> None:
+    aliases = future_aliases.pop(fut, set())
+    for alias in aliases:
+        existing = pending_predictor_futures.get(alias)
+        if existing is fut:
+            pending_predictor_futures.pop(alias, None)
+
+
+def _pop_prefilled_meta_by_alias(req_id: str) -> Optional[dict[str, Any]]:
+    for alias in _predictor_id_aliases(req_id):
+        item = prefilled_finished_requests.pop(alias, None)
+        if item is not None:
+            return item[0]
+    return None
 
 @dataclass
 class ModelConfig:
@@ -252,9 +294,9 @@ class DecodeMonitor:
         
         if not valid_candidates: return None, None, float("inf")
         
-        # 逻辑：按Future_tokens排序取Top3，再从Top3选负载最小
+        # 逻辑：按Future_tokens排序取Top2，再从Top2选负载最小
         valid_candidates.sort(key=lambda x: x[0])
-        top_candidates = valid_candidates[:3]
+        top_candidates = valid_candidates[:2]
         top_candidates.sort(key=lambda x: x[1])
         
         best_future, best_bottle, best_addr, best_zmq_addr = top_candidates[0]
@@ -316,10 +358,17 @@ def _listen_predictor_metadata():
             for meta in meta_list:
                 req_id = meta.get("req_id")
                 if not req_id: continue
+
+                matched_future = None
+                for alias in _predictor_id_aliases(req_id):
+                    matched_future = pending_predictor_futures.get(alias)
+                    if matched_future is not None:
+                        break
                 
                 # 如果 handle_request 正在等待这个 req_id
-                if req_id in pending_predictor_futures:
-                    fut = pending_predictor_futures.pop(req_id)
+                if matched_future is not None:
+                    fut = matched_future
+                    _unregister_predictor_future(fut)
                     if not fut.done():
                         # 获取主事件循环并设置结果
                         fut.get_loop().call_soon_threadsafe(fut.set_result, meta)
@@ -374,7 +423,7 @@ async def handle_request():
             count += 1
 
         request_id = f"___prefill_addr_{prefill_zmq_addr}__{uuid.uuid4().hex}"
-        predictor_req_id = f"cmpl-{request_id}-0"
+        predictor_req_id = f"chatcmpl-{request_id}"
 
         # 2. 发起 Prefill
         # 这里必须完整耗尽 generator
@@ -384,16 +433,17 @@ async def handle_request():
         # 3. 获取 Predictor Metadata (使用 Future 模式)
         predictor_meta = None
         # 检查是否已经提前到达
-        if predictor_req_id in prefilled_finished_requests:
-            predictor_meta, _ = prefilled_finished_requests.pop(predictor_req_id)
+        predictor_meta = _pop_prefilled_meta_by_alias(predictor_req_id)
+        if predictor_meta is not None:
+            pass
         else:
             # 创建 Future 并等待 ZMQ 线程填充
             fut = asyncio.get_event_loop().create_future()
-            pending_predictor_futures[predictor_req_id] = fut
+            _register_predictor_future(fut, predictor_req_id)
             try:
                 predictor_meta = await asyncio.wait_for(fut, timeout=180.0)
             except asyncio.TimeoutError:
-                pending_predictor_futures.pop(predictor_req_id, None)
+                _unregister_predictor_future(fut)
                 return "Predictor metadata timeout", 504
 
         # 4. 选择最佳 Decode 节点
@@ -402,6 +452,12 @@ async def handle_request():
             decode_addr, decode_zmq_addr, _ = monitor.select_best_instance(decode_list, predictor_meta)
 
         if not decode_addr: return "No decode instances available", 503
+
+        print(
+            f"[WT][ROUTE] req_id={predictor_meta.get('req_id')} "
+            f"prefill={prefill_addr} decode={decode_addr}",
+            flush=True,
+        )
 
         # 5. 广播路由决策并更新 ID
         routing_msg = f"{predictor_req_id}|{decode_zmq_addr}"

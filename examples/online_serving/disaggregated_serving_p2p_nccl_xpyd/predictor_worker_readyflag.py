@@ -4,6 +4,7 @@ import torch.nn as nn
 import threading
 import time
 import json
+import csv
 from typing import Dict, Any, Optional
 import torch.nn.functional as F
 from transformers import BertModel,AutoTokenizer,AutoConfig
@@ -16,6 +17,9 @@ import pickle
 import os
 import zmq
 import logging
+import queue
+import atexit
+
 class BertLengthDistributionModel_B(torch.nn.Module):
     def __init__(self, config, model_name, input_dim, hidden_dim, n_classes):
         super().__init__()
@@ -186,6 +190,36 @@ class PredictorWorker:
         zmq_proxy_addr = "tcp://127.0.0.1:32323"  # 替换为实际的ZMQ代理地址
         self.zmq_sock.connect(zmq_proxy_addr)
 
+        # -------- ASYNC TIMING CSV EXPORT --------
+        default_csv_path = (
+            f"/root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/4-Predict_latency/tmp/predict_timing_{time.strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+        )
+        self.timing_csv_path = os.getenv(
+            "WT_PREDICT_TIMING_CSV", default_csv_path)
+        self.verbose_timing = os.getenv("WT_TIMING_VERBOSE", "0") == "1"
+        self._timing_queue: "queue.Queue[list[Any]]" = queue.Queue(maxsize=65536)
+        self._timing_drop_count = 0
+        self._timing_stop_event = threading.Event()
+        self._timing_pending_lock = threading.Lock()
+        self._timing_pending: dict[str, Custom_Metadata] = {}
+        self._timing_pending_sleep_s = max(
+            float(os.getenv("WT_TIMING_PENDING_CHECK_MS", "1")) / 1000.0,
+            0.0005,
+        )
+        self._timing_writer_thread = threading.Thread(
+            target=self._timing_writer_loop,
+            daemon=True,
+            name="wt-timing-csv-writer",
+        )
+        self._timing_writer_thread.start()
+        self._timing_pending_thread = threading.Thread(
+            target=self._timing_pending_loop,
+            daemon=True,
+            name="wt-timing-pending-flusher",
+        )
+        self._timing_pending_thread.start()
+        atexit.register(self._stop_timing_writer)
+
     def start(self):
         for _ in range(self.num_threads):
             t = threading.Thread(
@@ -210,32 +244,30 @@ class PredictorWorker:
                     hidden_flat: torch.Tensor,  # [N,4096]
                     importance_flat: torch.Tensor,  # [N]
                     meta: list[Custom_Metadata]):
-        req_seqs = []
         lengths  = []
+        active_meta: list[Custom_Metadata] = []
+        token_ranges = []
         temp_list = []
         topp_list = []
         topk_list = []
         repetition_penalty_list = []
         for m in meta:
             (start, end) = m.token_range
-            seq = hidden_flat[start:end]
-            imp = importance_flat[start:end]
-            assert seq.dim() == 2
-            assert imp.dim() == 1
-            assert seq.shape[0] == imp.shape[0]
-            k = min(self.max_req_len, seq.shape[0])
-            topk_idx = torch.topk(imp, k=k).indices
-            selected_seq = seq[topk_idx]
-            req_seqs.append(selected_seq)
-            lengths.append(selected_seq.shape[0])
+            if end <= start:
+                continue
+
+            seq_len = end - start
+            lengths.append(min(self.max_req_len, seq_len))
+            active_meta.append(m)
+            token_ranges.append((start, end))
             temp_list.append(float(m.temperature))
             topp_list.append(float(m.top_p))
             topk_list.append(int(m.top_k))
             repetition_penalty_list.append(float(m.repetition_penalty))
             
-        if not req_seqs:
+        if not token_ranges:
             return
-        batch_size = len(req_seqs)
+        batch_size = len(token_ranges)
         max_len    = max(lengths)
         hidden_dim = hidden_flat.shape[1]
         device     = hidden_flat.device
@@ -252,13 +284,20 @@ class PredictorWorker:
             batch_size,
             max_len + 2,
             device=device,
-            dtype=torch.bfloat16
+            dtype=torch.bool
         )
-        attention_mask = attention_mask.to(dtype=torch.bfloat16)
-        for i, seq in enumerate(req_seqs):
-            L = seq.shape[0]
-            inputs_embeds[i, 1:1+L] = seq
-            attention_mask[i, :L+2] = 1
+        for i, (start, end) in enumerate(token_ranges):
+            seq = hidden_flat[start:end]
+            imp = importance_flat[start:end]
+            assert seq.dim() == 2
+            assert imp.dim() == 1
+            assert seq.shape[0] == imp.shape[0]
+
+            k = lengths[i]
+            topk_idx = torch.topk(imp, k=k, sorted=False).indices
+            topk_idx, _ = torch.sort(topk_idx)
+            inputs_embeds[i, 1:1 + k] = seq[topk_idx]
+            attention_mask[i, :k + 2] = True
         lengths = torch.tensor(lengths, device=device, dtype=torch.long)
         sampling_params = {
                         'temperature': temp_list,
@@ -266,10 +305,7 @@ class PredictorWorker:
                         'topk': topk_list,
                         'repetition_penalty': repetition_penalty_list
                     }
-        attention_mask = attention_mask.to(
-            device=inputs_embeds.device,
-            dtype=torch.bfloat16
-        )
+        attention_mask = attention_mask.to(device=inputs_embeds.device)
         with torch.no_grad():
             logits = self.predictor(inputs_embeds, attention_mask, lengths, sampling_params)
             probabilities = F.softmax(logits, dim=-1).to(torch.bfloat16)
@@ -287,23 +323,197 @@ class PredictorWorker:
             # mu_eff = (1 - lambdas) * bucket_mean + lambdas * bucket_high
             if self.input_dim == 4096:
                 bucket_low=torch.tensor([0,393,1145,7775,8167],device=device,dtype=torch.bfloat16)
-                bucket_mean=torch.tensor([219,645,3680,8078,8179],device=device,dtype=torch.bfloat16)
-                
+                # bucket_mean=torch.tensor([219,645,3680,8078,8179],device=device,dtype=torch.bfloat16)
+                # bucket两边的mean值(low+high)/2
+                bucket_median=torch.tensor([196,769,4460,7971,8180],device=device,dtype=torch.bfloat16)
             elif self.input_dim == 3584:
                 bucket_low=torch.tensor([0,281,704,26232,32730],device=device,dtype=torch.bfloat16)
-                bucket_mean=torch.tensor([127,464,5512,32385,32751],device=device,dtype=torch.bfloat16)
+                # bucket_mean=torch.tensor([127,464,5512,32385,32751],device=device,dtype=torch.bfloat16)
+                # bucket两边的mean值(low+high)/2
+                bucket_median=torch.tensor([140,482,4668,29489,32751],device=device,dtype=torch.bfloat16)
             
-            lambdas=torch.tensor([1.0, 0.8, 0.5, 0.2, 0.2],device=device,dtype=torch.bfloat16)
-            mu_eff = (1 - lambdas) * bucket_low  + lambdas * bucket_mean
-            predict_len=(probabilities * mu_eff).sum(dim=-1)
+            # lambdas=torch.tensor([1.0, 0.8, 0.5, 0.2, 0.2],device=device,dtype=torch.bfloat16)
+            # mu_eff = (1 - lambdas) * bucket_low  + lambdas * bucket_median
+            # predict_len=(probabilities * mu_eff).sum(dim=-1)
+            # 计算预测长度的miu
+            miu=(probabilities * bucket_median).sum(dim=-1)
+            sigma=torch.sqrt((probabilities * (bucket_median - miu.unsqueeze(-1))**2).sum(dim=-1))
+            predict_len=miu + sigma
             # predict_len向上取整为int型整数
-            for i in range(len(meta)):
-                assert meta[i].predict_output_len==None
-                meta[i].predict_output_len = int(predict_len[i].item())
-            self._send_metadata_to_proxy(meta)
+            predict_end_ts_ns = time.perf_counter_ns()
+            timing_rows = []
+            for i in range(len(active_meta)):
+                assert active_meta[i].predict_output_len==None
+                active_meta[i].predict_output_len = int(predict_len[i].item())
+                active_meta[i].predict_end_ts_ns = predict_end_ts_ns
+                row = self._build_complete_timing_row(active_meta[i])
+                if row is not None:
+                    timing_rows.append(row)
+                else:
+                    self._defer_timing_meta(active_meta[i])
+
+            self._enqueue_timing_rows(timing_rows)
+            # Opportunistically flush deferred rows without blocking hot path.
+            self._drain_ready_timing_meta(max_items=64)
+            self._send_metadata_to_proxy(active_meta)
             with self.lock:
                 self.predict_num += batch_size
                 print(f"[WT] Total predictions made: {self.predict_num} predictor_worker_readyflag.py")
+
+    def _build_complete_timing_row(
+        self,
+        meta: Custom_Metadata,
+    ) -> Optional[list[Any]]:
+        if (meta.predict_start_ts_ns is None or
+                meta.prefill_end_ts_ns is None or
+                meta.predict_end_ts_ns is None):
+            return None
+
+        prefill_tail_ms = (
+            meta.prefill_end_ts_ns - meta.predict_start_ts_ns) / 1e6
+        predict_ms = (
+            meta.predict_end_ts_ns - meta.predict_start_ts_ns) / 1e6
+        covered = meta.predict_end_ts_ns <= meta.prefill_end_ts_ns
+
+        if self.verbose_timing:
+            print(
+                f"[WT][Overlap] req_id={meta.req_id} "
+                f"predict_ms={predict_ms:.3f} "
+                f"prefill_tail_ms={prefill_tail_ms:.3f} "
+                f"covered={covered}")
+
+        return [
+            meta.req_id,
+            meta.predict_start_ts_ns,
+            meta.prefill_end_ts_ns,
+            meta.predict_end_ts_ns,
+            prefill_tail_ms,
+            predict_ms,
+            covered,
+        ]
+
+    def _timing_pending_key(self, meta: Custom_Metadata) -> str:
+        return f"{meta.req_id}::{id(meta)}"
+
+    def _defer_timing_meta(self, meta: Custom_Metadata) -> None:
+        key = self._timing_pending_key(meta)
+        with self._timing_pending_lock:
+            self._timing_pending[key] = meta
+
+    def _drain_ready_timing_meta(self, max_items: int = 256) -> int:
+        drained = 0
+        ready_rows: list[list[Any]] = []
+
+        with self._timing_pending_lock:
+            keys = list(self._timing_pending.keys())
+
+        for key in keys:
+            if drained >= max_items:
+                break
+
+            with self._timing_pending_lock:
+                meta = self._timing_pending.get(key)
+
+            if meta is None:
+                continue
+
+            row = self._build_complete_timing_row(meta)
+            if row is None:
+                continue
+
+            with self._timing_pending_lock:
+                removed = self._timing_pending.pop(key, None)
+            if removed is None:
+                continue
+
+            ready_rows.append(row)
+            drained += 1
+
+        if ready_rows:
+            self._enqueue_timing_rows(ready_rows)
+
+        return drained
+
+    def _timing_pending_loop(self) -> None:
+        while True:
+            if self._timing_stop_event.is_set():
+                self._drain_ready_timing_meta(max_items=4096)
+                with self._timing_pending_lock:
+                    if not self._timing_pending:
+                        break
+                time.sleep(self._timing_pending_sleep_s)
+                continue
+
+            drained = self._drain_ready_timing_meta(max_items=256)
+            if drained == 0:
+                time.sleep(self._timing_pending_sleep_s)
+
+    def _enqueue_timing_rows(self, rows: list[list[Any]]) -> None:
+        if not rows:
+            return
+        for row in rows:
+            try:
+                self._timing_queue.put_nowait(row)
+            except queue.Full:
+                self._timing_drop_count += 1
+                if self._timing_drop_count % 1000 == 0:
+                    print(
+                        f"[WT][TimingCSV] dropped rows={self._timing_drop_count} "
+                        "(queue full)")
+
+    def _ensure_timing_csv_header(self) -> None:
+        csv_dir = os.path.dirname(self.timing_csv_path)
+        if csv_dir:
+            os.makedirs(csv_dir, exist_ok=True)
+
+        need_header = (not os.path.exists(self.timing_csv_path) or
+                       os.path.getsize(self.timing_csv_path) == 0)
+        if not need_header:
+            return
+
+        with open(self.timing_csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "req_id",
+                "predict_start_ts_ns",
+                "prefill_end_ts_ns",
+                "predict_end_ts_ns",
+                "prefill_tail_ms",
+                "predict_ms",
+                "predict_hidden_by_prefill",
+            ])
+
+    def _timing_writer_loop(self) -> None:
+        self._ensure_timing_csv_header()
+        with open(self.timing_csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            while True:
+                if self._timing_stop_event.is_set() and self._timing_queue.empty():
+                    break
+
+                batch: list[list[Any]] = []
+                try:
+                    row = self._timing_queue.get(timeout=0.2)
+                    batch.append(row)
+                except queue.Empty:
+                    continue
+
+                while len(batch) < 512:
+                    try:
+                        batch.append(self._timing_queue.get_nowait())
+                    except queue.Empty:
+                        break
+
+                writer.writerows(batch)
+                f.flush()
+
+    def _stop_timing_writer(self) -> None:
+        self._timing_stop_event.set()
+        if self._timing_pending_thread.is_alive():
+            self._timing_pending_thread.join(timeout=1.0)
+        if self._timing_writer_thread.is_alive():
+            self._timing_writer_thread.join(timeout=1.0)
+
     def _send_metadata_to_proxy(self, meta: list[Custom_Metadata]):
         """
         Non-blocking send of predictor metadata to proxy.

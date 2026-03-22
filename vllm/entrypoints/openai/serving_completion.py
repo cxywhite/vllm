@@ -223,7 +223,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         lora_request=lora_request,
                     )
                 else:
-                    # logger.info(f'HJT 111')
+                    # [WT]prometheus 2026-01-04 13:10:11
                     generator = self.engine_client.generate(
                         engine_prompt,
                         sampling_params,
@@ -233,7 +233,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         priority=request.priority,
                         predictor_meta=request.predictor_meta,
                     )
-
+                    # [WT]end
                 generators.append(generator)
         except ValueError as e:
             # TODO: Use a vllm-specific Validation Error

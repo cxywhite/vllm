@@ -66,6 +66,7 @@ import pickle
 import tempfile
 import sys
 import os
+import time
 # sys.path.append('/root/predict-schedule')
 # from design_predict_activation_experiment.wt_metadata import Custom_Metadata
 # 获取当前文件 (llama.py) 所在目录的绝对路径
@@ -248,6 +249,7 @@ class LlamaAttention(nn.Module):
         # [WT]predict activation 2025-12-22 14:46:40
         my_metadata: Optional[list[Custom_Metadata]] = None,
         activate_predict:Optional[bool]=None,
+        compute_importance: bool = False,
         # [WT] end
     ) -> torch.Tensor:
         # logger.info(f"[HJT]&&& LlamaAttention forward")
@@ -256,7 +258,7 @@ class LlamaAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         # [WT]predict activation 2025-12-22 22:16:08
         token_importance = None
-        if activate_predict and my_metadata is not None:
+        if activate_predict and my_metadata is not None and compute_importance:
             # reshape
             qh = q.view(-1, self.num_heads, self.head_dim)
             kh = k.view(-1, self.num_kv_heads, self.head_dim)
@@ -271,18 +273,20 @@ class LlamaAttention(nn.Module):
                 if start >= end:
                     continue
 
-                _q = qh[start:end]  # [s, h, d]
+                # [s, h, d] / [s, h_kv, d]
+                _q = qh[start:end]
                 _k = kh[start:end]
 
-                _q = _q.permute(1, 0, 2).unsqueeze(1)   # [h,1,s,d]
-                _k = _k.permute(1, 0, 2).unsqueeze(0)   # [1,h_kv,s,d]
-
-                attn = torch.matmul(
-                    _q, _k.transpose(2, 3)
-                ) * self.scaling
+                # Algebraically equivalent to averaging over (h, h_kv)
+                # after pairwise dot products, but avoids materializing
+                # a large [h, h_kv, s, s] tensor.
+                q_mean = _q.mean(dim=1)  # [s, d]
+                k_mean = _k.mean(dim=1)  # [s, d]
 
                 # [s, s]
-                score = attn.mean(dim=(0, 1))
+                score = torch.matmul(
+                    q_mean, k_mean.transpose(0, 1)
+                ) * self.scaling
 
                 # importance: [s]
                 token_importance[start:end] = score.mean(dim=0)
@@ -388,6 +392,7 @@ class LlamaDecoderLayer(nn.Module):
         # [WT]predict activation 2025-12-22 22:17:08
         my_metadata: Optional[list[Custom_Metadata]] = None,
         activate_predict:Optional[bool]=None,
+        compute_importance: bool = False,
         # [WT] end
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
@@ -402,7 +407,8 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states,token_importance = self.self_attn(positions=positions,
                                        hidden_states=hidden_states,
                                        my_metadata=my_metadata,
-                                       activate_predict=activate_predict)
+                                       activate_predict=activate_predict,
+                                       compute_importance=compute_importance)
         else:
             hidden_states,token_importance = self.self_attn(positions=positions,
                                        hidden_states=hidden_states)
@@ -505,15 +511,32 @@ class LlamaModel(nn.Module):
         aux_hidden_states = []
         # [WT]predict activation 2025-12-22 22:18:42
         kv_role = self.kv_transfer_config.kv_role if self.kv_transfer_config else None
+        target_layer_idx = 15
+        predict_start_ts_ns: Optional[int] = None
         # [WT] end
         for idx, layer in enumerate(
                 islice(self.layers, self.start_layer, self.end_layer)):
+            layer_idx = self.start_layer + idx
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
             # [WT]predict activation 2025-12-22 22:19:42
-            if activate_predict and kv_role is not None and kv_role=='kv_producer' and my_metadata is not None and idx==7 :
-                hidden_states, residual,token_importance = layer(positions, hidden_states, residual,my_metadata=my_metadata,activate_predict=activate_predict)
+            if (activate_predict and kv_role is not None and
+                    kv_role == 'kv_producer' and my_metadata is not None and
+                    layer_idx == target_layer_idx):
+                hidden_states, residual,token_importance = layer(
+                    positions,
+                    hidden_states,
+                    residual,
+                    my_metadata=my_metadata,
+                    activate_predict=activate_predict,
+                    compute_importance=True)
                 assert token_importance is not None
+
+                predict_start_ts_ns = time.perf_counter_ns()
+                for m in my_metadata:
+                    if m.predict_start_ts_ns is None:
+                        m.predict_start_ts_ns = predict_start_ts_ns
+
                 # 传输hidden_states和my_metadata到gpu buffer
                 size_in_bytes = hidden_states.element_size() * hidden_states.numel()
                 size_in_mb = size_in_bytes / (1024 * 1024)
@@ -524,7 +547,13 @@ class LlamaModel(nn.Module):
                     meta=my_metadata              # req_id -> (start,end)
                 )
             else:
-                hidden_states, residual,token_importance = layer(positions, hidden_states, residual)
+                hidden_states, residual,token_importance = layer(
+                    positions,
+                    hidden_states,
+                    residual,
+                    my_metadata=my_metadata,
+                    activate_predict=activate_predict,
+                    compute_importance=False)
             # [WT] end
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
@@ -533,6 +562,12 @@ class LlamaModel(nn.Module):
             })
 
         hidden_states, _ = self.norm(hidden_states, residual)
+
+        # 记录从第16层中间激活导出开始到prefill完成(32层输出)的终止时刻。
+        if predict_start_ts_ns is not None and my_metadata is not None:
+            prefill_end_ts_ns = time.perf_counter_ns()
+            for m in my_metadata:
+                m.prefill_end_ts_ns = prefill_end_ts_ns
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states

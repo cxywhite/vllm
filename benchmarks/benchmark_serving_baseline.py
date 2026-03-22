@@ -800,15 +800,10 @@ def main(args: argparse.Namespace):
 
     if args.dataset_name == "custom" or args.dataset_name == "mysharegpt" or args.dataset_name == "lmsyschat" or args.dataset_name == "qwen" or args.dataset_name == "qwen_new":
         if args.dataset_name == "lmsyschat":
-            # 读取指定目录下的所有CSV 文件
-            df_list = []
-            for file in os.listdir(args.dataset_path):
-                if file.endswith('.csv'):
-                    df_list.append(pd.read_csv(os.path.join(args.dataset_path, file)))
-            # 将所有DataFrame 合并成一个大的DataFrame
-            df = pd.concat(df_list, ignore_index=True)
+            # 读取指定csv文件
+            df = pd.read_csv(args.dataset_path)
             # shuffle the dataframe to ensure randomness
-            # df = df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
+            df = df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
             # 随机选择num_prompts条数据
             df = df.head(args.num_prompts)
             input_requests: List[SampleRequest] = []
@@ -839,6 +834,45 @@ def main(args: argparse.Namespace):
                     f"expected_output_len={req.expected_output_len}, "
                     f"temperature={req.temperature}, top_p={req.top_p}, "
                     f"top_k={req.top_k}, repetition_penalty={req.repetition_penalty}")
+            # #读取指定目录下的所有CSV 文件
+            # df_list = []
+            # for file in os.listdir(args.dataset_path):
+            #     if file.endswith('.csv'):
+            #         df_list.append(pd.read_csv(os.path.join(args.dataset_path, file)))
+            # # 将所有DataFrame 合并成一个大的DataFrame
+            # df = pd.concat(df_list, ignore_index=True)
+            # # shuffle the dataframe to ensure randomness
+            # # df = df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
+            # # 随机选择num_prompts条数据
+            # df = df.head(args.num_prompts)
+            # input_requests: List[SampleRequest] = []
+            # for idx, row in df.iterrows():
+            #     req_id=str(row['req_id'])
+            #     prompt=row['prompt']
+            #     prompt_tokens=row['prompt_len']
+            #     expected_output_len=row['output_tokens']
+            #     temperature=row['temperature']
+            #     top_p=row['top_p']
+            #     top_k=row['top_k']
+            #     repetition_penalty=row['repetition_penalty']
+            #     input_requests.append(
+            #         SampleRequest(
+            #             req_id=req_id,
+            #             prompt=str(prompt),
+            #             prompt_len=int(prompt_tokens),
+            #             expected_output_len=int(expected_output_len),
+            #             temperature=round(float(temperature), 2),
+            #             top_p=round(float(top_p), 2),
+            #             top_k=int(top_k),
+            #             repetition_penalty=round(float(repetition_penalty), 2),
+            #         )
+            #     )
+            # # 打印前几条请求进行验证
+            # for i, req in enumerate(input_requests[:3]):
+            #     print(f"Request {i}: req_id={req.req_id}, prompt_len={req.prompt_len}, "
+            #         f"expected_output_len={req.expected_output_len}, "
+            #         f"temperature={req.temperature}, top_p={req.top_p}, "
+            #         f"top_k={req.top_k}, repetition_penalty={req.repetition_penalty}")
         elif args.dataset_name == "mysharegpt":
             df=pd.read_csv(args.dataset_path)
             input_requests: List[SampleRequest] = []

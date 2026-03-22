@@ -28,12 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from typing import List, Dict, Any, Optional, Callable, Union
-from pathlib import Path
-import csv
-import json
-import os
 from datetime import datetime
-import re
 '''
 paths = save_outputs(
     outputs=benchmark_results,
@@ -209,7 +204,139 @@ def save_sample(
             repetition_penalty = getattr(req, "repetition_penalty", 1.0)
             writer.writerow([req_id, prompt, temperature, top_p, top_k, repetition_penalty])
     return str(csv_path)
+
 def save_test_outputs(
+    outputs: List[Any],
+    out_path: str | Path,
+    timestamp_fmt: str = "%Y%m%d_%H%M%S",
+    run_config: Optional[Dict[str, Any]] = None,
+    prompt_truncate: Optional[int] = None,
+) -> str:
+    """
+    将 outputs 保存为 CSV 文件（只保存 CSV）。
+    已修复：强制 QUOTE_ALL + itl 转 json 字符串，避免逗号/引号/换行问题。
+    """
+    out_path = Path(out_path)
+    if out_path.is_dir() or str(out_path).endswith(os.sep):
+        base_dir = out_path
+        base_name = "test_results"
+    else:
+        base_dir = out_path.parent if out_path.parent != Path("") else Path(".")
+        base_name = out_path.stem
+
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now().strftime(timestamp_fmt)
+    csv_filename = f"{base_name}_{ts}.csv"
+    csv_path = base_dir / csv_filename
+
+    # CSV header
+    header = ["req_id","send_timestamp_ms","prompt","prompt_len","output_tokens","expect_output_len",
+              "temperature","top_p","top_k","repetition_penalty","latency",
+              "ttft","tpot","itl"]
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        # === 关键修复在这里 ===
+        writer = csv.writer(f, quoting=csv.QUOTE_ALL)   # 强制所有字段加引号
+        
+        writer.writerow(header)
+        
+        for out in outputs:
+            req_id = getattr(out, "req_id", "unknown")
+            send_timestamp_ms = getattr(out, "send_timestamp_ms", "")
+            prompt = getattr(out, "prompt", "")
+            prompt_len = getattr(out, "prompt_len", 0)
+            output_tokens = getattr(out, "output_tokens", 0)
+            expect_output_len = getattr(out, "expect_output_len", 0)
+            temperature = getattr(out, "temperature", 0.0)
+            top_p = getattr(out, "top_p", 0.0)
+            top_k = getattr(out, "top_k", 0)
+            repetition_penalty = getattr(out, "repetition_penalty", 1.0)
+            latency = getattr(out, "latency", 0.0)
+            ttft = getattr(out, "ttft", 0.0)
+            tpot = getattr(out, "tpot", 0.0)
+            itl = getattr(out, "itl", [])
+
+            # itl 转成 JSON 字符串（更标准，后续解析也方便）
+            itl_str = json.dumps(itl) if isinstance(itl, (list, tuple)) else str(itl)
+
+            # 可选：截断超长 prompt（防止 CSV 过大）
+            if prompt_truncate and len(prompt) > prompt_truncate:
+                prompt = prompt[:prompt_truncate] + "...(truncated)"
+
+            writer.writerow([
+                req_id,
+                send_timestamp_ms,
+                prompt,
+                prompt_len,
+                output_tokens,
+                expect_output_len,
+                temperature,
+                top_p,
+                top_k,
+                repetition_penalty,
+                latency,
+                ttft,
+                tpot,
+                itl_str
+            ])
+
+    print(f"✅ CSV saved: {csv_path}")
+    return str(csv_path)
+
+# def save_test_outputs(
+#     outputs: List[Any],           # list[RequestFuncOutput]
+#     out_path: str | Path,        # directory or file prefix (no ext needed)
+#     timestamp_fmt: str = "%Y%m%d_%H%M%S",
+#     run_config: Optional[Dict[str, Any]] = None,
+#     prompt_truncate: Optional[int] = None,  # 可选：截断 prompt 到多少字符
+# ) -> Dict[str, str]:
+#     """
+#     将 outputs 保存为 CSV 文件，包含每个 output 的req_id和对应output_tokens。
+
+#     """
+#     out_path = Path(out_path)
+#     if out_path.is_dir() or str(out_path).endswith(os.sep):
+#         base_dir = out_path
+#         base_name = "test_results"
+#     else:
+#         base_dir = out_path.parent if out_path.parent != Path("") else Path(".")
+#         base_name = out_path.stem
+
+#     base_dir.mkdir(parents=True, exist_ok=True)
+
+#     ts = datetime.now().strftime(timestamp_fmt)
+#     csv_filename = f"{base_name}_{ts}.csv"
+#     json_filename = f"{base_name}_{ts}.json"
+#     csv_path = base_dir / csv_filename
+#     json_path = base_dir / json_filename
+
+#     # CSV header
+#     header = ["req_id","prompt","prompt_len","output_tokens","expect_output_len","temperature","top_p","top_k","repetition_penalty","latency","ttft","tpot","itl"]
+
+#     # 写 CSV
+#     with open(csv_path, "w", newline="", encoding="utf-8") as f:
+#         writer = csv.writer(f)
+#         writer.writerow(header)
+#         for out in outputs:
+#             req_id = getattr(out, "req_id", "unknown")
+#             prompt = getattr(out, "prompt", "")
+#             prompt_len = getattr(out, "prompt_len", 0)
+#             output_tokens = getattr(out, "output_tokens", 0)
+#             expect_output_len = getattr(out, "expect_output_len", 0)
+#             temperature = getattr(out, "temperature", 0.0)
+#             top_p = getattr(out, "top_p", 0.0)
+#             top_k = getattr(out, "top_k", 0)
+#             repetition_penalty = getattr(out, "repetition_penalty", 1.0)
+#             latency = getattr(out, "latency", 0.0)
+#             ttft = getattr(out, "ttft", 0.0)
+#             tpot = getattr(out, "tpot", 0.0)
+#             itl = getattr(out, "itl", [])
+#             writer.writerow([req_id, prompt, prompt_len, output_tokens, expect_output_len, temperature, top_p, top_k, repetition_penalty, latency, ttft, tpot, itl])
+#     #只保存csv文件并返回路径
+#     return str(csv_path)
+
+def save_mean_and_sigma_outputs(
     outputs: List[Any],           # list[RequestFuncOutput]
     out_path: str | Path,        # directory or file prefix (no ext needed)
     timestamp_fmt: str = "%Y%m%d_%H%M%S",
@@ -237,7 +364,7 @@ def save_test_outputs(
     json_path = base_dir / json_filename
 
     # CSV header
-    header = ["req_id","prompt","prompt_len","output_tokens","expect_output_len","temperature","top_p","top_k","repetition_penalty","latency","ttft","tpot","itl"]
+    header = ["req_id","prompt","prompt_len","output_tokens","expect_output_len","mean_len","temperature","top_p","top_k","repetition_penalty","latency","ttft","tpot","itl"]
 
     # 写 CSV
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -248,6 +375,7 @@ def save_test_outputs(
             prompt = getattr(out, "prompt", "")
             prompt_len = getattr(out, "prompt_len", 0)
             output_tokens = getattr(out, "output_tokens", 0)
+            mean_len = getattr(out, "mean_len", 0)
             expect_output_len = getattr(out, "expect_output_len", 0)
             temperature = getattr(out, "temperature", 0.0)
             top_p = getattr(out, "top_p", 0.0)
@@ -257,7 +385,7 @@ def save_test_outputs(
             ttft = getattr(out, "ttft", 0.0)
             tpot = getattr(out, "tpot", 0.0)
             itl = getattr(out, "itl", [])
-            writer.writerow([req_id, prompt, prompt_len, output_tokens, expect_output_len, temperature, top_p, top_k, repetition_penalty, latency, ttft, tpot, itl])
+            writer.writerow([req_id, prompt, prompt_len, output_tokens, expect_output_len, mean_len, temperature, top_p, top_k, repetition_penalty, latency, ttft, tpot, itl])
     #只保存csv文件并返回路径
     return str(csv_path)
 
@@ -288,7 +416,7 @@ def save_full_outputs(
     csv_path = base_dir / csv_filename
     json_path = base_dir / json_filename
     # CSV header
-    header = ["req_id", "output_tokens","expect_output_len","prompt","prompt_len","generated_text","success","latency","ttft","itl","tpot","error"]
+    header = ["req_id", "send_timestamp_ms", "output_tokens","expect_output_len","prompt","prompt_len","generated_text","success","latency","ttft","itl","tpot","error"]
 
     # 写 CSV
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -296,6 +424,7 @@ def save_full_outputs(
         writer.writerow(header)
         for out in outputs:
             req_id = getattr(out, "req_id", "unknown")
+            send_timestamp_ms = getattr(out, "send_timestamp_ms", "")
             output_tokens = getattr(out, "output_tokens", 0)
             expect_output_len = getattr(out, "expect_output_len", 0)
             prompt = getattr(out, "prompt", "")
@@ -307,7 +436,21 @@ def save_full_outputs(
             itl = getattr(out, "itl", [])
             tpot = getattr(out, "tpot", 0.0)
             error = getattr(out, "error", "")
-            writer.writerow([req_id, output_tokens])
+            writer.writerow([
+                req_id,
+                send_timestamp_ms,
+                output_tokens,
+                expect_output_len,
+                prompt,
+                prompt_len,
+                generated_text,
+                success,
+                latency,
+                ttft,
+                itl,
+                tpot,
+                error,
+            ])
     #只保存csv文件并返回路径
     return str(csv_path)
 # ========== 数据加载与 ID 处理 ==========

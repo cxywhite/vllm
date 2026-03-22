@@ -1,0 +1,5 @@
+Total tokens (prompt_len + output_tokens) statistics:
+Min: 14
+Max: 481
+Mean: 157.8802
+Median: 140.0

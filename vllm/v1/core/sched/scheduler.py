@@ -214,8 +214,8 @@ class Scheduler(SchedulerInterface):
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
-            if request is not None and request.predictor_meta:
-                logger.info("RUNNING request %s", request.predictor_meta)
+            # if request is not None and request.predictor_meta:
+            #     logger.info("RUNNING request %s", request.predictor_meta)
             num_new_tokens = (request.num_tokens_with_spec +
                               request.num_output_placeholders -
                               request.num_computed_tokens)
@@ -534,7 +534,7 @@ class Scheduler(SchedulerInterface):
                     self.kv_cache_manager.get_blocks(request.request_id))
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= num_new_tokens
-                logger.info(f'[test] Scheduled WAITING request {request.request_id} for {num_new_tokens} tokens. Token budget left: {token_budget}')
+                # logger.info(f'[test] Scheduled WAITING request {request.request_id} for {num_new_tokens} tokens. Token budget left: {token_budget}')
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
@@ -1029,17 +1029,18 @@ class Scheduler(SchedulerInterface):
             finished_req_ids.clear()
         # [WT]prometheus 2026-01-02 21:14:52
         if self.vllm_config.scheduler_config is not None and self.vllm_config.kv_transfer_config is not None:
-           if self.vllm_config.kv_transfer_config.kv_role == 'kv_consumer' or self.vllm_config.scheduler_config.test_p2d:
-                if self.vllm_config.scheduler_config.activation_predict:
+           if self.vllm_config.kv_transfer_config.kv_role == 'kv_consumer' or self.vllm_config.scheduler_config.test_p2d or self.vllm_config.scheduler_config.test_optimal:
+                if self.vllm_config.scheduler_config.activation_predict or self.vllm_config.scheduler_config.test_optimal:
                     self.running_tokens = 0
                     self.running_predict_tokens = 0
                     self.waiting_tokens = 0
                     for req in self.running:
                         self.running_tokens+= req.num_computed_tokens
                         self.running_predict_tokens += max(1, req.num_prompt_tokens+req.predictor_meta['predict_output_len']-req.num_computed_tokens)
+                        # logger.info(f'[WT] RUNNING request {req.request_id} predictor_meta: {req.predictor_meta}, num_prompt_tokens: {req.num_prompt_tokens}, num_computed_tokens: {req.num_computed_tokens}, running_predict_tokens: {self.running_predict_tokens}')
                     for req in self.waiting:
                         self.waiting_tokens =self.waiting_tokens+req.num_prompt_tokens+req.predictor_meta['predict_output_len']
-                        logger.info(f'[test] WAITING request {req.request_id} predictor_meta: {req.predictor_meta}, num_prompt_tokens: {req.num_prompt_tokens}, num_computed_tokens: {req.num_computed_tokens}, waiting_tokens: {self.waiting_tokens}')
+                        # logger.info(f'[WT] WAITING request {req.request_id} predictor_meta: {req.predictor_meta}, num_prompt_tokens: {req.num_prompt_tokens}, num_computed_tokens: {req.num_computed_tokens}, waiting_tokens: {self.waiting_tokens}')
                 else:
                     self.running_tokens = 0
                     self.running_predict_tokens = 0

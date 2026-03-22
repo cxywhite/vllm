@@ -1,0 +1,12 @@
+Sampled 1k Statistics
+========================
+input_csv: /root/myshare/mean_and_sigma/llama_4_sample_range_50_lens_compute_means_and_probabilities_20250603_121645_with_stats_v2.csv
+output_dir: /root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/Mean_and_sigma/dataset
+total_rows_in_input: 10400
+sample_size_requested: 1000
+sample_size_actual: 1000
+unique_ids_in_sample: 881
+ids_appearing_once_count: 764
+rows_with_singleton_ids_count: 764
+mean_len_stats: {'count': 1000, 'mean': 4182.797, 'std': 2405.9541577511823, 'min': 1.0, 'p25': 2190.75, 'p50': 3903.5, 'p75': 6228.25, 'p90': 7878.0, 'p95': 8142.2, 'p99': 8184.0, 'max': 8190.0}
+sigma_len_stats: {'count': 1000, 'mean': 2365.103, 'std': 1177.6130174254233, 'min': 0.0, 'p25': 1734.0, 'p50': 2574.0, 'p75': 3330.0, 'p90': 3723.5, 'p95': 3843.1, 'p99': 3978.06, 'max': 4012.0}

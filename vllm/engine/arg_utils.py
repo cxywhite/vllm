@@ -490,7 +490,9 @@ class EngineArgs:
     activation_predict:Optional[bool] = None
     aimd_scheduler:Optional[bool] = None
     test_p2d:Optional[bool] = None
+    test_optimal:Optional[bool] = None
     test_model:Optional[str] = None
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -961,6 +963,9 @@ class EngineArgs:
         parser.add_argument('--test-p2d',
                             action='store_true',
                             help='Use test p2d.')
+        parser.add_argument('--test-optimal',
+                            action='store_true',
+                            help='Use test optimal.')
         parser.add_argument('--test-model',
                             type=str,
                             help='Use test model.')
@@ -1403,6 +1408,7 @@ class EngineArgs:
             activation_predict=self.activation_predict,
             aimd_scheduler=self.aimd_scheduler,
             test_p2d=self.test_p2d,
+            test_optimal=self.test_optimal,
             test_model=self.test_model,
         )
 

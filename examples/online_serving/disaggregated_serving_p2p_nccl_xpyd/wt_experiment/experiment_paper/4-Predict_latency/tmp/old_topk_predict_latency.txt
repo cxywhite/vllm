@@ -1,0 +1,131 @@
+========================================================================
+GPU Predictor Latency Grid Benchmark
+time: 2026-03-11 13:52:39
+gpu: cuda:7
+attn_filter: 510
+warmup_iters: 3
+repeats: 3
+temperature_choices: [0.2, 0.5, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8]
+topp_choices: [0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
+topk_choices: [10, 50, 500, 10000, 50000, -1]
+repetition_penalty_choices: [1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
+Only measured: attention filter + predictor forward
+topk_ratio/forward_ratio are computed over (topk + forward)
+Units in 2D table: ms (average of repeats)
+空 means this config was skipped or failed
+========================================================================
+
+2D Summary Table
+  input_len\bs             1            16            32            64           128           256           512          1024
+------------------------------------------------------------------------------------------------------------------------------
+            32         6.129         8.456        12.300        19.054        35.940        69.963       135.904       265.388
+            64         6.142         8.770        13.418        23.333        45.004        87.811       173.459       357.356
+           128         6.342        10.923        17.552        34.478        66.508       131.358       259.505       517.604
+           256         6.213        15.043        29.820        57.520       112.387       219.887       444.499       889.343
+           512         6.201        30.296        59.337       115.010       229.210       455.764       911.232      1828.907
+          1024         6.325        30.968        59.152       116.013       230.811       459.152       920.473      1844.192
+          2048         6.324        31.646        61.350       119.474       237.127       471.018       943.283             空
+          4096         6.607        37.553        74.236       146.024       288.545       573.991             空             空
+          8192         8.061        61.151       121.655       241.265       479.153             空             空             空
+
+2D TopK/Forward Avg(ms) Table
+Cell format: avg_topk_ms/avg_forward_ms
+        input_len\bs                   1                  16                  32                  64                 128                 256                 512                1024
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                  32         0.000/6.129         0.000/8.456        0.000/12.300        0.000/19.054        0.000/35.940        0.000/69.963       0.000/135.904       0.000/265.388
+                  64         0.000/6.142         0.000/8.770        0.000/13.418        0.000/23.333        0.000/45.004        0.000/87.811       0.000/173.459       0.000/357.356
+                 128         0.000/6.342        0.000/10.923        0.000/17.552        0.000/34.478        0.000/66.508       0.000/131.358       0.000/259.505       0.000/517.604
+                 256         0.000/6.213        0.000/15.043        0.000/29.820        0.000/57.520       0.000/112.387       0.000/219.887       0.000/444.499       0.000/889.343
+                 512         0.169/6.033        2.191/28.105        4.527/54.810       8.878/106.132      17.615/211.596      34.718/421.045      68.807/842.425    135.549/1693.358
+                1024         0.194/6.131        2.395/28.572        4.721/54.432       9.442/106.570      19.041/211.770      37.753/421.399      73.986/846.487    147.590/1696.602
+                2048         0.209/6.115        3.078/28.568        6.231/55.119      12.698/106.775      25.310/211.817      50.225/420.794      97.950/845.334                   空
+                4096         0.604/6.003        9.474/28.079       19.340/54.897      38.958/107.067      77.338/211.208     153.660/420.332                   空                   空
+                8192         2.094/5.968       33.223/27.928       67.235/54.421     134.866/106.399     267.157/211.995                   空                   空                   空
+
+2D TopK/Forward Ratio(%) Table
+Cell format: topk_ratio/forward_ratio
+          input_len\bs                     1                    16                    32                    64                   128                   256                   512                  1024
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                    32         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%
+                    64         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%
+                   128         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%
+                   256         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%         0.00%/100.00%
+                   512          2.72%/97.28%          7.23%/92.77%          7.63%/92.37%          7.72%/92.28%          7.68%/92.32%          7.62%/92.38%          7.55%/92.45%          7.41%/92.59%
+                  1024          3.07%/96.93%          7.73%/92.27%          7.98%/92.02%          8.14%/91.86%          8.25%/91.75%          8.22%/91.78%          8.04%/91.96%          8.00%/92.00%
+                  2048          3.31%/96.69%          9.73%/90.27%         10.16%/89.84%         10.63%/89.37%         10.67%/89.33%         10.66%/89.34%         10.38%/89.62%                     空
+                  4096          9.15%/90.85%         25.23%/74.77%         26.05%/73.95%         26.68%/73.32%         26.80%/73.20%         26.77%/73.23%                     空                     空
+                  8192         25.97%/74.03%         54.33%/45.67%         55.27%/44.73%         55.90%/44.10%         55.76%/44.24%                     空                     空                     空
+
+Per-Configuration Details
+input_length=32 batch_size=1 runs_ms=[6.177, 6.139, 6.071] avg_ms=6.129 avg_topk_ms=0.000 avg_forward_ms=6.129 topk_ratio=0.00% forward_ratio=100.00%
+input_length=32 batch_size=16 runs_ms=[8.488, 8.498, 8.384] avg_ms=8.456 avg_topk_ms=0.000 avg_forward_ms=8.456 topk_ratio=0.00% forward_ratio=100.00%
+input_length=32 batch_size=32 runs_ms=[12.291, 12.282, 12.328] avg_ms=12.300 avg_topk_ms=0.000 avg_forward_ms=12.300 topk_ratio=0.00% forward_ratio=100.00%
+input_length=32 batch_size=64 runs_ms=[19.118, 18.981, 19.064] avg_ms=19.054 avg_topk_ms=0.000 avg_forward_ms=19.054 topk_ratio=0.00% forward_ratio=100.00%
+input_length=32 batch_size=128 runs_ms=[35.887, 35.963, 35.970] avg_ms=35.940 avg_topk_ms=0.000 avg_forward_ms=35.940 topk_ratio=0.00% forward_ratio=100.00%
+input_length=32 batch_size=256 runs_ms=[70.051, 69.976, 69.864] avg_ms=69.963 avg_topk_ms=0.000 avg_forward_ms=69.963 topk_ratio=0.00% forward_ratio=100.00%
+input_length=32 batch_size=512 runs_ms=[136.389, 136.517, 134.806] avg_ms=135.904 avg_topk_ms=0.000 avg_forward_ms=135.904 topk_ratio=0.00% forward_ratio=100.00%
+input_length=32 batch_size=1024 runs_ms=[265.227, 264.505, 266.432] avg_ms=265.388 avg_topk_ms=0.000 avg_forward_ms=265.388 topk_ratio=0.00% forward_ratio=100.00%
+input_length=64 batch_size=1 runs_ms=[6.171, 6.109, 6.145] avg_ms=6.142 avg_topk_ms=0.000 avg_forward_ms=6.142 topk_ratio=0.00% forward_ratio=100.00%
+input_length=64 batch_size=16 runs_ms=[8.750, 8.783, 8.777] avg_ms=8.770 avg_topk_ms=0.000 avg_forward_ms=8.770 topk_ratio=0.00% forward_ratio=100.00%
+input_length=64 batch_size=32 runs_ms=[13.435, 13.413, 13.407] avg_ms=13.418 avg_topk_ms=0.000 avg_forward_ms=13.418 topk_ratio=0.00% forward_ratio=100.00%
+input_length=64 batch_size=64 runs_ms=[23.350, 23.361, 23.289] avg_ms=23.333 avg_topk_ms=0.000 avg_forward_ms=23.333 topk_ratio=0.00% forward_ratio=100.00%
+input_length=64 batch_size=128 runs_ms=[44.922, 44.993, 45.098] avg_ms=45.004 avg_topk_ms=0.000 avg_forward_ms=45.004 topk_ratio=0.00% forward_ratio=100.00%
+input_length=64 batch_size=256 runs_ms=[88.418, 87.311, 87.705] avg_ms=87.811 avg_topk_ms=0.000 avg_forward_ms=87.811 topk_ratio=0.00% forward_ratio=100.00%
+input_length=64 batch_size=512 runs_ms=[173.285, 173.773, 173.320] avg_ms=173.459 avg_topk_ms=0.000 avg_forward_ms=173.459 topk_ratio=0.00% forward_ratio=100.00%
+input_length=64 batch_size=1024 runs_ms=[352.360, 361.369, 358.339] avg_ms=357.356 avg_topk_ms=0.000 avg_forward_ms=357.356 topk_ratio=0.00% forward_ratio=100.00%
+input_length=128 batch_size=1 runs_ms=[6.347, 6.332, 6.347] avg_ms=6.342 avg_topk_ms=0.000 avg_forward_ms=6.342 topk_ratio=0.00% forward_ratio=100.00%
+input_length=128 batch_size=16 runs_ms=[10.314, 10.255, 12.201] avg_ms=10.923 avg_topk_ms=0.000 avg_forward_ms=10.923 topk_ratio=0.00% forward_ratio=100.00%
+input_length=128 batch_size=32 runs_ms=[17.521, 17.576, 17.557] avg_ms=17.552 avg_topk_ms=0.000 avg_forward_ms=17.552 topk_ratio=0.00% forward_ratio=100.00%
+input_length=128 batch_size=64 runs_ms=[35.716, 33.867, 33.852] avg_ms=34.478 avg_topk_ms=0.000 avg_forward_ms=34.478 topk_ratio=0.00% forward_ratio=100.00%
+input_length=128 batch_size=128 runs_ms=[66.485, 66.542, 66.495] avg_ms=66.508 avg_topk_ms=0.000 avg_forward_ms=66.508 topk_ratio=0.00% forward_ratio=100.00%
+input_length=128 batch_size=256 runs_ms=[130.184, 133.712, 130.178] avg_ms=131.358 avg_topk_ms=0.000 avg_forward_ms=131.358 topk_ratio=0.00% forward_ratio=100.00%
+input_length=128 batch_size=512 runs_ms=[257.823, 260.793, 259.899] avg_ms=259.505 avg_topk_ms=0.000 avg_forward_ms=259.505 topk_ratio=0.00% forward_ratio=100.00%
+input_length=128 batch_size=1024 runs_ms=[516.746, 519.068, 516.999] avg_ms=517.604 avg_topk_ms=0.000 avg_forward_ms=517.604 topk_ratio=0.00% forward_ratio=100.00%
+input_length=256 batch_size=1 runs_ms=[6.229, 6.199, 6.209] avg_ms=6.213 avg_topk_ms=0.000 avg_forward_ms=6.213 topk_ratio=0.00% forward_ratio=100.00%
+input_length=256 batch_size=16 runs_ms=[15.091, 15.004, 15.033] avg_ms=15.043 avg_topk_ms=0.000 avg_forward_ms=15.043 topk_ratio=0.00% forward_ratio=100.00%
+input_length=256 batch_size=32 runs_ms=[29.806, 29.655, 29.999] avg_ms=29.820 avg_topk_ms=0.000 avg_forward_ms=29.820 topk_ratio=0.00% forward_ratio=100.00%
+input_length=256 batch_size=64 runs_ms=[57.700, 57.572, 57.289] avg_ms=57.520 avg_topk_ms=0.000 avg_forward_ms=57.520 topk_ratio=0.00% forward_ratio=100.00%
+input_length=256 batch_size=128 runs_ms=[112.801, 112.437, 111.921] avg_ms=112.387 avg_topk_ms=0.000 avg_forward_ms=112.387 topk_ratio=0.00% forward_ratio=100.00%
+input_length=256 batch_size=256 runs_ms=[220.186, 220.282, 219.194] avg_ms=219.887 avg_topk_ms=0.000 avg_forward_ms=219.887 topk_ratio=0.00% forward_ratio=100.00%
+input_length=256 batch_size=512 runs_ms=[443.785, 443.391, 446.321] avg_ms=444.499 avg_topk_ms=0.000 avg_forward_ms=444.499 topk_ratio=0.00% forward_ratio=100.00%
+input_length=256 batch_size=1024 runs_ms=[888.492, 886.753, 892.783] avg_ms=889.343 avg_topk_ms=0.000 avg_forward_ms=889.343 topk_ratio=0.00% forward_ratio=100.00%
+input_length=512 batch_size=1 runs_ms=[6.203, 6.185, 6.216] avg_ms=6.201 avg_topk_ms=0.169 avg_forward_ms=6.033 topk_ratio=2.72% forward_ratio=97.28%
+input_length=512 batch_size=16 runs_ms=[30.213, 30.450, 30.224] avg_ms=30.296 avg_topk_ms=2.191 avg_forward_ms=28.105 topk_ratio=7.23% forward_ratio=92.77%
+input_length=512 batch_size=32 runs_ms=[59.128, 59.801, 59.082] avg_ms=59.337 avg_topk_ms=4.527 avg_forward_ms=54.810 topk_ratio=7.63% forward_ratio=92.37%
+input_length=512 batch_size=64 runs_ms=[114.710, 115.128, 115.191] avg_ms=115.010 avg_topk_ms=8.878 avg_forward_ms=106.132 topk_ratio=7.72% forward_ratio=92.28%
+input_length=512 batch_size=128 runs_ms=[229.087, 229.095, 229.449] avg_ms=229.210 avg_topk_ms=17.615 avg_forward_ms=211.596 topk_ratio=7.68% forward_ratio=92.32%
+input_length=512 batch_size=256 runs_ms=[455.585, 456.105, 455.601] avg_ms=455.764 avg_topk_ms=34.718 avg_forward_ms=421.045 topk_ratio=7.62% forward_ratio=92.38%
+input_length=512 batch_size=512 runs_ms=[911.154, 914.612, 907.929] avg_ms=911.232 avg_topk_ms=68.807 avg_forward_ms=842.425 topk_ratio=7.55% forward_ratio=92.45%
+input_length=512 batch_size=1024 runs_ms=[1830.978, 1829.275, 1826.468] avg_ms=1828.907 avg_topk_ms=135.549 avg_forward_ms=1693.358 topk_ratio=7.41% forward_ratio=92.59%
+input_length=1024 batch_size=1 runs_ms=[6.354, 6.351, 6.269] avg_ms=6.325 avg_topk_ms=0.194 avg_forward_ms=6.131 topk_ratio=3.07% forward_ratio=96.93%
+input_length=1024 batch_size=16 runs_ms=[30.972, 30.781, 31.150] avg_ms=30.968 avg_topk_ms=2.395 avg_forward_ms=28.572 topk_ratio=7.73% forward_ratio=92.27%
+input_length=1024 batch_size=32 runs_ms=[58.885, 59.185, 59.388] avg_ms=59.152 avg_topk_ms=4.721 avg_forward_ms=54.432 topk_ratio=7.98% forward_ratio=92.02%
+input_length=1024 batch_size=64 runs_ms=[115.650, 115.932, 116.456] avg_ms=116.013 avg_topk_ms=9.442 avg_forward_ms=106.570 topk_ratio=8.14% forward_ratio=91.86%
+input_length=1024 batch_size=128 runs_ms=[231.019, 230.577, 230.836] avg_ms=230.811 avg_topk_ms=19.041 avg_forward_ms=211.770 topk_ratio=8.25% forward_ratio=91.75%
+input_length=1024 batch_size=256 runs_ms=[459.228, 459.235, 458.994] avg_ms=459.152 avg_topk_ms=37.753 avg_forward_ms=421.399 topk_ratio=8.22% forward_ratio=91.78%
+input_length=1024 batch_size=512 runs_ms=[921.023, 921.591, 918.806] avg_ms=920.473 avg_topk_ms=73.986 avg_forward_ms=846.487 topk_ratio=8.04% forward_ratio=91.96%
+input_length=1024 batch_size=1024 runs_ms=[1845.566, 1843.649, 1843.360] avg_ms=1844.192 avg_topk_ms=147.590 avg_forward_ms=1696.602 topk_ratio=8.00% forward_ratio=92.00%
+input_length=2048 batch_size=1 runs_ms=[6.365, 6.289, 6.318] avg_ms=6.324 avg_topk_ms=0.209 avg_forward_ms=6.115 topk_ratio=3.31% forward_ratio=96.69%
+input_length=2048 batch_size=16 runs_ms=[31.724, 31.484, 31.730] avg_ms=31.646 avg_topk_ms=3.078 avg_forward_ms=28.568 topk_ratio=9.73% forward_ratio=90.27%
+input_length=2048 batch_size=32 runs_ms=[61.459, 61.231, 61.359] avg_ms=61.350 avg_topk_ms=6.231 avg_forward_ms=55.119 topk_ratio=10.16% forward_ratio=89.84%
+input_length=2048 batch_size=64 runs_ms=[119.595, 119.432, 119.394] avg_ms=119.474 avg_topk_ms=12.698 avg_forward_ms=106.775 topk_ratio=10.63% forward_ratio=89.37%
+input_length=2048 batch_size=128 runs_ms=[236.884, 237.491, 237.008] avg_ms=237.127 avg_topk_ms=25.310 avg_forward_ms=211.817 topk_ratio=10.67% forward_ratio=89.33%
+input_length=2048 batch_size=256 runs_ms=[470.478, 471.670, 470.908] avg_ms=471.018 avg_topk_ms=50.225 avg_forward_ms=420.794 topk_ratio=10.66% forward_ratio=89.34%
+input_length=2048 batch_size=512 runs_ms=[942.943, 940.223, 946.684] avg_ms=943.283 avg_topk_ms=97.950 avg_forward_ms=845.334 topk_ratio=10.38% forward_ratio=89.62%
+input_length=2048 batch_size=1024 result=空 reason=excessive memory usage
+input_length=4096 batch_size=1 runs_ms=[6.636, 6.577, 6.609] avg_ms=6.607 avg_topk_ms=0.604 avg_forward_ms=6.003 topk_ratio=9.15% forward_ratio=90.85%
+input_length=4096 batch_size=16 runs_ms=[37.679, 37.531, 37.448] avg_ms=37.553 avg_topk_ms=9.474 avg_forward_ms=28.079 topk_ratio=25.23% forward_ratio=74.77%
+input_length=4096 batch_size=32 runs_ms=[74.570, 74.101, 74.038] avg_ms=74.236 avg_topk_ms=19.340 avg_forward_ms=54.897 topk_ratio=26.05% forward_ratio=73.95%
+input_length=4096 batch_size=64 runs_ms=[145.922, 146.200, 145.951] avg_ms=146.024 avg_topk_ms=38.958 avg_forward_ms=107.067 topk_ratio=26.68% forward_ratio=73.32%
+input_length=4096 batch_size=128 runs_ms=[288.399, 288.600, 288.638] avg_ms=288.545 avg_topk_ms=77.338 avg_forward_ms=211.208 topk_ratio=26.80% forward_ratio=73.20%
+input_length=4096 batch_size=256 runs_ms=[574.107, 573.504, 574.363] avg_ms=573.991 avg_topk_ms=153.660 avg_forward_ms=420.332 topk_ratio=26.77% forward_ratio=73.23%
+input_length=4096 batch_size=512 result=空 reason=excessive memory usage
+input_length=4096 batch_size=1024 result=空 reason=excessive memory usage
+input_length=8192 batch_size=1 runs_ms=[8.076, 8.068, 8.039] avg_ms=8.061 avg_topk_ms=2.094 avg_forward_ms=5.968 topk_ratio=25.97% forward_ratio=74.03%
+input_length=8192 batch_size=16 runs_ms=[60.990, 60.959, 61.504] avg_ms=61.151 avg_topk_ms=33.223 avg_forward_ms=27.928 topk_ratio=54.33% forward_ratio=45.67%
+input_length=8192 batch_size=32 runs_ms=[121.956, 121.532, 121.479] avg_ms=121.655 avg_topk_ms=67.235 avg_forward_ms=54.421 topk_ratio=55.27% forward_ratio=44.73%
+input_length=8192 batch_size=64 runs_ms=[240.631, 240.153, 243.010] avg_ms=241.265 avg_topk_ms=134.866 avg_forward_ms=106.399 topk_ratio=55.90% forward_ratio=44.10%
+input_length=8192 batch_size=128 runs_ms=[478.656, 479.135, 479.666] avg_ms=479.153 avg_topk_ms=267.157 avg_forward_ms=211.995 topk_ratio=55.76% forward_ratio=44.24%
+input_length=8192 batch_size=256 result=空 reason=excessive memory usage
+input_length=8192 batch_size=512 result=空 reason=excessive memory usage
+input_length=8192 batch_size=1024 result=空 reason=excessive memory usage

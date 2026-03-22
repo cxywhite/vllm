@@ -2317,7 +2317,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Run the model.
         # [WT]predict activation 2025-12-19 13:55:34
-        if self.scheduler_config.activation_predict or self.scheduler_config.test_p2d:
+        if self.scheduler_config.activation_predict or self.scheduler_config.test_p2d or self.scheduler_config.test_optimal:
             # scheduler 输出
             
             scheduled_new_reqs = scheduler_output.scheduled_new_reqs
@@ -2339,6 +2339,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 top_p = sampling_params.top_p
                 top_k = sampling_params.top_k
                 rep_penalty = sampling_params.repetition_penalty
+                if self.scheduler_config.test_optimal:
+                    # 计算预期输出长度
+                    expected_output_len = sampling_params.max_tokens
+                    # logger.info(f'[WT] Expected output length for req {simplified_req_id}: {expected_output_len}')
+                else:
+                    expected_output_len = None
                 my_metadata.append(Custom_Metadata(
                     req_id=simplified_req_id,
                     token_range=(start_idx, end_idx),
@@ -2347,7 +2353,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     top_p=top_p,
                     top_k=top_k,
                     repetition_penalty=rep_penalty,
-                    predict_output_len=None  # 占位符，暂时不需要
+                    predict_output_len=expected_output_len  # 占位符，暂时不需要
                 ))
                 # 更新 start_idx
                 start_idx = end_idx
@@ -2373,14 +2379,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 inputs_embeds=inputs_embeds,
                 my_metadata=my_metadata,
                 activation_predict=True,
-                )            
+                )
+            elif self.scheduler_config.test_optimal:
+                model_output = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                my_metadata=my_metadata,
+                )
             else:
                 model_output = self.model(
                     input_ids=input_ids,
                     positions=positions,
                     intermediate_tensors=intermediate_tensors,
                     inputs_embeds=inputs_embeds,
-                    )
+                )
             # [WT] end
         with record_function_or_nullcontext("Postprocess"):
             if self.use_aux_hidden_state_outputs:

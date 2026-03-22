@@ -146,6 +146,7 @@ class SchedulerConfig:
     activation_predict: Optional[bool] = None
     aimd_scheduler: Optional[bool] = None
     test_p2d: Optional[bool] = None
+    test_optimal: Optional[bool] = None
     test_model: Optional[str] = None
     def compute_hash(self) -> str:
         """
@@ -254,6 +255,10 @@ class SchedulerConfig:
             logger.info(f"[test]&&& test_p2d")
         else:
             logger.info(f"[test]&&& no test_p2d")
+        if self.test_optimal is not None and self.test_optimal:
+            logger.info(f"[test]&&& test_optimal")
+        else:
+            logger.info(f"[test]&&& no test_optimal")
         if self.test_model is not None and self.test_model != "":
             logger.info(f"[test]&&& test_model: {self.test_model}")
     @model_validator(mode='after')
