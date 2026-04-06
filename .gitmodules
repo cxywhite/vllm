@@ -1,3 +1,6 @@
 [submodule "vllm"]
 	path = vllm
 	url = https://github.com/cxywhite/vllm.git
+[submodule "baseline_experiment/vllm"]
+	path = baseline_experiment/vllm
+	url = https://github.com/cxywhite/vllm.git
