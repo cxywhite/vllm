@@ -345,6 +345,17 @@ class Scheduler(SchedulerInterface):
                     if is_ready:
                         request.status = RequestStatus.WAITING
                     else:
+                        # yi[wt] Diagnose the queue-stall pattern where remote KV requests keep waiting while running queue drains. [end]
+                        if (len(self.running) == 0 and len(self.waiting) >= 64
+                                and self.kv_cache_manager.usage >= 0.90):
+                            logger.warning(
+                                "yi[wt] WAITING_FOR_REMOTE_KVS blocked req=%s "
+                                "running=%d waiting=%d ready_recv=%d "
+                                "kv_usage=%.4f [end]",
+                                request.request_id, len(self.running),
+                                len(self.waiting),
+                                len(self.finished_recving_kv_req_ids),
+                                self.kv_cache_manager.usage)
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request.request_id)
@@ -480,6 +491,16 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    # yi[wt] Diagnose allocation failure under high KV usage while requests are still in waiting queue. [end]
+                    logger.warning(
+                        "yi[wt] allocate_slots failed req=%s status=%s "
+                        "running=%d waiting=%d token_budget=%d "
+                        "num_new_tokens=%d num_external_tokens=%d "
+                        "kv_usage=%.4f [end]", request.request_id,
+                        request.status.name, len(self.running),
+                        len(self.waiting), token_budget, num_new_tokens,
+                        num_external_computed_tokens,
+                        self.kv_cache_manager.usage)
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -501,6 +522,17 @@ class Scheduler(SchedulerInterface):
                     # into the WAITING_FOR_REMOTE_KV state.
                     skipped_waiting_requests.prepend_request(request)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    # yi[wt] Trace requests that reserve KV blocks but still need remote KV transfer to become runnable. [end]
+                    logger.info(
+                        "yi[wt] enter WAITING_FOR_REMOTE_KVS req=%s "
+                        "running=%d waiting=%d reserved_blocks=%d "
+                        "ext_tokens=%d kv_usage=%.4f [end]",
+                        request.request_id, len(self.running),
+                        len(self.waiting),
+                        len(self.kv_cache_manager.get_block_ids(
+                            request.request_id)[0]),
+                        num_external_computed_tokens,
+                        self.kv_cache_manager.usage)
                     continue
 
                 req_index += 1
@@ -539,6 +571,16 @@ class Scheduler(SchedulerInterface):
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
+
+        # yi[wt] Emit a concise stall snapshot when running queue is empty but waiting queue remains full under high KV usage. [end]
+        if (len(self.running) == 0 and len(self.waiting) > 0
+                and self.kv_cache_manager.usage >= 0.95):
+            logger.error(
+                "yi[wt] scheduler stall snapshot running=%d waiting=%d "
+                "ready_recv=%d kv_usage=%.4f token_budget=%d [end]",
+                len(self.running), len(self.waiting),
+                len(self.finished_recving_kv_req_ids),
+                self.kv_cache_manager.usage, token_budget)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -1248,6 +1290,13 @@ class Scheduler(SchedulerInterface):
         """
         assert self.connector is not None
         if request.request_id not in self.finished_recving_kv_req_ids:
+            # yi[wt] Keep debug breadcrumb for requests that are still blocked waiting for remote KV transfer completion. [end]
+            logger.debug(
+                "yi[wt] remote KV not ready req=%s running=%d waiting=%d "
+                "ready_recv=%d kv_usage=%.4f [end]", request.request_id,
+                len(self.running), len(self.waiting),
+                len(self.finished_recving_kv_req_ids),
+                self.kv_cache_manager.usage)
             return False
 
         # Now that the blocks are ready, actually cache them.
@@ -1262,6 +1311,13 @@ class Scheduler(SchedulerInterface):
 
         # Update the request state for scheduling.
         request.num_computed_tokens = num_computed_tokens
+
+        # yi[wt] Confirm transition point where a WAITING_FOR_REMOTE_KVS request becomes schedulable again. [end]
+        logger.info(
+            "yi[wt] remote KV ready req=%s num_computed_tokens=%d "
+            "running=%d waiting=%d kv_usage=%.4f [end]", request.request_id,
+            num_computed_tokens, len(self.running), len(self.waiting),
+            self.kv_cache_manager.usage)
 
         # Return that we are ready.
         self.finished_recving_kv_req_ids.remove(request.request_id)
@@ -1281,6 +1337,18 @@ class Scheduler(SchedulerInterface):
 
         if self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)
+
+        # yi[wt] Summarize KV transfer completion signals entering scheduler state machine each step. [end]
+        finished_recving_count = len(kv_connector_output.finished_recving or ())
+        finished_sending_count = len(kv_connector_output.finished_sending or ())
+        if finished_recving_count > 0 or finished_sending_count > 0:
+            logger.info(
+                "yi[wt] kv_xfer_finished recv=%d send=%d "
+                "ready_recv_before=%d running=%d waiting=%d "
+                "kv_usage=%.4f [end]", finished_recving_count,
+                finished_sending_count,
+                len(self.finished_recving_kv_req_ids), len(self.running),
+                len(self.waiting), self.kv_cache_manager.usage)
 
         # KV Connector:: update recv and send status from last step.
         for req_id in (kv_connector_output.finished_recving or ()):

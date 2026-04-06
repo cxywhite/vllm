@@ -1101,6 +1101,14 @@ class NixlConnectorWorker:
                 "and %s requests done recving", self.tp_rank,
                 len(done_sending), len(done_recving))
 
+        # yi[wt] Diagnose no-progress windows where pending remote send tracking exists but no transfer completion arrives. [end]
+        if self._reqs_to_send and not done_sending and not done_recving:
+            logger.debug(
+                "yi[wt] nixl get_finished no progress reqs_to_send=%d "
+                "reqs_to_process=%d recving_transfers=%d [end]",
+                len(self._reqs_to_send), len(self._reqs_to_process),
+                len(self._recving_transfers))
+
         if self.use_host_buffer:
             for req_id in done_recving:
                 meta = self._recving_metadata.pop(req_id)
@@ -1119,6 +1127,12 @@ class NixlConnectorWorker:
                 "Releasing expired KV blocks for request %s which were "
                 "retrieved by %d decode worker(s) within %d seconds.", req_id,
                 count, envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT)
+            # yi[wt] Print timeout-path state to correlate producer-side expiration with decode-side waiting buildup. [end]
+            logger.warning(
+                "yi[wt] timeout release req=%s pending_send_before=%d "
+                "pending_process_before=%d done_sending=%d [end]", req_id,
+                len(self._reqs_to_send), len(self._reqs_to_process),
+                len(done_sending))
             self._reqs_to_process.remove(req_id)
             del self._reqs_to_send[req_id]
             done_sending.add(req_id)
@@ -1141,6 +1155,12 @@ class NixlConnectorWorker:
                         "Potentially invalid KV blocks for "
                         "unrecognized request %s were retrieved by "
                         "a decode worker. They may have expired.", req_id)
+                    # yi[wt] Emit queue-state context for invalid notif diagnostics (late notification after producer expiry). [end]
+                    logger.error(
+                        "yi[wt] invalid notif req=%s tracked_send=%d "
+                        "tracked_process=%d notif_cache=%d [end]", req_id,
+                        len(self._reqs_to_send), len(self._reqs_to_process),
+                        len(notified_req_ids))
                     continue
 
                 self.consumer_notification_counts_by_req[req_id] += 1
@@ -1187,6 +1207,16 @@ class NixlConnectorWorker:
         Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
         """
+        # yi[wt] Summarize scheduler metadata entering worker-side transfer pipeline each step. [end]
+        if (metadata.reqs_to_recv or metadata.reqs_to_send
+                or metadata.reqs_in_batch):
+            logger.info(
+                "yi[wt] start_load_kv metadata recv=%d send=%d in_batch=%d "
+                "tracked_send_before=%d tracked_process_before=%d [end]",
+                len(metadata.reqs_to_recv), len(metadata.reqs_to_send),
+                len(metadata.reqs_in_batch), len(self._reqs_to_send),
+                len(self._reqs_to_process))
+
         for req_id, meta in metadata.reqs_to_recv.items():
             remote_engine_id = meta.remote_engine_id
             logger.debug(
@@ -1224,6 +1254,14 @@ class NixlConnectorWorker:
         for req_id, expiration_time in metadata.reqs_to_send.items():
             if req_id in self._reqs_to_process:
                 self._reqs_to_send[req_id] = expiration_time
+
+        # yi[wt] Confirm post-update tracking sizes to observe growth/plateau of pending send requests. [end]
+        if metadata.reqs_to_send:
+            logger.info(
+                "yi[wt] start_load_kv tracked_send_after=%d "
+                "tracked_process_after=%d ready_queue=%d [end]",
+                len(self._reqs_to_send), len(self._reqs_to_process),
+                self._ready_requests.qsize())
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         logger.debug(
