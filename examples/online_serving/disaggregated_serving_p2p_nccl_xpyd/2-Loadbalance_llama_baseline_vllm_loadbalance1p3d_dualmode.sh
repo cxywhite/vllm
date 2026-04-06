@@ -5,9 +5,9 @@ set -euo pipefail
 # ---------------------------
 
 USE_PASTFUTURE_SCHEDULER="false"
-USE_ACTIVATION_PREDICTOR="true"
-USE_CUSTOM_PROXY="true"
-USE_AIMD_SCHEDULER="true"
+USE_ACTIVATION_PREDICTOR="false"
+USE_CUSTOM_PROXY="false"
+USE_AIMD_SCHEDULER="false"
 TEST_ABLATION_P2D="false"
 TEST_OPTIMAL="false"
 IGNORE="true"

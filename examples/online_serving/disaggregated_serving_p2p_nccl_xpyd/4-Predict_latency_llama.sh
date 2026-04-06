@@ -5,9 +5,9 @@ set -euo pipefail
 # ---------------------------
 
 USE_PASTFUTURE_SCHEDULER="false"
-USE_ACTIVATION_PREDICTOR="false"
-USE_CUSTOM_PROXY="false"
-USE_AIMD_SCHEDULER="false"
+USE_ACTIVATION_PREDICTOR="true"
+USE_CUSTOM_PROXY="true"
+USE_AIMD_SCHEDULER="true"
 TEST_ABLATION_P2D="false"
 TEST_OPTIMAL="false"
 IGNORE="true"
@@ -16,8 +16,8 @@ SAVE_SAMPLE="true"
 REPRODUCE_BASELINE_CSV_PATH="/root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/experiment_result/experiment_paper/tmp/baseline_116/benchmark_np4000_rr20_mt3000_20260116_195621_1p4d_test_baseline/dataset_result/test_results_20260116_201101.csv"
 TEST_MODEL="llama"
 
-BENCH_DATASET_NAME=${BENCH_DATASET_NAME:-trace}
-BENCH_DATASET_PATH=${BENCH_DATASET_PATH:-/root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/5-DynamicQPS/tmp_dataset}
+BENCH_DATASET_NAME=${BENCH_DATASET_NAME:-mysharegpt}
+BENCH_DATASET_PATH=${BENCH_DATASET_PATH:-/root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/2-Loadbalance/dataset/llama-mysharegpt-loadbalance_1p3d_good.csv}
 SAVE_OUTPUT=${SAVE_OUTPUT:-True}
 
 VLLM_DTYPE=${VLLM_DTYPE:-bfloat16}
@@ -29,21 +29,21 @@ BENCH_REPETITION_PENALTY=${BENCH_REPETITION_PENALTY:-1.0}
 
 MODEL=${MODEL:-/root/.cache/huggingface/hub/Meta-Llama-3-8B-Instruct}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
-BASE_RESULT_DIR=${BASE_RESULT_DIR:-/root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/tmp/baseline_325}
+BASE_RESULT_DIR=${BASE_RESULT_DIR:-/root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/tmp/baseline_320}
 
 PROXY_PORT=${PROXY_PORT:-28002}
 BENCH_PORT=${BENCH_PORT:-22007}
 
-PREFILL_GPUS=${PREFILL_GPUS:-0,1}
-PREFILL_PORTS=${PREFILL_PORTS:-22001,22002}
-PREFILL_KV_PORTS=${PREFILL_KV_PORTS:-22011,22012}
+PREFILL_GPUS=${PREFILL_GPUS:-4}
+PREFILL_PORTS=${PREFILL_PORTS:-22001}
+PREFILL_KV_PORTS=${PREFILL_KV_PORTS:-22011}
 PREFILL_GPU_MEMORY_UTILIZATION=${PREFILL_GPU_MEMORY_UTILIZATION:-0.8}
 PREFILL_TENSOR_PARALLEL_SIZE=${PREFILL_TENSOR_PARALLEL_SIZE:-1}
 PREFILL_TENSOR_POOL_MEMORY=${PREFILL_TENSOR_POOL_MEMORY:-8}
 
-DECODE_GPUS=${DECODE_GPUS:-2,3,4,5,6,7}
-DECODE_PORTS=${DECODE_PORTS:-22020,22021,22022,22023,22024,22025}
-DECODE_KV_PORTS=${DECODE_KV_PORTS:-22032,22033,22034,22035,22036,22037}
+DECODE_GPUS=${DECODE_GPUS:-5,6,7}
+DECODE_PORTS=${DECODE_PORTS:-22020,22021,22022}
+DECODE_KV_PORTS=${DECODE_KV_PORTS:-22032,22033,22034}
 DECODE_GPU_MEMORY_UTILIZATION=${DECODE_GPU_MEMORY_UTILIZATION:-0.8}
 DECODE_TENSOR_PARALLEL_SIZE=${DECODE_TENSOR_PARALLEL_SIZE:-1}
 DECODE_TENSOR_POOL_MEMORY=${DECODE_TENSOR_POOL_MEMORY:-16}
@@ -61,31 +61,18 @@ PREFILL_VLLM_MAX_NUM_BATCHED_TOKENS=${PREFILL_VLLM_MAX_NUM_BATCHED_TOKENS:-32768
 DECODE_VLLM_MAX_NUM_BATCHED_TOKENS=${DECODE_VLLM_MAX_NUM_BATCHED_TOKENS:-8192}
 VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-1024}
 
-BENCH_SCRIPT=${BENCH_SCRIPT:-/root/predict-schedule/vllm/benchmarks/benchmark_serving_trace.py}
+BENCH_SCRIPT=${BENCH_SCRIPT:-/root/predict-schedule/vllm/benchmarks/benchmark_serving_load_balance.py}
 BENCH_MODEL=${BENCH_MODEL:-$MODEL}
 BENCH_MAX_CONCURRENCY=${BENCH_MAX_CONCURRENCY:-1024}
 BENCH_GOODPUT=${BENCH_GOODPUT:-ttft:1000 tpot:50}
 CACULATE_GOODPUT=${CACULATE_GOODPUT:-tpot:50}
-USE_TRACE_TIMESTAMPS=${USE_TRACE_TIMESTAMPS:-true}
-
-PREFILL_INFLIGHT_LIMIT=${PREFILL_INFLIGHT_LIMIT:-64}
-PREFILL_QUEUE_TIMEOUT_SECONDS=${PREFILL_QUEUE_TIMEOUT_SECONDS:-0}
-PREFILL_TIMEOUT_SECONDS=${PREFILL_TIMEOUT_SECONDS:-600}
 
 NUM_PROMPTS_LIST=${NUM_PROMPTS_LIST:-"1000"}
-BENCH_REQUEST_RATE_LIST=${BENCH_REQUEST_RATE_LIST:-"8,6"}
+BENCH_REQUEST_RATE_LIST=${BENCH_REQUEST_RATE_LIST:-"4,6,8,10,12"}
 BENCH_MAX_TOKENS_LIST=${BENCH_MAX_TOKENS_LIST:-"8192"}
 SLEEP_BETWEEN_RUNS=${SLEEP_BETWEEN_RUNS:-5}
 RUN_REPEAT_PER_CONFIG=${RUN_REPEAT_PER_CONFIG:-1}
 PROXY_SCRIPT_OVERRIDE=${PROXY_SCRIPT_OVERRIDE:-}
-INSTANCE_DOWN_TIMEOUT_SECONDS=${INSTANCE_DOWN_TIMEOUT_SECONDS:-120}
-INSTANCE_HEALTH_CHECK_INTERVAL_SECONDS=${INSTANCE_HEALTH_CHECK_INTERVAL_SECONDS:-5}
-
-PROXY_BASE_DIR="/root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd"
-PROXY_SCRIPT_DEFAULT="${PROXY_BASE_DIR}/disagg_proxy_p2p_nccl_xpyd.py"
-PROXY_SCRIPT_OPTIMAL="${PROXY_BASE_DIR}/test_disagg_proxy_p2d_loadbalance.py"
-PROXY_SCRIPT_CUSTOM="${PROXY_BASE_DIR}/test_disagg_proxy.py"
-PROXY_SCRIPT_ABLATION_P2D="${PROXY_BASE_DIR}/test_disagg_proxy_p2d.py"
 
 is_true() {
     local v="${1:-}"
@@ -96,66 +83,19 @@ update_proxy_script() {
     if [ -n "$PROXY_SCRIPT_OVERRIDE" ]; then
         PROXY_SCRIPT="$PROXY_SCRIPT_OVERRIDE"
     elif [ "$USE_CUSTOM_PROXY" = "true" ]; then
-        PROXY_SCRIPT="$PROXY_SCRIPT_CUSTOM"
+        PROXY_SCRIPT="test_disagg_proxy.py"
     elif is_true "$TEST_OPTIMAL"; then
-        PROXY_SCRIPT="$PROXY_SCRIPT_OPTIMAL"
+        PROXY_SCRIPT="test_disagg_proxy_p2d_loadbalance.py"
     elif [ "$TEST_ABLATION_P2D" = "true" ]; then
-        PROXY_SCRIPT="$PROXY_SCRIPT_ABLATION_P2D"
+        PROXY_SCRIPT="test_disagg_proxy_p2d.py"
     else
-        PROXY_SCRIPT="$PROXY_SCRIPT_DEFAULT"
+        PROXY_SCRIPT="disagg_proxy_p2p_nccl_xpyd.py"
     fi
 }
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 PIDS=()
 PGIDS=()
-PREFILL_PIDS=()
-DECODE_PIDS=()
-DATASET_PATH_ARRAY=()
-CURRENT_BENCH_DATASET_PATH=""
-CURRENT_BENCH_DATASET_LABEL=""
-
-sanitize_name() {
-    local raw_name="$1"
-    raw_name="${raw_name// /_}"
-    raw_name="$(printf '%s' "$raw_name" | sed 's/[^[:alnum:]_.-]/_/g')"
-    printf '%s' "$raw_name"
-}
-
-resolve_dataset_paths() {
-    DATASET_PATH_ARRAY=()
-
-    if [[ -d "$BENCH_DATASET_PATH" ]]; then
-        while IFS= read -r csv_file; do
-            DATASET_PATH_ARRAY+=("$csv_file")
-        done < <(find "$BENCH_DATASET_PATH" -maxdepth 1 -type f -name '*.csv' | sort)
-
-        if [[ ${#DATASET_PATH_ARRAY[@]} -eq 0 ]]; then
-            echo "No CSV files found under dataset directory: $BENCH_DATASET_PATH"
-            exit 1
-        fi
-
-        echo "Resolved ${#DATASET_PATH_ARRAY[@]} dataset CSV files from $BENCH_DATASET_PATH"
-    elif [[ -f "$BENCH_DATASET_PATH" ]]; then
-        DATASET_PATH_ARRAY=("$BENCH_DATASET_PATH")
-    else
-        echo "Dataset path not found: $BENCH_DATASET_PATH"
-        exit 1
-    fi
-}
-
-set_current_dataset() {
-    local dataset_path="$1"
-    local dataset_file_name
-    dataset_file_name="$(basename "$dataset_path")"
-
-    CURRENT_BENCH_DATASET_PATH="$dataset_path"
-    CURRENT_BENCH_DATASET_LABEL="$(sanitize_name "${dataset_file_name%.csv}")"
-
-    if [[ ${#DATASET_PATH_ARRAY[@]} -eq 1 && -f "$BENCH_DATASET_PATH" ]]; then
-        CURRENT_BENCH_DATASET_LABEL=""
-    fi
-}
 
 setup_directories() {
     local num_prompts=$1
@@ -164,13 +104,8 @@ setup_directories() {
     local timestamp=$4
     local dir_suffix=$5
     local repeat_idx=$6
-    local dataset_suffix=""
 
-    if [[ -n "$CURRENT_BENCH_DATASET_LABEL" ]]; then
-        dataset_suffix="_ds${CURRENT_BENCH_DATASET_LABEL}"
-    fi
-
-    BENCHMARK_DIR="${BASE_RESULT_DIR}/benchmark_np${num_prompts}_rr${req_rate}_mt${max_tokens}_${timestamp}_rep${repeat_idx}_${dir_suffix}${dataset_suffix}"
+    BENCHMARK_DIR="${BASE_RESULT_DIR}/benchmark_np${num_prompts}_rr${req_rate}_mt${max_tokens}_${timestamp}_rep${repeat_idx}_${dir_suffix}"
     mkdir -p "$BENCHMARK_DIR"
 
     CONFIG_DIR="${BENCHMARK_DIR}/config"
@@ -268,8 +203,7 @@ dump_config_json() {
     "bench_port": ${BENCH_PORT},
     "endpoint": "/v1/completions",
     "dataset_name": "${BENCH_DATASET_NAME}",
-    "dataset_path": "${CURRENT_BENCH_DATASET_PATH}",
-    "dataset_label": "${CURRENT_BENCH_DATASET_LABEL}",
+    "dataset_path": "${BENCH_DATASET_PATH}",
     "max_concurrency": ${BENCH_MAX_CONCURRENCY},
     "request_rate": "${current_rate}",
     "maxtokenscustom": ${current_tokens},
@@ -311,8 +245,6 @@ stop_servers() {
     pkill -9 -f vllm >/dev/null 2>&1 || true
     PIDS=()
     PGIDS=()
-    PREFILL_PIDS=()
-    DECODE_PIDS=()
 }
 
 cleanup() {
@@ -346,7 +278,7 @@ wait_for_server() {
 plot_decode_load() {
     local ts=$1
     local proxy_log="${LOG_DIR}/proxy_${ts}.log"
-    local plot_script="${PROXY_BASE_DIR}/plot_decode_load2.py"
+    local plot_script="$(dirname "${BASH_SOURCE[0]}")/plot_decode_load2.py"
 
     [[ -f "$plot_script" ]] || { echo "[WARN] plot_decode_load2.py not found"; return 0; }
     [[ -f "$proxy_log" ]] || { echo "[WARN] Proxy log not found: $proxy_log"; return 0; }
@@ -359,12 +291,10 @@ plot_decode_load() {
 start_servers() {
     PIDS=()
     PGIDS=()
-    PREFILL_PIDS=()
-    DECODE_PIDS=()
     local timestamp=$1
     echo "Launching servers..."
 
-    setsid env PROXY_PORT="${PROXY_PORT}" BENCH_PORT="${BENCH_PORT}" VLLM_DTYPE="${VLLM_DTYPE}" MODEL_CONFIG_PATH="${MODEL}/config.json" TPOT="${CACULATE_GOODPUT}" PREFILL_INFLIGHT_LIMIT="${PREFILL_INFLIGHT_LIMIT}" PREFILL_QUEUE_TIMEOUT_SECONDS="${PREFILL_QUEUE_TIMEOUT_SECONDS}" PREFILL_TIMEOUT_SECONDS="${PREFILL_TIMEOUT_SECONDS}" bash -c "exec python3 \"$PROXY_SCRIPT\"" &> "${LOG_DIR}/proxy_${timestamp}.log" &
+    setsid env PROXY_PORT="${PROXY_PORT}" BENCH_PORT="${BENCH_PORT}" VLLM_DTYPE="${VLLM_DTYPE}" MODEL_CONFIG_PATH="${MODEL}/config.json" TPOT="${CACULATE_GOODPUT}" bash -c "exec python3 \"$PROXY_SCRIPT\"" &> "${LOG_DIR}/proxy_${timestamp}.log" &
     proxy_pid=$!
     proxy_pgid=$(ps -o pgid= -p "$proxy_pid" | tr -d ' ')
     PIDS+=("$proxy_pid"); PGIDS+=("$proxy_pgid")
@@ -412,7 +342,6 @@ start_servers() {
         setsid env CUDA_VISIBLE_DEVICES="$gpu_id" VLLM_USE_V1=1 bash -c "exec $CMD" > "${LOG_DIR}/prefill${i}_${timestamp}.log" 2>&1 &
         pid=$!; pgid=$(ps -o pgid= -p "$pid" | tr -d ' ')
         PIDS+=("$pid"); PGIDS+=("$pgid")
-        PREFILL_PIDS+=("$pid")
     done
 
     IFS=',' read -ra DECODE_GPU_ARRAY <<< "$DECODE_GPUS"
@@ -464,7 +393,6 @@ start_servers() {
         setsid env DECODE_INSTANCE_ID="decode-${i}" VLLM_USE_V1=1 CUDA_VISIBLE_DEVICES="$gpu_id" bash -c "exec $CMD" > "${LOG_DIR}/decode${i}_${timestamp}.log" 2>&1 &
         pid=$!; pgid=$(ps -o pgid= -p "$pid" | tr -d ' ')
         PIDS+=("$pid"); PGIDS+=("$pgid")
-        DECODE_PIDS+=("$pid")
     done
 
     echo "Waiting for servers..."
@@ -478,54 +406,6 @@ start_servers() {
     return 0
 }
 
-run_benchmark_with_health_guard() {
-    local client_pid="$1"
-    local timeout_seconds="${INSTANCE_DOWN_TIMEOUT_SECONDS}"
-    local check_interval="${INSTANCE_HEALTH_CHECK_INTERVAL_SECONDS}"
-    declare -A down_since=()
-
-    while ps -p "$client_pid" >/dev/null 2>&1; do
-        local now
-        now=$(date +%s)
-
-        for i in "${!PREFILL_PIDS[@]}"; do
-            local pid="${PREFILL_PIDS[$i]}"
-            local key="prefill-${i}"
-            if ! ps -p "$pid" >/dev/null 2>&1; then
-                if [[ -z "${down_since[$key]:-}" ]]; then
-                    down_since[$key]="$now"
-                    echo "[WARN] ${key} (pid=${pid}) is down. Starting 2-minute countdown..."
-                elif (( now - down_since[$key] >= timeout_seconds )); then
-                    echo "[ERROR] ${key} (pid=${pid}) has been down for ${timeout_seconds}s. Abort current dataset."
-                    return 2
-                fi
-            else
-                unset 'down_since[$key]'
-            fi
-        done
-
-        for i in "${!DECODE_PIDS[@]}"; do
-            local pid="${DECODE_PIDS[$i]}"
-            local key="decode-${i}"
-            if ! ps -p "$pid" >/dev/null 2>&1; then
-                if [[ -z "${down_since[$key]:-}" ]]; then
-                    down_since[$key]="$now"
-                    echo "[WARN] ${key} (pid=${pid}) is down. Starting 10-minute countdown..."
-                elif (( now - down_since[$key] >= timeout_seconds )); then
-                    echo "[ERROR] ${key} (pid=${pid}) has been down for ${timeout_seconds}s. Abort current dataset."
-                    return 2
-                fi
-            else
-                unset 'down_since[$key]'
-            fi
-        done
-
-        sleep "$check_interval"
-    done
-
-    wait "$client_pid"
-}
-
 trap cleanup INT TERM EXIT
 
 main() {
@@ -534,74 +414,43 @@ main() {
     ensure_python_library_installed datasets
     ensure_python_library_installed vllm
     ensure_python_library_installed quart
-    resolve_dataset_paths
-
-    # if is_true "$USE_TRACE_TIMESTAMPS"; then
-    #     if [ "$BENCH_DATASET_NAME" != "mooncake_trace" ] && [ "$BENCH_DATASET_NAME" != "lmsyschat" ] && [ "$BENCH_DATASET_NAME" != "trace" ]; then
-    #         echo "USE_TRACE_TIMESTAMPS=true requires BENCH_DATASET_NAME to be mooncake_trace, lmsyschat, or trace"
-    #         exit 1
-    #     fi
-    # fi
 
     IFS=',' read -ra NUM_PROMPTS_ARRAY <<< "$NUM_PROMPTS_LIST"
-    if is_true "$USE_TRACE_TIMESTAMPS"; then
-        REQUEST_RATE_ARRAY=("trace")
-    else
-        IFS=',' read -ra REQUEST_RATE_ARRAY <<< "$BENCH_REQUEST_RATE_LIST"
-    fi
+    IFS=',' read -ra REQUEST_RATE_ARRAY <<< "$BENCH_REQUEST_RATE_LIST"
     IFS=',' read -ra MAX_TOKENS_ARRAY <<< "$BENCH_MAX_TOKENS_LIST"
 
-    for dataset_path in "${DATASET_PATH_ARRAY[@]}"; do
-        set_current_dataset "$dataset_path"
-        echo "Testing dataset: ${CURRENT_BENCH_DATASET_PATH}"
-        dataset_should_skip="false"
-
     for num_prompts in "${NUM_PROMPTS_ARRAY[@]}"; do
-        if [ "$dataset_should_skip" = "true" ]; then
-            break
-        fi
         for req_rate in "${REQUEST_RATE_ARRAY[@]}"; do
-            if [ "$dataset_should_skip" = "true" ]; then
-                break
-            fi
             for max_tokens in "${MAX_TOKENS_ARRAY[@]}"; do
-                if [ "$dataset_should_skip" = "true" ]; then
-                    break
-                fi
                 for optimal_mode in false true; do
-                    if [ "$dataset_should_skip" = "true" ]; then
-                        break
-                    fi
                     export TEST_OPTIMAL="$optimal_mode"
-                        # 如果是optimal_mode为true先跳过不测试
+                    # 判断optimal_mode是false就跳过
+                    if [ "$optimal_mode" = "false" ]; then
+                        echo "Skipping suboptimal config"
+                        continue
+                    fi
                     if is_true "$TEST_OPTIMAL"; then
-                            echo "Testing optimal load balance mode"
-                            continue
-                        fi
-                        # 如果data_path是/root/myshare/DynamicQPS/burstgpt/A_gt_small_1_dataset.csv，先跳过
-                        if [ "$dataset_path" = "/root/myshare/DynamicQPS/tmp_dataset2/hqmemv4_01_qwen_thinking_blksz_16_th8192_ts4500000_7140000_tqps3p5.csv" ]; then
-                            echo "Skipping dataset: ${dataset_path} for optimal load balance mode"
-                            continue
-                        fi
-                        if is_true "$TEST_OPTIMAL"; then
-                            DIR_SUFFIX="2p6d_optimal"
-                        else
-                            DIR_SUFFIX="2p6d_rr"
-                        fi
+                        DIR_SUFFIX="1p3d_optimal"
+                    else
+                        DIR_SUFFIX="1p3d_rr"
+                    fi
 
                     update_proxy_script
                     check_required_files
 
                     for repeat_idx in $(seq 1 "$RUN_REPEAT_PER_CONFIG"); do
                         timestamp=$(date +%Y%m%d_%H%M%S)
+                        # 如果request rate为8 并且optimal_mode为false，跳过
+                        if [ "$req_rate" -eq 8 ] && [ "$TEST_OPTIMAL" = "false" ]; then
+                            echo "Skipping suboptimal config with request rate 8"
+                            continue
+                        fi
                         setup_directories "$num_prompts" "$req_rate" "$max_tokens" "$timestamp" "$DIR_SUFFIX" "$repeat_idx"
 
                         echo "========================================"
                         echo "Run: TEST_OPTIMAL=${TEST_OPTIMAL}, Repeat=${repeat_idx}/${RUN_REPEAT_PER_CONFIG}, Prompts=${num_prompts}, Rate=${req_rate}, MaxTokens=${max_tokens}"
-                            echo "Dataset: ${CURRENT_BENCH_DATASET_PATH}"
                         echo "Dir: ${BENCHMARK_DIR}"
                         echo "Proxy: ${PROXY_SCRIPT}"
-                        echo "Use trace timestamps: ${USE_TRACE_TIMESTAMPS}"
                         echo "========================================"
 
                         dump_config_json "$num_prompts" "$req_rate" "$max_tokens" "$timestamp"
@@ -620,26 +469,20 @@ main() {
                             --endpoint '/v1/chat/completions' \
                             --model \"${BENCH_MODEL}\" \
                             --dataset-name ${BENCH_DATASET_NAME} \
-                            --dataset-path \"${CURRENT_BENCH_DATASET_PATH}\" \
+                            --dataset-path ${BENCH_DATASET_PATH} \
                             --save-output ${SAVE_OUTPUT} \
                             --out-path \"${RESULT_DIR}\" \
                             --maxtokenscustom ${max_tokens} \
                             --seed ${VLLM_SEED} \
-                            --max-concurrency ${BENCH_MAX_CONCURRENCY} \
+                            --num-prompts ${num_prompts} \
+                            --max-concurrency 1024 \
                             --temperature ${BENCH_TEMPERATURE} \
                             --top-p ${BENCH_TOP_P} \
                             --top-k ${BENCH_TOP_K} \
                             --repetition-penalty ${BENCH_REPETITION_PENALTY} \
+                            --request-rate ${req_rate} \
                             --goodput ${BENCH_GOODPUT}"
 
-                        if ! is_true "$USE_TRACE_TIMESTAMPS"; then
-                            CMD="$CMD --request-rate ${req_rate}"
-                        fi
-                            if [ "$BENCH_DATASET_NAME" = "mooncake_trace" ] || [ "$BENCH_DATASET_NAME" = "trace" ] || [ "$BENCH_DATASET_NAME" = "lmsyschat" ]; then
-                                echo "Using trace-order prompts from dataset ${CURRENT_BENCH_DATASET_PATH}"
-                        else
-                            CMD="$CMD --num-prompts ${num_prompts}"
-                        fi
                         [ "$IGNORE" = "true" ] && CMD="$CMD --ignore-eos"
                         [ "$TEST_ABLATION_P2D" = "true" ] && CMD="$CMD --ablation-p2d"
 
@@ -650,31 +493,13 @@ main() {
                         fi
                         [ "$SAVE_SAMPLE" = "true" ] && CMD="$CMD --save-sample"
 
-                            setsid env BENCHMARK_INSTANCE_ID="benchmark-${num_prompts}${CURRENT_BENCH_DATASET_LABEL:+-${CURRENT_BENCH_DATASET_LABEL}}" bash -c "exec $CMD" > "$log_file" 2>&1 &
+                        setsid env BENCHMARK_INSTANCE_ID="benchmark-${num_prompts}" bash -c "exec $CMD" > "$log_file" 2>&1 &
                         client_pid=$!
-                        if run_benchmark_with_health_guard "$client_pid"; then
-                            bench_exit_code=0
-                        else
-                            bench_exit_code=$?
-                        fi
-
-                        if [ "$bench_exit_code" -eq 2 ]; then
-                            echo "Dataset ${CURRENT_BENCH_DATASET_PATH}: prefill/decode instance down >= ${INSTANCE_DOWN_TIMEOUT_SECONDS}s."
-                            dataset_should_skip="true"
-                            kill -TERM "$client_pid" >/dev/null 2>&1 || true
-                            sleep 2
-                            kill -KILL "$client_pid" >/dev/null 2>&1 || true
-                        elif [ "$bench_exit_code" -ne 0 ]; then
-                            echo "Benchmark process failed with exit code ${bench_exit_code}."
-                            stop_servers
-                            exit "$bench_exit_code"
-                        fi
-
+                        wait "$client_pid"
                         echo "Benchmark finished."
 
                         plot_decode_load "$timestamp"
 
-                        if [ "$dataset_should_skip" != "true" ]; then
                         for pid in "${PIDS[@]}"; do
                             if ! ps -p "$pid" >/dev/null 2>&1; then
                                 echo "ERROR: Server died."
@@ -683,7 +508,6 @@ main() {
                                 exit 1
                             fi
                         done
-                        fi
 
                         stop_servers
 
@@ -694,10 +518,6 @@ main() {
 
                         echo "Sleeping ${SLEEP_BETWEEN_RUNS}s..."
                         sleep "${SLEEP_BETWEEN_RUNS}"
-                        if [ "$dataset_should_skip" = "true" ]; then
-                            break
-                        fi
-                        done
                     done
                 done
             done

@@ -860,12 +860,10 @@ def main(args: argparse.Namespace):
             for idx, row in df.iterrows():
 
                 req_id = str(row["req_id"]) if "req_id" in df.columns else str(idx)
-                if args.dataset_name == "trace" and "templated_prompt" in df.columns:
-                    prompt = row["templated_prompt"]
-                else:
+                if args.dataset_name == "trace":
                     prompt = row["prompt"]
                 if "prompt_len" in df.columns:
-                    prompt_tokens = row["prompt_len"]
+                    prompt_tokens = row["prompt_len"]+10 #llama加上了特殊token
                 else:
                     prompt_tokens = row["prompt_tokens"]
                 expected_output_len = row["output_tokens"]

@@ -218,3 +218,14 @@ csrc/moe/marlin_moe_wna16/kernel_*
 
 # Ignore ep_kernels_workspace folder
 ep_kernels_workspace/
+
+# Experiment data
+examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/5-DynamicQPS/tmp_dataset/
+examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/tmp/baseline_324/
+examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/tmp/baseline_325/
+examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/tmp/baseline_326/
+
+
+# Predict latency experiment output
+examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/4-Predict_latency/tmp/
+

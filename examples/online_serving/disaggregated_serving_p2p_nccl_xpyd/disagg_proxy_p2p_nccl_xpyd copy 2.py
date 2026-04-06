@@ -32,29 +32,12 @@ AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 PREFILL_TIMEOUT_SECONDS = 600.0
 PREFILL_INFLIGHT_LIMIT = int(os.environ.get("PREFILL_INFLIGHT_LIMIT", "64"))
 PREFILL_QUEUE_TIMEOUT_SECONDS = float(os.environ.get("PREFILL_QUEUE_TIMEOUT_SECONDS", "0"))
-PREFILL_DROP_FAIL_THRESHOLD = int(os.environ.get("PREFILL_DROP_FAIL_THRESHOLD", "5"))
-PREFILL_MAX_RETRIES = int(os.environ.get("PREFILL_MAX_RETRIES", "3"))
-PREFILL_RETRY_BACKOFF_SECONDS = float(os.environ.get("PREFILL_RETRY_BACKOFF_SECONDS", "0.2"))
-DECODE_OPEN_MAX_RETRIES = int(os.environ.get("DECODE_OPEN_MAX_RETRIES", "3"))
-DECODE_OPEN_RETRY_BACKOFF_SECONDS = float(os.environ.get("DECODE_OPEN_RETRY_BACKOFF_SECONDS", "0.2"))
 
 _request_counter_lock = threading.Lock()
 _prefill_semaphore: asyncio.Semaphore | None = None
 _shared_http_session: aiohttp.ClientSession | None = None
-_prefill_fail_counts_lock = threading.Lock()
-_prefill_fail_counts: dict[str, int] = {}
 
 app = Quart(__name__)
-
-
-def _is_retry_exhausted(attempt: int) -> bool:
-    # 0 means retry forever for completion-priority runs.
-    return PREFILL_MAX_RETRIES > 0 and attempt >= PREFILL_MAX_RETRIES
-
-
-def _is_decode_open_retry_exhausted(attempt: int) -> bool:
-    # 0 means retry forever for decode stream-open attempts.
-    return DECODE_OPEN_MAX_RETRIES > 0 and attempt >= DECODE_OPEN_MAX_RETRIES
 
 
 class PrefillQueueTimeoutError(RuntimeError):
@@ -217,54 +200,53 @@ class DecodeMonitor:
             self._last_log_time = now
     def _calculate_load(self, n_req, m_tok, kv_usage):
         lm = self.load_model
-        # 基础维度
-        H = lm.config.hidden_size
-        I = lm.config.intermediate_size
-        L = lm.config.num_hidden_layers
         
-        # 1. 硬件能力：每毫秒能搬运的字节数 (GB/s -> Bytes/ms)
+        # 统一单位：每毫秒能读取的字节数 (GB/s -> Bytes/ms)
         bw_bytes_ms = (lm.bandwidth_gbs * 1e9) / 1000
 
-        # 2. KV Cache 访存 (KVcache_gen)
-        # 这里的 m_tok 是当前实例上运行的所有 token 总数（历史 KV）
+        # 1. KV Cache 访存耗时 (动态开销: 读取当前所有Token的历史KV)
         kv_vram_bytes = (
-            2 * L * m_tok * lm.kv_dim * lm.precision_bytes
+            2 * lm.config.num_hidden_layers 
+            * m_tok 
+            * lm.kv_dim 
+            * lm.precision_bytes
         )
+        t_kv_io = kv_vram_bytes / bw_bytes_ms
 
-        # 3. 【新增】Activation 访存近似
-        # 虽然是瞬时的，但在生成一个 Token 的全过程中，L 层累加的总流量：
-        # 每层：Hidden State 读+写 (2H), MLP 中间激活值 读+写 (2I)
-        activation_vram_bytes = (
-            n_req * L * (2 * H + 2 * I) * lm.precision_bytes
-        )
-
-        # 4. 计算耗时 (TFLOPS 维度)
+        # 2. 计算耗时 (TFLOPS 维度)
         flops = (n_req * lm.linear_flops_coeff + lm.attn_flops_coeff * m_tok)
         t_compute = (flops / 1e12) / lm.peak_tflops * 1000
 
-        # 5. 归一化负载
+        # 3. 归一化负载
         lc = t_compute / lm.tpot
 
-        # 6. 带宽负载 (分子 = 动态访存总和)
+        # 按要求将权重项从分子移到分母:
+        # Load_Memory = kv_vram_bytes / (bw_bytes_ms * tpot - weights_vram)
         memory_denominator = bw_bytes_ms * lm.tpot - lm.weights_vram
-        
-        # 将 Activation 加入分子
-        total_dynamic_io_bytes = kv_vram_bytes + activation_vram_bytes
-        
         lm_ = (
-            total_dynamic_io_bytes / memory_denominator
+            kv_vram_bytes / memory_denominator
             if memory_denominator > 0
             else float("inf")
         )
-
-        lcap = kv_usage # 显存容量占用百分比
-        
+        lcap = kv_usage
         return {
             "Load_Compute": lc,
             "Load_Memory": lm_,
             "Load_Memory_Capacity": lcap,
             "Load_Bottle": max(lc, lm_, lcap),
         }
+
+    # def select_best_instance(self, instances):
+    #     best_addr,best_zmq_addr, best_load = None,None, float("inf")
+    #     for addr, zmq_addr in instances:
+    #         load = self.latest_load.get(addr)
+    #         if not load:
+    #             continue
+    #         if load["Load_Bottle"] < best_load:
+    #             best_addr = addr
+    #             best_load = load["Load_Bottle"]
+    #             best_zmq_addr = zmq_addr[0]
+    #     return best_addr,best_zmq_addr, best_load
 
 monitor = DecodeMonitor(
     config_path=os.environ.get("MODEL_CONFIG_PATH", "model_config.json"),
@@ -354,20 +336,6 @@ def _drop_instance(
         if value is not None:
             print(f"[WARN] Drop instance HTTP:{http_addr}, ZMQ:{value[0]}, reason={reason}")
             cv.notify_all()
-    with _prefill_fail_counts_lock:
-        _prefill_fail_counts.pop(http_addr, None)
-
-
-def _record_prefill_failure(http_addr: str) -> int:
-    with _prefill_fail_counts_lock:
-        fail_count = _prefill_fail_counts.get(http_addr, 0) + 1
-        _prefill_fail_counts[http_addr] = fail_count
-        return fail_count
-
-
-def _record_prefill_success(http_addr: str) -> None:
-    with _prefill_fail_counts_lock:
-        _prefill_fail_counts.pop(http_addr, None)
 
 
 def _listen_for_register(poller, router_socket):
@@ -479,46 +447,96 @@ async def forward_request(url, data, request_id):
             )
 
 
-async def forward_decode_request_with_open_retry(url, data, request_id, request_no):
-    attempt = 0
-    last_decode_error: Exception | None = None
-
-    while True:
-        attempt += 1
-        got_first_chunk = False
-        try:
-            async for chunk_bytes in forward_request(url, data, request_id):
-                got_first_chunk = True
-                yield chunk_bytes
-            return
-        except Exception as decode_err:
-            # Request-level 4xx usually indicates invalid input and should not retry.
-            if "Upstream returned 4" in str(decode_err):
-                raise
-
-            # Only do open-stream retry. Once the first chunk is sent, keep old behavior.
-            if got_first_chunk:
-                raise
-
-            last_decode_error = decode_err
-            print(
-                f"[WARN] decode stream-open error req_no={request_no} "
-                f"request_id={request_id} attempt={attempt}/"
-                f"{('inf' if DECODE_OPEN_MAX_RETRIES <= 0 else DECODE_OPEN_MAX_RETRIES)} "
-                f"type={type(decode_err).__name__} err={decode_err!r}",
-                flush=True,
-            )
-            if _is_decode_open_retry_exhausted(attempt):
-                raise RuntimeError(
-                    f"Decode stream open failed after retries: {last_decode_error}"
-                ) from last_decode_error
-            if DECODE_OPEN_RETRY_BACKOFF_SECONDS > 0:
-                await asyncio.sleep(DECODE_OPEN_RETRY_BACKOFF_SECONDS)
-
-
 async def _drain_stream(stream):
     async for _ in stream:
         continue
+
+# [WT] 2026-01-24 07:55:08
+# 修改pd分离ttft计算逻辑,在prefill完从proxy返回给benchmark时间戳
+# @app.route("/v1/completions", methods=["POST"])
+# @app.route("/v1/chat/completions", methods=["POST"])
+# async def handle_request():
+#     try:
+#         import time
+
+#         original_request_data = await request.get_json()
+#         original_request_data["predictor_meta"] = None
+
+#         # ---------- Prefill request ----------
+#         prefill_request = original_request_data.copy()
+#         prefill_request["max_tokens"] = 1
+#         prefill_request["stream"] = True   # ⚠️ 必须是 True
+
+#         if "max_completion_tokens" in prefill_request:
+#             prefill_request["max_completion_tokens"] = 1
+
+#         global count, prefill_instances, prefill_cv
+#         global decode_instances, decode_cv
+
+#         with prefill_cv:
+#             prefill_list = list(prefill_instances.items())
+#             prefill_addr, prefill_zmq_addr = prefill_list[count % len(prefill_list)]
+#             prefill_zmq_addr = prefill_zmq_addr[0]
+
+#         with decode_cv:
+#             decode_list = list(decode_instances.items())
+#             decode_addr, decode_zmq_addr = decode_list[count % len(decode_list)]
+#             decode_zmq_addr = decode_zmq_addr[0]
+
+#         request_id = (
+#             f"___prefill_addr_{prefill_zmq_addr}"
+#             f"___decode_addr_{decode_zmq_addr}_{random_uuid()}"
+#         )
+
+#         print(
+#             f"handle_request count={count} "
+#             f"[prefill:{prefill_addr}] -> [decode:{decode_addr}]"
+#         )
+#         count += 1
+
+#         # ---------- Prefill phase ----------
+#         prefill_start_ts = time.perf_counter()
+
+#         async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+#             async with session.post(
+#                 f"http://{prefill_addr}{request.path}",
+#                 json=prefill_request,
+#                 headers={
+#                     "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+#                     "X-Request-Id": request_id,
+#                 },
+#             ) as resp:
+#                 if resp.status != 200:
+#                     text = await resp.text()
+#                     raise RuntimeError(f"Prefill failed: {resp.status}, {text}")
+
+#                 # ⚠️ 必须把 stream 消耗完
+#                 async for _ in resp.content:
+#                     pass
+
+#         prefill_done_ts = time.perf_counter()
+
+#         # ---------- Decode phase (streaming) ----------
+#         generator = forward_request(
+#             f"http://{decode_addr}{request.path}",
+#             original_request_data,
+#             request_id,
+#         )
+
+#         response = await make_response(generator)
+#         response.timeout = None
+
+#         # ⭐ 传给 benchmark
+#         response.headers["x-prefill-done-ts"] = str(prefill_done_ts)
+
+#         return response
+
+#     except Exception as e:
+#         import sys, traceback
+#         print("Error occurred in disagg prefill proxy server")
+#         print(e)
+#         print("".join(traceback.format_exception(*sys.exc_info())))
+#         return await make_response(str(e), 500)
 
 
 # 原始过程
@@ -554,9 +572,7 @@ async def handle_request():
             request_no = count
             count += 1
 
-        attempt = 0
-        while True:
-            attempt += 1
+        for _attempt in range(3):
             selected_prefill_addr, selected_prefill_zmq_addr = _pick_instance_with_wait(
                 prefill_cv,
                 prefill_instances,
@@ -573,8 +589,7 @@ async def handle_request():
             )
 
             print(
-                f"handle_request req_no:{request_no} attempt:{attempt}/"
-                f"{('inf' if PREFILL_MAX_RETRIES <= 0 else PREFILL_MAX_RETRIES)} "
+                f"handle_request req_no:{request_no} attempt:{_attempt + 1}/3 "
                 f"[HTTP:{selected_prefill_addr}, "
                 f"ZMQ:{selected_prefill_zmq_addr}] -> [HTTP:{selected_decode_addr}, "
                 f"ZMQ:{selected_decode_zmq_addr}] request_id={request_id}",
@@ -599,7 +614,6 @@ async def handle_request():
                     f"done_ms={prefill_ms:.1f}",
                     flush=True,
                 )
-                _record_prefill_success(selected_prefill_addr)
                 last_prefill_error = None
                 break
             except RuntimeError as conn_err:
@@ -614,25 +628,12 @@ async def handle_request():
                     f"err={conn_err!r}",
                     flush=True,
                 )
-                fail_count = _record_prefill_failure(selected_prefill_addr)
-                if fail_count >= max(1, PREFILL_DROP_FAIL_THRESHOLD):
-                    _drop_instance(
-                        prefill_cv,
-                        prefill_instances,
-                        selected_prefill_addr,
-                        f"prefill-connect-failed (consecutive={fail_count}): {conn_err}",
-                    )
-                else:
-                    print(
-                        f"[WARN] Keep prefill HTTP:{selected_prefill_addr} after runtime error "
-                        f"(consecutive_failures={fail_count}/{max(1, PREFILL_DROP_FAIL_THRESHOLD)})",
-                        flush=True,
-                    )
-                if _is_retry_exhausted(attempt):
-                    break
-                if PREFILL_RETRY_BACKOFF_SECONDS > 0:
-                    await asyncio.sleep(PREFILL_RETRY_BACKOFF_SECONDS)
-                continue
+                _drop_instance(
+                    prefill_cv,
+                    prefill_instances,
+                    selected_prefill_addr,
+                    f"prefill-connect-failed: {conn_err}",
+                )
             except PrefillQueueTimeoutError as queue_err:
                 last_prefill_error = queue_err
                 print(
@@ -641,11 +642,6 @@ async def handle_request():
                     f"err={queue_err!r}",
                     flush=True,
                 )
-                if _is_retry_exhausted(attempt):
-                    break
-                if PREFILL_RETRY_BACKOFF_SECONDS > 0:
-                    await asyncio.sleep(PREFILL_RETRY_BACKOFF_SECONDS)
-                continue
             except (aiohttp.ClientError, asyncio.TimeoutError) as conn_err:
                 last_prefill_error = conn_err
                 print(
@@ -654,25 +650,12 @@ async def handle_request():
                     f"err={conn_err!r}",
                     flush=True,
                 )
-                fail_count = _record_prefill_failure(selected_prefill_addr)
-                if fail_count >= max(1, PREFILL_DROP_FAIL_THRESHOLD):
-                    _drop_instance(
-                        prefill_cv,
-                        prefill_instances,
-                        selected_prefill_addr,
-                        f"prefill-connect-failed (consecutive={fail_count}): {conn_err}",
-                    )
-                else:
-                    print(
-                        f"[WARN] Keep prefill HTTP:{selected_prefill_addr} after timeout "
-                        f"(consecutive_failures={fail_count}/{max(1, PREFILL_DROP_FAIL_THRESHOLD)})",
-                        flush=True,
-                    )
-                if _is_retry_exhausted(attempt):
-                    break
-                if PREFILL_RETRY_BACKOFF_SECONDS > 0:
-                    await asyncio.sleep(PREFILL_RETRY_BACKOFF_SECONDS)
-                continue
+                _drop_instance(
+                    prefill_cv,
+                    prefill_instances,
+                    selected_prefill_addr,
+                    f"prefill-connect-failed: {conn_err}",
+                )
 
         if last_prefill_error is not None:
             raise RuntimeError(
@@ -680,11 +663,10 @@ async def handle_request():
             )
 
         # return decode
-        generator = forward_decode_request_with_open_retry(
+        generator = forward_request(
             f"http://{selected_decode_addr}{request.path}",
             original_request_data,
             request_id,
-            request_no,
         )
         response = await make_response(generator)
         response.timeout = None

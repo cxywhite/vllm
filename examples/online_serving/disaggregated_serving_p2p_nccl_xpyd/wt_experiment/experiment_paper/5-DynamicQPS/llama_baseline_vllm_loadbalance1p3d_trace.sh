@@ -17,7 +17,7 @@ REPRODUCE_BASELINE_CSV_PATH="/root/predict-schedule/vllm/examples/online_serving
 TEST_MODEL="llama"
 
 BENCH_DATASET_NAME=${BENCH_DATASET_NAME:-trace}
-BENCH_DATASET_PATH=${BENCH_DATASET_PATH:-/root/myshare/DynamicQPS/tmpdataset1-2}
+BENCH_DATASET_PATH=${BENCH_DATASET_PATH:-/root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/5-DynamicQPS/tmp_dataset}
 SAVE_OUTPUT=${SAVE_OUTPUT:-True}
 
 VLLM_DTYPE=${VLLM_DTYPE:-bfloat16}
@@ -29,7 +29,7 @@ BENCH_REPETITION_PENALTY=${BENCH_REPETITION_PENALTY:-1.0}
 
 MODEL=${MODEL:-/root/.cache/huggingface/hub/Meta-Llama-3-8B-Instruct}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
-BASE_RESULT_DIR=${BASE_RESULT_DIR:-/root/myshare/DynamicQPS/baseline_319}
+BASE_RESULT_DIR=${BASE_RESULT_DIR:-/root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/tmp/baseline_326}
 
 PROXY_PORT=${PROXY_PORT:-28002}
 BENCH_PORT=${BENCH_PORT:-22007}
@@ -67,6 +67,10 @@ BENCH_MAX_CONCURRENCY=${BENCH_MAX_CONCURRENCY:-1024}
 BENCH_GOODPUT=${BENCH_GOODPUT:-ttft:1000 tpot:50}
 CACULATE_GOODPUT=${CACULATE_GOODPUT:-tpot:50}
 USE_TRACE_TIMESTAMPS=${USE_TRACE_TIMESTAMPS:-true}
+
+PREFILL_INFLIGHT_LIMIT=${PREFILL_INFLIGHT_LIMIT:-64}
+PREFILL_QUEUE_TIMEOUT_SECONDS=${PREFILL_QUEUE_TIMEOUT_SECONDS:-0}
+PREFILL_TIMEOUT_SECONDS=${PREFILL_TIMEOUT_SECONDS:-600}
 
 NUM_PROMPTS_LIST=${NUM_PROMPTS_LIST:-"1000"}
 BENCH_REQUEST_RATE_LIST=${BENCH_REQUEST_RATE_LIST:-"8,6"}
@@ -360,7 +364,7 @@ start_servers() {
     local timestamp=$1
     echo "Launching servers..."
 
-    setsid env PROXY_PORT="${PROXY_PORT}" BENCH_PORT="${BENCH_PORT}" VLLM_DTYPE="${VLLM_DTYPE}" MODEL_CONFIG_PATH="${MODEL}/config.json" TPOT="${CACULATE_GOODPUT}" bash -c "exec python3 \"$PROXY_SCRIPT\"" &> "${LOG_DIR}/proxy_${timestamp}.log" &
+    setsid env PROXY_PORT="${PROXY_PORT}" BENCH_PORT="${BENCH_PORT}" VLLM_DTYPE="${VLLM_DTYPE}" MODEL_CONFIG_PATH="${MODEL}/config.json" TPOT="${CACULATE_GOODPUT}" PREFILL_INFLIGHT_LIMIT="${PREFILL_INFLIGHT_LIMIT}" PREFILL_QUEUE_TIMEOUT_SECONDS="${PREFILL_QUEUE_TIMEOUT_SECONDS}" PREFILL_TIMEOUT_SECONDS="${PREFILL_TIMEOUT_SECONDS}" bash -c "exec python3 \"$PROXY_SCRIPT\"" &> "${LOG_DIR}/proxy_${timestamp}.log" &
     proxy_pid=$!
     proxy_pgid=$(ps -o pgid= -p "$proxy_pid" | tr -d ' ')
     PIDS+=("$proxy_pid"); PGIDS+=("$proxy_pgid")
@@ -621,7 +625,7 @@ main() {
                             --out-path \"${RESULT_DIR}\" \
                             --maxtokenscustom ${max_tokens} \
                             --seed ${VLLM_SEED} \
-                            --max-concurrency 1024 \
+                            --max-concurrency ${BENCH_MAX_CONCURRENCY} \
                             --temperature ${BENCH_TEMPERATURE} \
                             --top-p ${BENCH_TOP_P} \
                             --top-k ${BENCH_TOP_K} \

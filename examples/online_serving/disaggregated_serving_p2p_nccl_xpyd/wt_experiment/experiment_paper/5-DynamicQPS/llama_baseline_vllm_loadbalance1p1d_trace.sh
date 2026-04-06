@@ -17,7 +17,7 @@ REPRODUCE_BASELINE_CSV_PATH="/root/predict-schedule/vllm/examples/online_serving
 TEST_MODEL="llama"
 
 BENCH_DATASET_NAME=${BENCH_DATASET_NAME:-trace}
-BENCH_DATASET_PATH=${BENCH_DATASET_PATH:-/root/myshare/DynamicQPS/tmp_dataset2}
+BENCH_DATASET_PATH=${BENCH_DATASET_PATH:-/root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/5-DynamicQPS/tmp_dataset}
 SAVE_OUTPUT=${SAVE_OUTPUT:-True}
 
 VLLM_DTYPE=${VLLM_DTYPE:-bfloat16}
@@ -29,19 +29,19 @@ BENCH_REPETITION_PENALTY=${BENCH_REPETITION_PENALTY:-1.0}
 
 MODEL=${MODEL:-/root/.cache/huggingface/hub/Meta-Llama-3-8B-Instruct}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
-BASE_RESULT_DIR=${BASE_RESULT_DIR:-/root/myshare/DynamicQPS/baseline_319-2}
+BASE_RESULT_DIR=${BASE_RESULT_DIR:-/root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/tmp/baseline_325}
 
 PROXY_PORT=${PROXY_PORT:-28002}
 BENCH_PORT=${BENCH_PORT:-22007}
 
-PREFILL_GPUS=${PREFILL_GPUS:-4}
+PREFILL_GPUS=${PREFILL_GPUS:-6}
 PREFILL_PORTS=${PREFILL_PORTS:-22001}
 PREFILL_KV_PORTS=${PREFILL_KV_PORTS:-22011}
 PREFILL_GPU_MEMORY_UTILIZATION=${PREFILL_GPU_MEMORY_UTILIZATION:-0.8}
 PREFILL_TENSOR_PARALLEL_SIZE=${PREFILL_TENSOR_PARALLEL_SIZE:-1}
 PREFILL_TENSOR_POOL_MEMORY=${PREFILL_TENSOR_POOL_MEMORY:-8}
 
-DECODE_GPUS=${DECODE_GPUS:-5}
+DECODE_GPUS=${DECODE_GPUS:-7}
 DECODE_PORTS=${DECODE_PORTS:-22020}
 DECODE_KV_PORTS=${DECODE_KV_PORTS:-22032}
 DECODE_GPU_MEMORY_UTILIZATION=${DECODE_GPU_MEMORY_UTILIZATION:-0.8}
@@ -68,14 +68,25 @@ BENCH_GOODPUT=${BENCH_GOODPUT:-ttft:1000 tpot:50}
 CACULATE_GOODPUT=${CACULATE_GOODPUT:-tpot:50}
 USE_TRACE_TIMESTAMPS=${USE_TRACE_TIMESTAMPS:-true}
 
+PREFILL_INFLIGHT_LIMIT=${PREFILL_INFLIGHT_LIMIT:-8}
+PREFILL_QUEUE_TIMEOUT_SECONDS=${PREFILL_QUEUE_TIMEOUT_SECONDS:-0}
+PREFILL_TIMEOUT_SECONDS=${PREFILL_TIMEOUT_SECONDS:-7200}
+PREFILL_DROP_FAIL_THRESHOLD=${PREFILL_DROP_FAIL_THRESHOLD:-100000}
+PREFILL_MAX_RETRIES=${PREFILL_MAX_RETRIES:-0}
+PREFILL_RETRY_BACKOFF_SECONDS=${PREFILL_RETRY_BACKOFF_SECONDS:-0.2}
+
 NUM_PROMPTS_LIST=${NUM_PROMPTS_LIST:-"1000"}
 BENCH_REQUEST_RATE_LIST=${BENCH_REQUEST_RATE_LIST:-"8,6"}
 BENCH_MAX_TOKENS_LIST=${BENCH_MAX_TOKENS_LIST:-"8192"}
 SLEEP_BETWEEN_RUNS=${SLEEP_BETWEEN_RUNS:-5}
 RUN_REPEAT_PER_CONFIG=${RUN_REPEAT_PER_CONFIG:-1}
 PROXY_SCRIPT_OVERRIDE=${PROXY_SCRIPT_OVERRIDE:-}
-INSTANCE_DOWN_TIMEOUT_SECONDS=${INSTANCE_DOWN_TIMEOUT_SECONDS:-120}
+INSTANCE_DOWN_TIMEOUT_SECONDS=${INSTANCE_DOWN_TIMEOUT_SECONDS:-1800}
 INSTANCE_HEALTH_CHECK_INTERVAL_SECONDS=${INSTANCE_HEALTH_CHECK_INTERVAL_SECONDS:-5}
+ENABLE_GPU_STALL_GUARD=${ENABLE_GPU_STALL_GUARD:-true}
+GPU_STALL_CHECK_INTERVAL_SECONDS=${GPU_STALL_CHECK_INTERVAL_SECONDS:-5}
+GPU_STALL_TIMEOUT_SECONDS=${GPU_STALL_TIMEOUT_SECONDS:-480}
+GPU_STALL_MEMORY_THRESHOLD_MIB=${GPU_STALL_MEMORY_THRESHOLD_MIB:-100}
 
 PROXY_BASE_DIR="/root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd"
 PROXY_SCRIPT_DEFAULT="${PROXY_BASE_DIR}/disagg_proxy_p2p_nccl_xpyd.py"
@@ -116,6 +127,71 @@ sanitize_name() {
     raw_name="${raw_name// /_}"
     raw_name="$(printf '%s' "$raw_name" | sed 's/[^[:alnum:]_.-]/_/g')"
     printf '%s' "$raw_name"
+}
+
+get_monitored_gpu_ids() {
+    local combined_gpus="${PREFILL_GPUS},${DECODE_GPUS}"
+    local -A seen_gpu_ids=()
+    IFS=',' read -ra all_gpu_ids <<< "$combined_gpus"
+
+    for gpu_id in "${all_gpu_ids[@]}"; do
+        gpu_id="${gpu_id#"${gpu_id%%[![:space:]]*}"}"
+        gpu_id="${gpu_id%"${gpu_id##*[![:space:]]}"}"
+
+        if [[ -n "$gpu_id" && -z "${seen_gpu_ids[$gpu_id]:-}" ]]; then
+            seen_gpu_ids["$gpu_id"]=1
+            printf '%s\n' "$gpu_id"
+        fi
+    done
+}
+
+is_gpu_group_stalled() {
+    local gpu_csv="$1"
+    local group_name="$2"
+    local memory_threshold_mib="$3"
+    local valid_gpu_count=0
+
+    IFS=',' read -ra group_gpu_ids <<< "$gpu_csv"
+
+    for gpu_id in "${group_gpu_ids[@]}"; do
+        gpu_id="${gpu_id#"${gpu_id%%[![:space:]]*}"}"
+        gpu_id="${gpu_id%"${gpu_id##*[![:space:]]}"}"
+        [[ -n "$gpu_id" ]] || continue
+        valid_gpu_count=$((valid_gpu_count + 1))
+
+        local smi_line
+        if ! smi_line=$(nvidia-smi -i "$gpu_id" --query-gpu=utilization.gpu,memory.used --format=csv,noheader,nounits 2>/dev/null | head -n 1); then
+            echo "[WARN] Failed to query ${group_name} GPU ${gpu_id} via nvidia-smi."
+            return 1
+        fi
+
+        local gpu_util
+        local gpu_mem_used
+        IFS=',' read -r gpu_util gpu_mem_used <<< "$smi_line"
+        gpu_util="${gpu_util//[[:space:]]/}"
+        gpu_mem_used="${gpu_mem_used//[[:space:]]/}"
+
+        if [[ -z "$gpu_util" || -z "$gpu_mem_used" ]]; then
+            echo "[WARN] Skip ${group_name} GPU ${gpu_id} due to empty nvidia-smi fields (${smi_line})."
+            return 1
+        fi
+
+        if [[ ! "$gpu_util" =~ ^[0-9]+$ || ! "$gpu_mem_used" =~ ^[0-9]+$ ]]; then
+            echo "[WARN] Skip ${group_name} GPU ${gpu_id} due to non-numeric nvidia-smi fields (${smi_line})."
+            return 1
+        fi
+
+        if (( gpu_mem_used < memory_threshold_mib )) || (( gpu_util != 0 )); then
+            return 1
+        fi
+    done
+
+    if (( valid_gpu_count == 0 )); then
+        echo "[WARN] No valid ${group_name} GPUs configured for stall guard."
+        return 1
+    fi
+
+    return 0
 }
 
 resolve_dataset_paths() {
@@ -360,7 +436,7 @@ start_servers() {
     local timestamp=$1
     echo "Launching servers..."
 
-    setsid env PROXY_PORT="${PROXY_PORT}" BENCH_PORT="${BENCH_PORT}" VLLM_DTYPE="${VLLM_DTYPE}" MODEL_CONFIG_PATH="${MODEL}/config.json" TPOT="${CACULATE_GOODPUT}" bash -c "exec python3 \"$PROXY_SCRIPT\"" &> "${LOG_DIR}/proxy_${timestamp}.log" &
+    setsid env PROXY_PORT="${PROXY_PORT}" BENCH_PORT="${BENCH_PORT}" VLLM_DTYPE="${VLLM_DTYPE}" MODEL_CONFIG_PATH="${MODEL}/config.json" TPOT="${CACULATE_GOODPUT}" PREFILL_INFLIGHT_LIMIT="${PREFILL_INFLIGHT_LIMIT}" PREFILL_QUEUE_TIMEOUT_SECONDS="${PREFILL_QUEUE_TIMEOUT_SECONDS}" PREFILL_TIMEOUT_SECONDS="${PREFILL_TIMEOUT_SECONDS}" PREFILL_DROP_FAIL_THRESHOLD="${PREFILL_DROP_FAIL_THRESHOLD}" PREFILL_MAX_RETRIES="${PREFILL_MAX_RETRIES}" PREFILL_RETRY_BACKOFF_SECONDS="${PREFILL_RETRY_BACKOFF_SECONDS}" bash -c "exec python3 \"$PROXY_SCRIPT\"" &> "${LOG_DIR}/proxy_${timestamp}.log" &
     proxy_pid=$!
     proxy_pgid=$(ps -o pgid= -p "$proxy_pid" | tr -d ' ')
     PIDS+=("$proxy_pid"); PGIDS+=("$proxy_pgid")
@@ -478,6 +554,11 @@ run_benchmark_with_health_guard() {
     local client_pid="$1"
     local timeout_seconds="${INSTANCE_DOWN_TIMEOUT_SECONDS}"
     local check_interval="${INSTANCE_HEALTH_CHECK_INTERVAL_SECONDS}"
+    local gpu_check_interval="${GPU_STALL_CHECK_INTERVAL_SECONDS}"
+    local gpu_stall_timeout_seconds="${GPU_STALL_TIMEOUT_SECONDS}"
+    local gpu_stall_memory_threshold_mib="${GPU_STALL_MEMORY_THRESHOLD_MIB}"
+    local last_gpu_check=0
+    local group_stall_since=""
     declare -A down_since=()
 
     while ps -p "$client_pid" >/dev/null 2>&1; do
@@ -515,6 +596,33 @@ run_benchmark_with_health_guard() {
                 unset 'down_since[$key]'
             fi
         done
+
+        if is_true "$ENABLE_GPU_STALL_GUARD" && (( now - last_gpu_check >= gpu_check_interval )); then
+            last_gpu_check="$now"
+
+            local prefill_group_stalled="false"
+            local decode_group_stalled="false"
+
+            if is_gpu_group_stalled "$PREFILL_GPUS" "prefill" "$gpu_stall_memory_threshold_mib"; then
+                prefill_group_stalled="true"
+            fi
+
+            if is_gpu_group_stalled "$DECODE_GPUS" "decode" "$gpu_stall_memory_threshold_mib"; then
+                decode_group_stalled="true"
+            fi
+
+            if is_true "$prefill_group_stalled" && is_true "$decode_group_stalled"; then
+                if [[ -z "$group_stall_since" ]]; then
+                    group_stall_since="$now"
+                    echo "[WARN] Prefill+Decode groups both stalled (all mem>=${gpu_stall_memory_threshold_mib}MiB and util=0%). Starting ${gpu_stall_timeout_seconds}s countdown..."
+                elif (( now - group_stall_since >= gpu_stall_timeout_seconds )); then
+                    echo "[ERROR] Prefill+Decode groups stalled for >= ${gpu_stall_timeout_seconds}s. Abort current benchmark run."
+                    return 3
+                fi
+            else
+                group_stall_since=""
+            fi
+        fi
 
         sleep "$check_interval"
     done
@@ -574,11 +682,6 @@ main() {
                             echo "Testing optimal load balance mode"
                             continue
                         fi
-                        # 如果data_path是/root/myshare/DynamicQPS/burstgpt/A_gt_small_1_dataset.csv，先跳过
-                        if [ "$dataset_path" = "/root/myshare/DynamicQPS/tmp_dataset2/hqmemv4_01_qwen_thinking_blksz_16_th8192_ts4500000_7140000_tqps3p5.csv" ]; then
-                            echo "Skipping dataset: ${dataset_path} for optimal load balance mode"
-                            continue
-                        fi
                         if is_true "$TEST_OPTIMAL"; then
                             DIR_SUFFIX="1p1d_optimal"
                         else
@@ -621,7 +724,7 @@ main() {
                                 --out-path \"${RESULT_DIR}\" \
                                 --maxtokenscustom ${max_tokens} \
                                 --seed ${VLLM_SEED} \
-                                --max-concurrency 1024 \
+                                --max-concurrency ${BENCH_MAX_CONCURRENCY} \
                                 --temperature ${BENCH_TEMPERATURE} \
                                 --top-p ${BENCH_TOP_P} \
                                 --top-k ${BENCH_TOP_K} \
@@ -660,13 +763,22 @@ main() {
                             kill -TERM "$client_pid" >/dev/null 2>&1 || true
                             sleep 2
                             kill -KILL "$client_pid" >/dev/null 2>&1 || true
+                        elif [ "$bench_exit_code" -eq 3 ]; then
+                            echo "GPU stall guard triggered: util=0 with occupied memory for >= ${GPU_STALL_TIMEOUT_SECONDS}s. Abort current run and continue next config."
+                            kill -TERM "$client_pid" >/dev/null 2>&1 || true
+                            sleep 2
+                            kill -KILL "$client_pid" >/dev/null 2>&1 || true
                         elif [ "$bench_exit_code" -ne 0 ]; then
                             echo "Benchmark process failed with exit code ${bench_exit_code}."
                             stop_servers
                             exit "$bench_exit_code"
                         fi
 
-                            echo "Benchmark finished."
+                            if [ "$bench_exit_code" -eq 0 ]; then
+                                echo "Benchmark finished."
+                            else
+                                echo "Benchmark aborted by health guard with exit code ${bench_exit_code}."
+                            fi
 
                             plot_decode_load "$timestamp"
 

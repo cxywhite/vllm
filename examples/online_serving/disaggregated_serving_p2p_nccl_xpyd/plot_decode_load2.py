@@ -12,6 +12,8 @@ import argparse
 MAX_POINTS = 300
 FIG_SIZE = (12, 6)
 DPI = 150
+MIN_Y_MAX = 1.05
+Y_PAD_RATIO = 0.08
 
 LINESTYLES = {
     "compute": "-",
@@ -69,6 +71,14 @@ def downsample(x, y, max_points):
     return [x[i] for i in idx], [y[i] for i in idx]
 
 
+def auto_ymax(values, min_ymax=MIN_Y_MAX, pad_ratio=Y_PAD_RATIO):
+    if not values:
+        return min_ymax
+
+    vmax = max(values)
+    return max(min_ymax, vmax * (1 + pad_ratio))
+
+
 # =======================
 # 图 1
 # =======================
@@ -83,7 +93,10 @@ def plot_figure_1(data, decode_map, decodes, log_path):
         ax1.plot(t, v, linestyle=style, linewidth=2, label=metric)
 
     ax1.set_ylabel("Load", fontsize=9)
-    ax1.set_ylim(0, 1.05)
+    load_values = []
+    for metric in LINESTYLES:
+        load_values.extend(data[target][metric])
+    ax1.set_ylim(0, auto_ymax(load_values))
     ax1.grid(True, alpha=0.4)
     ax1.legend(frameon=False)
     ax1.tick_params(axis="x", labelbottom=False)
@@ -100,7 +113,10 @@ def plot_figure_1(data, decode_map, decodes, log_path):
         ax2.plot(t, v, linewidth=2, label=decode_map[d])
 
     ax2.set_ylabel("Bottle", fontsize=9)
-    ax2.set_ylim(0, 1.05)
+    bottle_values = []
+    for d in decodes:
+        bottle_values.extend(data[d]["bottle"])
+    ax2.set_ylim(0, auto_ymax(bottle_values))
     ax2.grid(True, alpha=0.4)
     ax2.legend(frameon=False, loc="upper right")
     ax2.set_xlabel("Time", fontsize=9)
@@ -134,7 +150,10 @@ def plot_figure_2(data, decode_map, decodes, log_path):
             ax.plot(t, v, linestyle=style, linewidth=2, label=metric)
 
         ax.set_ylabel("Load", fontsize=9)
-        ax.set_ylim(0, 1.05)
+        load_values = []
+        for metric in LINESTYLES:
+            load_values.extend(data[d][metric])
+        ax.set_ylim(0, auto_ymax(load_values))
         ax.grid(True, alpha=0.4)
         ax.legend(frameon=False)
         ax.tick_params(axis="x", labelbottom=False)
@@ -152,7 +171,10 @@ def plot_figure_2(data, decode_map, decodes, log_path):
         ax.plot(t, v, linewidth=2, label=decode_map[d])
 
     ax.set_ylabel("Bottle", fontsize=9)
-    ax.set_ylim(0, 1.05)
+    bottle_values = []
+    for d in decodes:
+        bottle_values.extend(data[d]["bottle"])
+    ax.set_ylim(0, auto_ymax(bottle_values))
     ax.grid(True, alpha=0.4)
     ax.legend(frameon=False, loc="upper right")
     ax.set_xlabel("Time", fontsize=9)
