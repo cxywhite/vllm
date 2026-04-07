@@ -314,7 +314,8 @@ monitor = DecodeMonitor(
     config_path=os.environ.get("MODEL_CONFIG_PATH", "model_config.json"),
     precision=os.environ.get("VLLM_DTYPE", "bf16"),
     tpot=float(os.environ.get("TPOT", "tpot:50").split(':')[-1]),
-)
+    check_interval=0.01,
+    enable_monitor_log=True,)
 
 @app.before_serving
 async def start_monitor():
@@ -326,7 +327,6 @@ def _remove_oldest_instances(instances: dict) -> None:
     for k in keys_to_del:
         val = instances.pop(k, None)
         if val: print(f"🔴Remove [HTTP:{k}, ZMQ:{val[0]}]")
-
 def _listen_for_register(poller, router_socket):
     while True:
         socks = dict(poller.poll(1000))

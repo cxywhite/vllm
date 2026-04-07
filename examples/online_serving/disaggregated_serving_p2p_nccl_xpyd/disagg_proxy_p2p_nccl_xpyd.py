@@ -6,20 +6,18 @@ import socket
 import threading
 import time
 import uuid
-from typing import Any,Dict, List
-from contextlib import asynccontextmanager
+import asyncio
+import json
+import re
+from dataclasses import dataclass
+from typing import Any, Dict
+
 import aiohttp
+import httpx
 import msgpack
 import zmq
-from quart import Quart, make_response, request
-import json
-import asyncio
-from dataclasses import dataclass
-import httpx
-import re
-import os
-import sys
-from typing import Any, Dict, List, Optional
+from quart import Quart, jsonify, make_response, request
+
 count = 0
 prefill_instances: dict[str, Any] = {}  # http_address: (zmq_address, stamp)
 decode_instances: dict[str, Any] = {}  # http_address: (zmq_address, stamp)
@@ -28,37 +26,88 @@ prefill_cv = threading.Condition()
 decode_cv = threading.Condition()
 
 DEFAULT_PING_SECONDS = 5
-AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
-PREFILL_TIMEOUT_SECONDS = 600.0
-PREFILL_INFLIGHT_LIMIT = int(os.environ.get("PREFILL_INFLIGHT_LIMIT", "64"))
-PREFILL_QUEUE_TIMEOUT_SECONDS = float(os.environ.get("PREFILL_QUEUE_TIMEOUT_SECONDS", "0"))
-PREFILL_DROP_FAIL_THRESHOLD = int(os.environ.get("PREFILL_DROP_FAIL_THRESHOLD", "5"))
-PREFILL_MAX_RETRIES = int(os.environ.get("PREFILL_MAX_RETRIES", "3"))
-PREFILL_RETRY_BACKOFF_SECONDS = float(os.environ.get("PREFILL_RETRY_BACKOFF_SECONDS", "0.2"))
-DECODE_OPEN_MAX_RETRIES = int(os.environ.get("DECODE_OPEN_MAX_RETRIES", "3"))
-DECODE_OPEN_RETRY_BACKOFF_SECONDS = float(os.environ.get("DECODE_OPEN_RETRY_BACKOFF_SECONDS", "0.2"))
 
-_request_counter_lock = threading.Lock()
-_prefill_semaphore: asyncio.Semaphore | None = None
-_shared_http_session: aiohttp.ClientSession | None = None
-_prefill_fail_counts_lock = threading.Lock()
-_prefill_fail_counts: dict[str, int] = {}
+
+def _remove_oldest_instances(instances: dict[str, Any]) -> None:
+    oldest_key = next(iter(instances), None)
+    while oldest_key is not None:
+        value = instances[oldest_key]
+        if value[1] > time.time():
+            break
+        print(f"🔴Remove [HTTP:{oldest_key}, ZMQ:{value[0]}, stamp:{value[1]}]")
+        instances.pop(oldest_key, None)
+        oldest_key = next(iter(instances), None)
+
+def _remove_oldest_instances(instances: dict) -> None:
+    now = time.time()
+    keys_to_del = [k for k, v in instances.items() if v[1] < now]
+    for k in keys_to_del:
+        val = instances.pop(k, None)
+        if val: print(f"🔴Remove [HTTP:{k}, ZMQ:{val[0]}]")
+def _listen_for_register(poller, router_socket):
+    while True:
+        socks = dict(poller.poll(1000))
+        if router_socket in socks:
+            remote_address, message = router_socket.recv_multipart()
+            # data: {"type": "P", "http_address": "ip:port",
+            #        "zmq_address": "ip:port"}
+            data = msgpack.loads(message)
+            if data["type"] == "P":
+                global prefill_instances
+                global prefill_cv
+                with prefill_cv:
+                    node = prefill_instances.get(data["http_address"], None)
+                    prefill_instances[data["http_address"]] = (
+                        data["zmq_address"],
+                        time.time() + DEFAULT_PING_SECONDS,
+                    )
+                    _remove_oldest_instances(prefill_instances)
+
+            elif data["type"] == "D":
+                global decode_instances
+                global decode_cv
+                with decode_cv:
+                    node = decode_instances.get(data["http_address"], None)
+                    decode_instances[data["http_address"]] = (
+                        data["zmq_address"],
+                        time.time() + DEFAULT_PING_SECONDS,
+                    )
+                    _remove_oldest_instances(decode_instances)
+            else:
+                print(
+                    "Unexpected, Received message from %s, data: %s",
+                    remote_address,
+                    data,
+                )
+                return
+
+            if node is None:
+                print(f"🔵Add [HTTP:{data['http_address']}, ZMQ:{data['zmq_address']}]")
+
+
+def start_service_discovery(hostname, port):
+    if not hostname:
+        hostname = socket.gethostname()
+    if port == 0:
+        raise ValueError("Port cannot be 0")
+
+    context = zmq.Context()
+    router_socket = context.socket(zmq.ROUTER)
+    router_socket.bind(f"tcp://{hostname}:{port}")
+
+    poller = zmq.Poller()
+    poller.register(router_socket, zmq.POLLIN)
+
+    _listener_thread = threading.Thread(
+        target=_listen_for_register, args=[poller, router_socket], daemon=True
+    )
+    _listener_thread.start()
+    return _listener_thread
+
+
+AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
 app = Quart(__name__)
-
-
-def _is_retry_exhausted(attempt: int) -> bool:
-    # 0 means retry forever for completion-priority runs.
-    return PREFILL_MAX_RETRIES > 0 and attempt >= PREFILL_MAX_RETRIES
-
-
-def _is_decode_open_retry_exhausted(attempt: int) -> bool:
-    # 0 means retry forever for decode stream-open attempts.
-    return DECODE_OPEN_MAX_RETRIES > 0 and attempt >= DECODE_OPEN_MAX_RETRIES
-
-
-class PrefillQueueTimeoutError(RuntimeError):
-    pass
 
 
 @dataclass
@@ -83,20 +132,17 @@ class DecodeLoadModel:
 
     def __post_init__(self):
         c = self.config
-        H = c.hidden_size
-        I = c.intermediate_size
-        V = c.vocab_size
-        L = c.num_hidden_layers
-        self.kv_dim = (H // c.num_attention_heads) * c.num_key_value_heads
-        self.layer_params = (H * (H + 2 * self.kv_dim) + H * H + 3 * H * I)
-        self.total_params = L * self.layer_params + V * H
+        h_dim = c.hidden_size
+        i_dim = c.intermediate_size
+        v_dim = c.vocab_size
+        l_dim = c.num_hidden_layers
+        self.kv_dim = (h_dim // c.num_attention_heads) * c.num_key_value_heads
+        self.layer_params = (h_dim * (h_dim + 2 * self.kv_dim) + h_dim * h_dim + 3 * h_dim * i_dim)
+        self.total_params = l_dim * self.layer_params + v_dim * h_dim
         self.weights_vram = self.total_params * self.precision_bytes
-        self.linear_flops_coeff = 2 * (L * self.layer_params + V * H)
-        self.attn_flops_coeff = 4 * L * H
+        self.linear_flops_coeff = 2 * (l_dim * self.layer_params + v_dim * h_dim)
+        self.attn_flops_coeff = 4 * l_dim * h_dim
 
-# =========================
-# Decode Monitor
-# =========================
 
 class DecodeMonitor:
     def __init__(
@@ -114,6 +160,8 @@ class DecodeMonitor:
         self.is_running = True
         self.config = self._load_config(config_path)
         self.precision = precision.lower()
+        if self.precision == "bf16":
+            self.precision = "bfloat16"
 
         precision_map = {
             "int8": 1,
@@ -164,36 +212,48 @@ class DecodeMonitor:
 
     async def fetch_metrics(self):
         limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
-        async with httpx.AsyncClient(timeout=httpx.Timeout(0.5), limits=limits) as client:
+        # Decode metrics are from internal service addresses; bypass env proxies.
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(0.5),
+            limits=limits,
+            trust_env=False,
+        ) as client:
             while self.is_running:
                 urls = list(decode_instances.keys())
                 if urls:
-                    await asyncio.gather(*[self._update_instance(client, u) for u in urls], return_exceptions=True)
+                    await asyncio.gather(
+                        *[self._update_instance(client, decode_addr) for decode_addr in urls],
+                        return_exceptions=True,
+                    )
                     self._compute_all_loads()
                 await asyncio.sleep(self.check_interval)
 
     async def _update_instance(self, client: httpx.AsyncClient, addr: str):
         try:
-            r = await client.get(f"http://{addr}/metrics")
-            if r.status_code != 200: return
-            def p(name):
-                m = re.search(rf"{name}\{{.*?\}}\s+([\d\.e\+]+)", r.text)
-                return float(m.group(1)) if m else 0.0
-            
+            response = await client.get(f"http://{addr}/metrics")
+            if response.status_code != 200:
+                return
+
+            def parse_metric(name):
+                match = re.search(rf"{name}\{{.*?\}}\s+([\d\.e\+]+)", response.text)
+                return float(match.group(1)) if match else 0.0
+
             self.stats[addr] = {
-                "kv_usage": p("vllm:kv_cache_usage_perc"),
-                "running_tokens": int(p("vllm:running_tokens")),
-                "running_requests": int(p("vllm:num_requests_running")),
+                "kv_usage": parse_metric("vllm:kv_cache_usage_perc"),
+                "running_tokens": int(parse_metric("vllm:running_tokens")),
+                "running_requests": int(parse_metric("vllm:num_requests_running")),
                 "status": "healthy",
                 "dirty": True,
             }
         except Exception:
             self.stats.setdefault(addr, {})["status"] = "unhealthy"
+
     def _compute_all_loads(self):
         now = time.time()
         do_log = self.enable_monitor_log and (now - self._last_log_time >= self.log_interval)
         for addr, stat in self.stats.items():
-            if stat.get("status") != "healthy" or not stat.get("dirty"): continue
+            if stat.get("status") != "healthy" or not stat.get("dirty"):
+                continue
             stat["dirty"] = False
             load = self._calculate_load(
                 stat["running_requests"],
@@ -215,61 +275,54 @@ class DecodeMonitor:
                 )
         if do_log:
             self._last_log_time = now
+
     def _calculate_load(self, n_req, m_tok, kv_usage):
-        lm = self.load_model
-        # 基础维度
-        H = lm.config.hidden_size
-        I = lm.config.intermediate_size
-        L = lm.config.num_hidden_layers
-        
-        # 1. 硬件能力：每毫秒能搬运的字节数 (GB/s -> Bytes/ms)
-        bw_bytes_ms = (lm.bandwidth_gbs * 1e9) / 1000
+        load_model = self.load_model
+        h_dim = load_model.config.hidden_size
+        i_dim = load_model.config.intermediate_size
+        l_dim = load_model.config.num_hidden_layers
 
-        # 2. KV Cache 访存 (KVcache_gen)
-        # 这里的 m_tok 是当前实例上运行的所有 token 总数（历史 KV）
+        bw_bytes_ms = (load_model.bandwidth_gbs * 1e9) / 1000
+
         kv_vram_bytes = (
-            2 * L * m_tok * lm.kv_dim * lm.precision_bytes
+            2 * l_dim * m_tok * load_model.kv_dim * load_model.precision_bytes
         )
 
-        # 3. 【新增】Activation 访存近似
-        # 虽然是瞬时的，但在生成一个 Token 的全过程中，L 层累加的总流量：
-        # 每层：Hidden State 读+写 (2H), MLP 中间激活值 读+写 (2I)
         activation_vram_bytes = (
-            n_req * L * (2 * H + 2 * I) * lm.precision_bytes
+            n_req * l_dim * (2 * h_dim + 2 * i_dim) * load_model.precision_bytes
         )
 
-        # 4. 计算耗时 (TFLOPS 维度)
-        flops = (n_req * lm.linear_flops_coeff + lm.attn_flops_coeff * m_tok)
-        t_compute = (flops / 1e12) / lm.peak_tflops * 1000
+        flops = (n_req * load_model.linear_flops_coeff + load_model.attn_flops_coeff * m_tok)
+        t_compute = (flops / 1e12) / load_model.peak_tflops * 1000
 
-        # 5. 归一化负载
-        lc = t_compute / lm.tpot
+        load_compute = t_compute / load_model.tpot
 
-        # 6. 带宽负载 (分子 = 动态访存总和)
-        memory_denominator = bw_bytes_ms * lm.tpot - lm.weights_vram
-        
-        # 将 Activation 加入分子
+        memory_denominator = bw_bytes_ms * load_model.tpot - load_model.weights_vram
         total_dynamic_io_bytes = kv_vram_bytes + activation_vram_bytes
-        
-        lm_ = (
+
+        load_memory = (
             total_dynamic_io_bytes / memory_denominator
             if memory_denominator > 0
             else float("inf")
         )
 
-        lcap = kv_usage # 显存容量占用百分比
-        
+        load_memory_capacity = kv_usage
+
         return {
-            "Load_Compute": lc,
-            "Load_Memory": lm_,
-            "Load_Memory_Capacity": lcap,
-            "Load_Bottle": max(lc, lm_, lcap),
+            "Load_Compute": load_compute,
+            "Load_Memory": load_memory,
+            "Load_Memory_Capacity": load_memory_capacity,
+            "Load_Bottle": max(load_compute, load_memory, load_memory_capacity),
         }
+
+
+_tpot_raw = os.environ.get("TPOT", "tpot:50")
+_tpot_value = _tpot_raw.split(":", 1)[1] if ":" in _tpot_raw else _tpot_raw
 
 monitor = DecodeMonitor(
     config_path=os.environ.get("MODEL_CONFIG_PATH", "model_config.json"),
     precision=os.environ.get("VLLM_DTYPE", "bf16"),
-    tpot=os.environ.get("TPOT", 'tpot:50').split(':')[1],
+    tpot=_tpot_value,
     check_interval=0.01,
     enable_monitor_log=True,
 )
@@ -277,432 +330,101 @@ monitor = DecodeMonitor(
 
 @app.before_serving
 async def start_monitor():
-    global _prefill_semaphore
-    global _shared_http_session
-
-    _prefill_semaphore = asyncio.Semaphore(max(1, PREFILL_INFLIGHT_LIMIT))
-    connector = aiohttp.TCPConnector(limit=2048, limit_per_host=1024, enable_cleanup_closed=True)
-    _shared_http_session = aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT, connector=connector)
-
-    print(
-        f"[WT][PROXY] prefill_inflight_limit={max(1, PREFILL_INFLIGHT_LIMIT)} "
-        f"prefill_queue_timeout_s={PREFILL_QUEUE_TIMEOUT_SECONDS:.1f} "
-        f"prefill_timeout_s={PREFILL_TIMEOUT_SECONDS:.1f}",
-        flush=True,
-    )
     asyncio.create_task(monitor.fetch_metrics())
 
-
-@app.after_serving
-async def stop_monitor():
-    global _shared_http_session
-    if _shared_http_session is not None and not _shared_http_session.closed:
-        await _shared_http_session.close()
-    _shared_http_session = None
-
-
-@asynccontextmanager
-async def _acquire_prefill_slot(request_id: str):
-    if _prefill_semaphore is None:
-        raise RuntimeError("Prefill semaphore is not initialized")
-
-    queue_start = time.perf_counter()
-    try:
-        if PREFILL_QUEUE_TIMEOUT_SECONDS > 0:
-            await asyncio.wait_for(
-                _prefill_semaphore.acquire(),
-                timeout=PREFILL_QUEUE_TIMEOUT_SECONDS,
-            )
-        else:
-            await _prefill_semaphore.acquire()
-    except asyncio.TimeoutError as e:
-        waited = time.perf_counter() - queue_start
-        raise PrefillQueueTimeoutError(
-            f"Prefill queue wait timeout after {waited:.2f}s, request_id={request_id}"
-        ) from e
-
-    waited = time.perf_counter() - queue_start
-    if waited >= 1.0:
-        print(
-            f"[WT][PREFILL_QUEUE] request_id={request_id} waited_s={waited:.2f}",
-            flush=True,
-        )
-
-    try:
-        yield
-    finally:
-        _prefill_semaphore.release()
-
-def _remove_expired_instances(instances: dict[str, Any]) -> None:
-    now = time.time()
-    expired_keys = [k for k, v in instances.items() if v[1] <= now]
-    for key in expired_keys:
-        value = instances.get(key)
-        if value is not None:
-            print(f"🔴Remove [HTTP:{key}, ZMQ:{value[0]}, stamp:{value[1]}]")
-            instances.pop(key, None)
-
-
-def _drop_instance(
-    cv: threading.Condition,
-    instances: dict[str, Any],
-    http_addr: str,
-    reason: str,
-) -> None:
-    with cv:
-        value = instances.pop(http_addr, None)
-        if value is not None:
-            print(f"[WARN] Drop instance HTTP:{http_addr}, ZMQ:{value[0]}, reason={reason}")
-            cv.notify_all()
-    with _prefill_fail_counts_lock:
-        _prefill_fail_counts.pop(http_addr, None)
-
-
-def _record_prefill_failure(http_addr: str) -> int:
-    with _prefill_fail_counts_lock:
-        fail_count = _prefill_fail_counts.get(http_addr, 0) + 1
-        _prefill_fail_counts[http_addr] = fail_count
-        return fail_count
-
-
-def _record_prefill_success(http_addr: str) -> None:
-    with _prefill_fail_counts_lock:
-        _prefill_fail_counts.pop(http_addr, None)
-
-
-def _listen_for_register(poller, router_socket):
-    while True:
-        socks = dict(poller.poll())
-        if router_socket in socks:
-            remote_address, message = router_socket.recv_multipart()
-            # data: {"type": "P", "http_address": "ip:port",
-            #        "zmq_address": "ip:port"}
-            data = msgpack.loads(message)
-            if data["type"] == "P":
-                global prefill_instances
-                global prefill_cv
-                with prefill_cv:
-                    node = prefill_instances.get(data["http_address"], None)
-                    prefill_instances[data["http_address"]] = (
-                        data["zmq_address"],
-                        time.time() + DEFAULT_PING_SECONDS,
-                    )
-                    _remove_expired_instances(prefill_instances)
-                    prefill_cv.notify_all()
-
-            elif data["type"] == "D":
-                global decode_instances
-                global decode_cv
-                with decode_cv:
-                    node = decode_instances.get(data["http_address"], None)
-                    decode_instances[data["http_address"]] = (
-                        data["zmq_address"],
-                        time.time() + DEFAULT_PING_SECONDS,
-                    )
-                    _remove_expired_instances(decode_instances)
-                    decode_cv.notify_all()
-            else:
-                print(
-                    "Unexpected, Received message from %s, data: %s",
-                    remote_address,
-                    data,
-                )
-                return
-
-            if node is None:
-                print(f"🔵Add [HTTP:{data['http_address']}, ZMQ:{data['zmq_address']}]")
-
-
-def start_service_discovery(hostname, port):
-    if not hostname:
-        hostname = socket.gethostname()
-    if port == 0:
-        raise ValueError("Port cannot be 0")
-
-    context = zmq.Context()
-    router_socket = context.socket(zmq.ROUTER)
-    router_socket.bind(f"tcp://{hostname}:{port}")
-
-    poller = zmq.Poller()
-    poller.register(router_socket, zmq.POLLIN)
-
-    _listener_thread = threading.Thread(
-        target=_listen_for_register, args=[poller, router_socket], daemon=True
-    )
-    _listener_thread.start()
-    return _listener_thread
 
 def random_uuid() -> str:
     return str(uuid.uuid4().hex)
 
 
-def _pick_instance_with_wait(
-    cv: threading.Condition,
-    instances: dict[str, Any],
-    role: str,
-    timeout_s: float = 60.0,
-) -> tuple[str, str]:
-    deadline = time.time() + timeout_s
-    while True:
-        with cv:
-            _remove_expired_instances(instances)
-            items = list(instances.items())
-            if items:
-                # Use global round-robin counter to keep pair selection behavior.
-                idx = count % len(items)
-                http_addr, zmq_info = items[idx]
-                return http_addr, zmq_info[0]
-
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                raise RuntimeError(f"No available {role} instances within {timeout_s:.1f}s")
-
-            cv.wait(timeout=min(0.2, remaining))
-
-
 async def forward_request(url, data, request_id):
-    if _shared_http_session is None or _shared_http_session.closed:
-        raise RuntimeError("Shared HTTP session is unavailable")
-
-    headers = {
-        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
-        "X-Request-Id": request_id,
-    }
-    async with _shared_http_session.post(url=url, json=data, headers=headers) as response:
-        if response.status == 200:
-            async for chunk_bytes in response.content.iter_chunked(1024):
-                yield chunk_bytes
-        else:
-            err_msg = await response.text()
-            raise RuntimeError(
-                f"Upstream returned {response.status} for {url}: {err_msg[:400]}"
-            )
+    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+        headers = {
+            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+            "X-Request-Id": request_id,
+        }
+        async with session.post(url=url, json=data, headers=headers) as response:
+            if response.status == 200:
+                if True:
+                    async for chunk_bytes in response.content.iter_chunked(1024):
+                        yield chunk_bytes
+                else:
+                    content = await response.read()
+                    yield content
 
 
-async def forward_decode_request_with_open_retry(url, data, request_id, request_no):
-    attempt = 0
-    last_decode_error: Exception | None = None
-
-    while True:
-        attempt += 1
-        got_first_chunk = False
-        try:
-            async for chunk_bytes in forward_request(url, data, request_id):
-                got_first_chunk = True
-                yield chunk_bytes
-            return
-        except Exception as decode_err:
-            # Request-level 4xx usually indicates invalid input and should not retry.
-            if "Upstream returned 4" in str(decode_err):
-                raise
-
-            # Only do open-stream retry. Once the first chunk is sent, keep old behavior.
-            if got_first_chunk:
-                raise
-
-            last_decode_error = decode_err
-            print(
-                f"[WARN] decode stream-open error req_no={request_no} "
-                f"request_id={request_id} attempt={attempt}/"
-                f"{('inf' if DECODE_OPEN_MAX_RETRIES <= 0 else DECODE_OPEN_MAX_RETRIES)} "
-                f"type={type(decode_err).__name__} err={decode_err!r}",
-                flush=True,
-            )
-            if _is_decode_open_retry_exhausted(attempt):
-                raise RuntimeError(
-                    f"Decode stream open failed after retries: {last_decode_error}"
-                ) from last_decode_error
-            if DECODE_OPEN_RETRY_BACKOFF_SECONDS > 0:
-                await asyncio.sleep(DECODE_OPEN_RETRY_BACKOFF_SECONDS)
-
-
-async def _drain_stream(stream):
-    async for _ in stream:
-        continue
-
-
-# 原始过程
 @app.route("/v1/completions", methods=["POST"])
 @app.route("/v1/chat/completions", methods=["POST"])
 async def handle_request():
     try:
         original_request_data = await request.get_json()
-        original_request_data["predictor_meta"] = None
+
         prefill_request = original_request_data.copy()
+        # change max_tokens = 1 to let it only do prefill
         prefill_request["max_tokens"] = 1
-        # Prefill is only used to materialize KV; non-streaming avoids
-        # long-lived SSE responses blocking the proxy request lifecycle.
-        prefill_request["stream"] = False
-        # OpenAI-compatible servers reject stream_options when stream is False.
-        prefill_request.pop("stream_options", None)
         if "max_completion_tokens" in prefill_request:
             prefill_request["max_completion_tokens"] = 1
+
         global count
         global prefill_instances
         global prefill_cv
+        with prefill_cv:
+            prefill_list = list(prefill_instances.items())
+            if not prefill_list:
+                return jsonify({"error": "No prefill instance available"}), 503
+            prefill_addr, prefill_zmq_addr = prefill_list[count % len(prefill_list)]
+            prefill_zmq_addr = prefill_zmq_addr[0]
+
         global decode_instances
         global decode_cv
-        global _request_counter_lock
-        last_prefill_error: Exception | None = None
-        selected_prefill_addr = ""
-        selected_prefill_zmq_addr = ""
-        selected_decode_addr = ""
-        selected_decode_zmq_addr = ""
-        request_id = ""
+        with decode_cv:
+            decode_list = list(decode_instances.items())
+            if not decode_list:
+                return jsonify({"error": "No decode instance available"}), 503
+            decode_addr, decode_zmq_addr = decode_list[count % len(decode_list)]
+            decode_zmq_addr = decode_zmq_addr[0]
 
-        with _request_counter_lock:
-            request_no = count
-            count += 1
+        print(
+            f"handle_request count: {count}, [HTTP:{prefill_addr}, "
+            f"ZMQ:{prefill_zmq_addr}] 👉 [HTTP:{decode_addr}, "
+            f"ZMQ:{decode_zmq_addr}]"
+        )
+        count += 1
 
-        attempt = 0
-        while True:
-            attempt += 1
-            selected_prefill_addr, selected_prefill_zmq_addr = _pick_instance_with_wait(
-                prefill_cv,
-                prefill_instances,
-                "prefill",
-            )
-            selected_decode_addr, selected_decode_zmq_addr = _pick_instance_with_wait(
-                decode_cv,
-                decode_instances,
-                "decode",
-            )
-            request_id = (
-                f"___prefill_addr_{selected_prefill_zmq_addr}___decode_addr_"
-                f"{selected_decode_zmq_addr}_{random_uuid()}"
-            )
+        request_id = (
+            f"___prefill_addr_{prefill_zmq_addr}___decode_addr_"
+            f"{decode_zmq_addr}_{random_uuid()}"
+        )
 
-            print(
-                f"handle_request req_no:{request_no} attempt:{attempt}/"
-                f"{('inf' if PREFILL_MAX_RETRIES <= 0 else PREFILL_MAX_RETRIES)} "
-                f"[HTTP:{selected_prefill_addr}, "
-                f"ZMQ:{selected_prefill_zmq_addr}] -> [HTTP:{selected_decode_addr}, "
-                f"ZMQ:{selected_decode_zmq_addr}] request_id={request_id}",
-                flush=True,
-            )
-
-            try:
-                prefill_start = time.perf_counter()
-                async with _acquire_prefill_slot(request_id):
-                    await asyncio.wait_for(
-                        _drain_stream(
-                            forward_request(
-                                f"http://{selected_prefill_addr}{request.path}",
-                                prefill_request,
-                                request_id,
-                            )),
-                        timeout=PREFILL_TIMEOUT_SECONDS,
-                    )
-                prefill_ms = (time.perf_counter() - prefill_start) * 1000.0
-                print(
-                    f"[WT][PREFILL] req_no={request_no} request_id={request_id} "
-                    f"done_ms={prefill_ms:.1f}",
-                    flush=True,
-                )
-                _record_prefill_success(selected_prefill_addr)
-                last_prefill_error = None
-                break
-            except RuntimeError as conn_err:
-                # Request-level 4xx usually indicates invalid input rather
-                # than an unhealthy prefill instance.
-                if "Upstream returned 4" in str(conn_err):
-                    raise
-                last_prefill_error = conn_err
-                print(
-                    f"[WARN] prefill runtime error req_no={request_no} "
-                    f"request_id={request_id} type={type(conn_err).__name__} "
-                    f"err={conn_err!r}",
-                    flush=True,
-                )
-                fail_count = _record_prefill_failure(selected_prefill_addr)
-                if fail_count >= max(1, PREFILL_DROP_FAIL_THRESHOLD):
-                    _drop_instance(
-                        prefill_cv,
-                        prefill_instances,
-                        selected_prefill_addr,
-                        f"prefill-connect-failed (consecutive={fail_count}): {conn_err}",
-                    )
-                else:
-                    print(
-                        f"[WARN] Keep prefill HTTP:{selected_prefill_addr} after runtime error "
-                        f"(consecutive_failures={fail_count}/{max(1, PREFILL_DROP_FAIL_THRESHOLD)})",
-                        flush=True,
-                    )
-                if _is_retry_exhausted(attempt):
-                    break
-                if PREFILL_RETRY_BACKOFF_SECONDS > 0:
-                    await asyncio.sleep(PREFILL_RETRY_BACKOFF_SECONDS)
-                continue
-            except PrefillQueueTimeoutError as queue_err:
-                last_prefill_error = queue_err
-                print(
-                    f"[WARN] prefill queue timeout req_no={request_no} "
-                    f"request_id={request_id} type={type(queue_err).__name__} "
-                    f"err={queue_err!r}",
-                    flush=True,
-                )
-                if _is_retry_exhausted(attempt):
-                    break
-                if PREFILL_RETRY_BACKOFF_SECONDS > 0:
-                    await asyncio.sleep(PREFILL_RETRY_BACKOFF_SECONDS)
-                continue
-            except (aiohttp.ClientError, asyncio.TimeoutError) as conn_err:
-                last_prefill_error = conn_err
-                print(
-                    f"[WARN] prefill connection/timeout req_no={request_no} "
-                    f"request_id={request_id} type={type(conn_err).__name__} "
-                    f"err={conn_err!r}",
-                    flush=True,
-                )
-                fail_count = _record_prefill_failure(selected_prefill_addr)
-                if fail_count >= max(1, PREFILL_DROP_FAIL_THRESHOLD):
-                    _drop_instance(
-                        prefill_cv,
-                        prefill_instances,
-                        selected_prefill_addr,
-                        f"prefill-connect-failed (consecutive={fail_count}): {conn_err}",
-                    )
-                else:
-                    print(
-                        f"[WARN] Keep prefill HTTP:{selected_prefill_addr} after timeout "
-                        f"(consecutive_failures={fail_count}/{max(1, PREFILL_DROP_FAIL_THRESHOLD)})",
-                        flush=True,
-                    )
-                if _is_retry_exhausted(attempt):
-                    break
-                if PREFILL_RETRY_BACKOFF_SECONDS > 0:
-                    await asyncio.sleep(PREFILL_RETRY_BACKOFF_SECONDS)
-                continue
-
-        if last_prefill_error is not None:
-            raise RuntimeError(
-                f"Prefill connection failed after retries: {last_prefill_error}"
-            )
+        # finish prefill
+        async for _ in forward_request(
+            f"http://{prefill_addr}{request.path}", prefill_request, request_id
+        ):
+            continue
 
         # return decode
-        generator = forward_decode_request_with_open_retry(
-            f"http://{selected_decode_addr}{request.path}",
-            original_request_data,
-            request_id,
-            request_no,
+        generator = forward_request(
+            f"http://{decode_addr}{request.path}", original_request_data, request_id
         )
         response = await make_response(generator)
         response.timeout = None
+
         return response
+
     except Exception as e:
         import sys
         import traceback
+
         exc_info = sys.exc_info()
         print("Error occurred in disagg prefill proxy server")
         print(e)
         print("".join(traceback.format_exception(*exc_info)))
-        return await make_response(str(e), 500)
-
+        return jsonify({"error": "disagg proxy internal error", "detail": str(e)}), 500
 
 
 if __name__ == "__main__":
-    proxy_port=os.environ.get("PROXY_PORT", "28001")
-    bench_port=os.environ.get("BENCH_PORT", "22006")
+    proxy_port = int(os.environ.get("PROXY_PORT", "30001"))
+    bench_port = int(os.environ.get("BENCH_PORT", "10001"))
     t = start_service_discovery("0.0.0.0", proxy_port)
     app.run(host="0.0.0.0", port=bench_port)
     t.join()
