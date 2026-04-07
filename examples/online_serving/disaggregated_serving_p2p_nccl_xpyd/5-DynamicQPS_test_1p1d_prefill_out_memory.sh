@@ -46,6 +46,7 @@ BENCH_REPETITION_PENALTY=${BENCH_REPETITION_PENALTY:-1.0}
 SAVE_OUTPUT=${SAVE_OUTPUT:-True}
 IGNORE=${IGNORE:-true}
 BENCH_GOODPUT=${BENCH_GOODPUT:-ttft:1000 tpot:50}
+CACULATE_GOODPUT=${CACULATE_GOODPUT:-tpot:50}
 OUTPUT_TOKENS=${OUTPUT_TOKENS:-1}   # 输出长度固定（prefill OOM 测试无需长输出）
 
 # OOM 测试扫参（batchsize × inputlength）
@@ -260,7 +261,7 @@ start_servers() {
     echo "Launching 1 Prefill + 1 Decode servers..."
     
     # Proxy
-    setsid env PROXY_PORT="${PROXY_PORT}" BENCH_PORT="${BENCH_PORT}" VLLM_DTYPE="${VLLM_DTYPE}" MODEL_CONFIG_PATH="${MODEL}/config.json" bash -c "exec python3 \"$PROXY_SCRIPT\"" &> "${LOG_DIR}/proxy_${timestamp}.log" &
+    setsid env PROXY_PORT="${PROXY_PORT}" BENCH_PORT="${BENCH_PORT}" VLLM_DTYPE="${VLLM_DTYPE}" MODEL_CONFIG_PATH="${MODEL}/config.json" TPOT="${CACULATE_GOODPUT}" bash -c "exec python3 \"$PROXY_SCRIPT\"" &> "${LOG_DIR}/proxy_${timestamp}.log" &
     proxy_pid=$!
     proxy_pgid=$(ps -o pgid= -p "$proxy_pid" | tr -d ' ')
     PIDS+=("$proxy_pid"); PGIDS+=("$proxy_pgid")

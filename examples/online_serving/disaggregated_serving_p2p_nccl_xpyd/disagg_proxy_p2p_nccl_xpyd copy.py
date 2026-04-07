@@ -128,7 +128,7 @@ class DecodeMonitor:
             vocab_size=raw.get("vocab_size", 32000),
             intermediate_size=raw.get("intermediate_size", 11008),
             num_attention_heads=raw.get("num_attention_heads", 32),
-            num_key_value_heads=raw.get("num_key_value_heads", raw.get("num_attention_heads", 32)),
+            num_key_value_heads=raw.get("num_key_value_heads", raw.get("num_attention_heads", 8)),
         )
 
     async def fetch_metrics(self):

@@ -25,15 +25,15 @@ set -e
 # Configuration - can be overridden via environment variables
 MODEL=${MODEL:-/root/.cache/huggingface/hub/Meta-Llama-3-8B-Instruct}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
-PROXY_PORT=${PROXY_PORT:-30001}
+PROXY_PORT=${PROXY_PORT:-30002}
 QUART_DEBUG=${QUART_DEBUG:-0}
 LOG_NO_COLOR=${LOG_NO_COLOR:-1}
 
 # Default 1P1D configuration for A/B comparison with launch_nixl_disagg.sh
-PREFILL_GPUS=${PREFILL_GPUS:-6}
-DECODE_GPUS=${DECODE_GPUS:-7}
-PREFILL_PORTS=${PREFILL_PORTS:-20003}
-DECODE_PORTS=${DECODE_PORTS:-20005}
+PREFILL_GPUS=${PREFILL_GPUS:-0}
+DECODE_GPUS=${DECODE_GPUS:-1}
+PREFILL_PORTS=${PREFILL_PORTS:-20103}
+DECODE_PORTS=${DECODE_PORTS:-20105}
 
 # Model/runtime configuration aligned with launch_nixl_disagg.sh
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
@@ -48,11 +48,11 @@ UCX_TLS=${UCX_TLS:-tcp,cuda_copy}
 
 # Benchmark configuration aligned with launch_nixl_disagg.sh
 # Note: disagg_proxy_p2p_nccl_xpyd.py listens on HTTP port 10001 by design.
-BENCH_PORT=${BENCH_PORT:-10001}
+BENCH_PORT=${BENCH_PORT:-10002}
 BENCH_SEED=${BENCH_SEED:-$(date +%s)}
 BENCH_RANDOM_INPUT_LEN=${BENCH_RANDOM_INPUT_LEN:-1}
 BENCH_RANDOM_OUTPUT_LEN=${BENCH_RANDOM_OUTPUT_LEN:-1}
-BENCH_RANDOM_INPUT_LENS=${BENCH_RANDOM_INPUT_LENS:-50,100,200,500,1000,2000,4000,6000}
+BENCH_RANDOM_INPUT_LENS=${BENCH_RANDOM_INPUT_LENS:-4000,6000}
 BENCH_RANDOM_OUTPUT_LENS=${BENCH_RANDOM_OUTPUT_LENS:-50,100,200,500,1000,2000,4000,6000}
 BENCH_NUM_PROMPTS=${BENCH_NUM_PROMPTS:-1000}
 BENCH_BURSTINESS=${BENCH_BURSTINESS:-1}
@@ -75,7 +75,7 @@ ENABLE_GLOBAL_PKILL_FALLBACK=${ENABLE_GLOBAL_PKILL_FALLBACK:-0}
 
 # Logs (aligned with 5-D style directory layout)
 BASE_RESULT_DIR=${BASE_RESULT_DIR:-$(dirname "${BASH_SOURCE[0]}")/wt_experiment/test_runs}
-LOG_SUFFIX=${LOG_SUFFIX:-}
+LOG_SUFFIX=${LOG_SUFFIX:-run2_g0g1}
 
 BENCH_INPUT_TAG=$(echo "$BENCH_RANDOM_INPUT_LENS" | sed -E 's/[ ,\/]+/-/g; s/^-+//; s/-+$//; s/-+/-/g; s/\./p/g')
 BENCH_OUTPUT_TAG=$(echo "$BENCH_RANDOM_OUTPUT_LENS" | sed -E 's/[ ,\/]+/-/g; s/^-+//; s/-+$//; s/-+/-/g; s/\./p/g')
@@ -109,6 +109,8 @@ PREFILL_MEM_POOL_SIZE_GB=${PREFILL_MEM_POOL_SIZE_GB:-32}
 DECODE_MEM_POOL_SIZE_GB=${DECODE_MEM_POOL_SIZE_GB:-32}
 PREFILL_KV_BUFFER_SIZE=${PREFILL_KV_BUFFER_SIZE:-1e1}
 DECODE_KV_BUFFER_SIZE=${DECODE_KV_BUFFER_SIZE:-8e9}
+PREFILL_KV_PORT_BASE=${PREFILL_KV_PORT_BASE:-21101}
+DECODE_KV_PORT_BASE=${DECODE_KV_PORT_BASE:-22101}
 
 echo "Warning: P2P NCCL disaggregated prefill XpYd support for vLLM v1 is experimental and subject to change."
 echo ""
@@ -118,6 +120,8 @@ echo "  Prefill GPUs: $PREFILL_GPUS, Ports: $PREFILL_PORTS"
 echo "  Decode GPUs: $DECODE_GPUS, Ports: $DECODE_PORTS"
 echo "  Prefill Mem Pool (GB): $PREFILL_MEM_POOL_SIZE_GB, KV Buffer: $PREFILL_KV_BUFFER_SIZE"
 echo "  Decode Mem Pool (GB): $DECODE_MEM_POOL_SIZE_GB, KV Buffer: $DECODE_KV_BUFFER_SIZE"
+echo "  Prefill KV Port Base: $PREFILL_KV_PORT_BASE"
+echo "  Decode KV Port Base: $DECODE_KV_PORT_BASE"
 echo "  Proxy Port: $PROXY_PORT"
 echo "  Benchmark Port: $BENCH_PORT"
 echo "  Benchmark Script: $BENCH_SCRIPT"
@@ -479,7 +483,7 @@ launch_model_servers() {
     for i in "${!PREFILL_GPU_ARRAY[@]}"; do
         local gpu_id=${PREFILL_GPU_ARRAY[$i]}
         local port=${PREFILL_PORT_ARRAY[$i]}
-        local kv_port=$((21001 + i))
+        local kv_port=$((PREFILL_KV_PORT_BASE + i))
         local prefill_log="$LOG_DIR/prefill$((i+1))_${RUN_TIMESTAMP}_${tag}.log"
 
         echo "  Prefill server $((i+1)): GPU $gpu_id, Port $port, KV Port $kv_port"
@@ -505,7 +509,7 @@ launch_model_servers() {
     for i in "${!DECODE_GPU_ARRAY[@]}"; do
         local gpu_id=${DECODE_GPU_ARRAY[$i]}
         local port=${DECODE_PORT_ARRAY[$i]}
-        local kv_port=$((22001 + i))
+        local kv_port=$((DECODE_KV_PORT_BASE + i))
         local decode_log="$LOG_DIR/decode$((i+1))_${RUN_TIMESTAMP}_${tag}.log"
 
         echo "  Decode server $((i+1)): GPU $gpu_id, Port $port, KV Port $kv_port"
@@ -754,11 +758,6 @@ main() {
                 # [wt] qps=100 仅在总长度不超过 1000 时测试。
                 if [ "$request_rate" = "100" ] && [ $((input_len + output_len)) -gt 1000 ]; then
                     echo "Skipping qps=100 combo: in${input_len}_out${output_len} (sum>1000)"
-                    continue
-                fi
-                # 如果input_len=50且output_len=50且qps=1或者2跳过这个组合
-                if [ "$input_len" -eq 50 ] && [ "$output_len" -eq 50 ] && { [ "$request_rate" = "1" ] || [ "$request_rate" = "2" ]; }; then
-                    echo "Skipping combo: in50_out50_rr${request_rate}"
                     continue
                 fi
                 total_runs=$((total_runs + 1))

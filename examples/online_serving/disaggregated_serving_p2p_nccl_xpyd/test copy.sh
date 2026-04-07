@@ -6,7 +6,7 @@
 # This script demonstrates disaggregated prefill and decode serving using
 # P2P NCCL communication. The architecture supports various XpYd configurations:
 #
-# - 1p1d: 1 Prefill server + 3 Decode servers (current default)
+# - 1P3D: 1 Prefill server + 3 Decode servers (current default)
 # - 3P1D: 3 Prefill servers + 1 Decode server
 # - etc.
 #
@@ -52,26 +52,22 @@ BENCH_PORT=${BENCH_PORT:-10001}
 BENCH_SEED=${BENCH_SEED:-$(date +%s)}
 BENCH_RANDOM_INPUT_LEN=${BENCH_RANDOM_INPUT_LEN:-1}
 BENCH_RANDOM_OUTPUT_LEN=${BENCH_RANDOM_OUTPUT_LEN:-1}
-BENCH_RANDOM_INPUT_LENS=${BENCH_RANDOM_INPUT_LENS:-50,100,200,500,1000,2000,4000,6000}
-BENCH_RANDOM_OUTPUT_LENS=${BENCH_RANDOM_OUTPUT_LENS:-50,100,200,500,1000,2000,4000,6000}
+BENCH_RANDOM_INPUT_LENS=${BENCH_RANDOM_INPUT_LENS:-100,200,500,1000,2000,4000,6000}
+BENCH_RANDOM_OUTPUT_LENS=${BENCH_RANDOM_OUTPUT_LENS:-100,200,500,1000,2000,4000,6000}
 BENCH_NUM_PROMPTS=${BENCH_NUM_PROMPTS:-1000}
 BENCH_BURSTINESS=${BENCH_BURSTINESS:-1}
 BENCH_REQUEST_RATE=${BENCH_REQUEST_RATE:-inf}
-BENCH_REQUEST_RATES=${BENCH_REQUEST_RATES:-1,2,4,8,100}
+BENCH_REQUEST_RATES=${BENCH_REQUEST_RATES:-1,2,4,8,16,32,64}
 BENCH_GOODPUT_TTFT_MS=${BENCH_GOODPUT_TTFT_MS:-500}
 BENCH_GOODPUT_TPOT_MS=${BENCH_GOODPUT_TPOT_MS:-50}
 # Set to 0 to skip vllm bench's initial single-prompt ready check.
 BENCH_READY_CHECK_TIMEOUT_SEC=${BENCH_READY_CHECK_TIMEOUT_SEC:-0}
-BENCH_SCRIPT=${BENCH_SCRIPT:-../../../benchmarks/benchmark_serving_baseline.py}
 
 # GPU watchdog: if both prefill and decode groups stay at 0 util too long,
 # current combo is marked failed, services are restarted, and next combo runs.
 GPU_IDLE_TIMEOUT_SECONDS=${GPU_IDLE_TIMEOUT_SECONDS:-120}
 GPU_IDLE_CHECK_INTERVAL_SECONDS=${GPU_IDLE_CHECK_INTERVAL_SECONDS:-30}
 ENABLE_GPU_IDLE_WATCHDOG=${ENABLE_GPU_IDLE_WATCHDOG:-1}
-# Keep disabled by default to avoid cross-run accidental kills when multiple
-# test scripts run concurrently on the same host.
-ENABLE_GLOBAL_PKILL_FALLBACK=${ENABLE_GLOBAL_PKILL_FALLBACK:-0}
 
 # Logs (aligned with 5-D style directory layout)
 BASE_RESULT_DIR=${BASE_RESULT_DIR:-$(dirname "${BASH_SOURCE[0]}")/wt_experiment/test_runs}
@@ -91,7 +87,7 @@ if [ -n "$LOG_SUFFIX" ]; then
 fi
 
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
-BENCHMARK_DIR=${BENCHMARK_DIR:-${BASE_RESULT_DIR}/benchmark_${RUN_TIMESTAMP}_${RUNTIME_LOG_SUFFIX}_1p1d}
+BENCHMARK_DIR=${BENCHMARK_DIR:-${BASE_RESULT_DIR}/benchmark_${RUN_TIMESTAMP}_${RUNTIME_LOG_SUFFIX}_1p3d}
 CONFIG_DIR=${CONFIG_DIR:-${BENCHMARK_DIR}/config}
 LOG_DIR=${LOG_DIR:-${BENCHMARK_DIR}/log}
 RESULT_DIR=${RESULT_DIR:-${BENCHMARK_DIR}/dataset_result}
@@ -120,7 +116,6 @@ echo "  Prefill Mem Pool (GB): $PREFILL_MEM_POOL_SIZE_GB, KV Buffer: $PREFILL_KV
 echo "  Decode Mem Pool (GB): $DECODE_MEM_POOL_SIZE_GB, KV Buffer: $DECODE_KV_BUFFER_SIZE"
 echo "  Proxy Port: $PROXY_PORT"
 echo "  Benchmark Port: $BENCH_PORT"
-echo "  Benchmark Script: $BENCH_SCRIPT"
 echo "  Quart Debug: $QUART_DEBUG"
 echo "  Disable Color Logs: $LOG_NO_COLOR"
 echo "  Log Suffix: $RUNTIME_LOG_SUFFIX"
@@ -133,7 +128,6 @@ echo "  Result Dir: $RESULT_DIR"
 echo "  GPU Idle Watchdog: $ENABLE_GPU_IDLE_WATCHDOG"
 echo "  GPU Idle Timeout (s): $GPU_IDLE_TIMEOUT_SECONDS"
 echo "  GPU Idle Check Interval (s): $GPU_IDLE_CHECK_INTERVAL_SECONDS"
-echo "  Global pkill fallback: $ENABLE_GLOBAL_PKILL_FALLBACK"
 echo "  Bench Ready Check Timeout (s): $BENCH_READY_CHECK_TIMEOUT_SEC"
 echo "  Timeout: ${TIMEOUT_SECONDS}s"
 echo ""
@@ -154,7 +148,7 @@ record_pid() {
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 check_required_files() {
-    local files=("disagg_proxy_p2p_nccl_xpyd.py" "$BENCH_SCRIPT")
+    local files=("disagg_proxy_p2p_nccl_xpyd.py")
     for file in "${files[@]}"; do
         if [[ ! -f "$file" ]]; then
             echo "Required file $file not found in $(pwd)"
@@ -235,29 +229,13 @@ is_truthy() {
     [[ "$v" == "1" || "$v" == "true" || "$v" == "yes" || "$v" == "y" ]]
 }
 
-kill_process_tree() {
-    local root_pid="$1"
-    local signal="${2:-TERM}"
-    local children=""
-    local child
-
-    if [[ -z "$root_pid" ]] || ! kill -0 "$root_pid" 2>/dev/null; then
-        return 0
-    fi
-
-    children=$(pgrep -P "$root_pid" 2>/dev/null || true)
-    for child in $children; do
-        kill_process_tree "$child" "$signal"
-    done
-
-    kill "-$signal" "$root_pid" 2>/dev/null || true
-}
-
 stop_all_services() {
     local tracked_pids=("${PIDS[@]}")
 
     for pid in "${tracked_pids[@]}"; do
-        kill_process_tree "$pid" TERM
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
     done
 
     local deadline=$((SECONDS + 10))
@@ -277,15 +255,12 @@ stop_all_services() {
 
     for pid in "${tracked_pids[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
-            kill_process_tree "$pid" KILL
+            kill -9 "$pid" 2>/dev/null || true
         fi
     done
 
-    if is_truthy "$ENABLE_GLOBAL_PKILL_FALLBACK"; then
-        echo "[WARN] ENABLE_GLOBAL_PKILL_FALLBACK=1, running global pkill cleanup"
-        pkill -9 -f "disagg_proxy_p2p_nccl_xpyd.py" 2>/dev/null || true
-        pkill -9 -f "vllm serve" 2>/dev/null || true
-    fi
+    pkill -9 -f "disagg_proxy_p2p_nccl_xpyd.py" 2>/dev/null || true
+    pkill -9 -f "vllm serve" 2>/dev/null || true
 
     PIDS=()
     PROXY_PID=""
@@ -402,13 +377,9 @@ stop_proxy_server() {
 start_proxy_server() {
     local tag="$1"
     PROXY_LOG="$LOG_DIR/proxy_${RUN_TIMESTAMP}_${tag}.log"
-    local proxy_model_config_path="${MODEL}/config.json"
-    local proxy_tpot="tpot:${BENCH_GOODPUT_TPOT_MS}"
-    local proxy_dtype="bfloat16"
 
     echo "Starting proxy server on port $PROXY_PORT (tag=$tag)..."
-    echo "Proxy self-check env: MODEL_CONFIG_PATH=$proxy_model_config_path TPOT=$proxy_tpot VLLM_DTYPE=$proxy_dtype"
-    PROXY_PORT=$PROXY_PORT BENCH_PORT=$BENCH_PORT QUART_DEBUG=$QUART_DEBUG MODEL_CONFIG_PATH=$proxy_model_config_path TPOT=$proxy_tpot VLLM_DTYPE=$proxy_dtype python3 disagg_proxy_p2p_nccl_xpyd.py \
+    PROXY_PORT=$PROXY_PORT BENCH_PORT=$BENCH_PORT QUART_DEBUG=$QUART_DEBUG python3 disagg_proxy_p2p_nccl_xpyd.py \
             > "$PROXY_LOG" 2>&1 &
     PROXY_PID=$!
     record_pid "$PROXY_PID"
@@ -567,7 +538,8 @@ run_benchmark_with_watchdog() {
                     local elapsed=$((now - zero_since))
                     if (( elapsed >= GPU_IDLE_TIMEOUT_SECONDS )); then
                         echo "[WATCHDOG][TIMEOUT] combo=$combo_tag zero-util elapsed=${elapsed}s >= ${GPU_IDLE_TIMEOUT_SECONDS}s"
-                        kill_process_tree "$client_pid" TERM
+                        kill "$client_pid" 2>/dev/null || true
+                        pkill -f "vllm bench serve" 2>/dev/null || true
                         wait "$client_pid" 2>/dev/null || true
                         return 124
                     fi
@@ -751,16 +723,6 @@ main() {
                     echo "Skipping combo: in${input_len}_out${output_len}_rr${rate_tag}"
                     continue
                 fi
-                # [wt] qps=100 仅在总长度不超过 1000 时测试。
-                if [ "$request_rate" = "100" ] && [ $((input_len + output_len)) -gt 1000 ]; then
-                    echo "Skipping qps=100 combo: in${input_len}_out${output_len} (sum>1000)"
-                    continue
-                fi
-                # 如果input_len=50且output_len=50且qps=1或者2跳过这个组合
-                if [ "$input_len" -eq 50 ] && [ "$output_len" -eq 50 ] && { [ "$request_rate" = "1" ] || [ "$request_rate" = "2" ]; }; then
-                    echo "Skipping combo: in50_out50_rr${request_rate}"
-                    continue
-                fi
                 total_runs=$((total_runs + 1))
                 local rate_tag="${request_rate//./p}"
                 local combo_tag="in${input_len}_out${output_len}_rr${rate_tag}"
@@ -778,7 +740,7 @@ main() {
                 echo "Log: $combo_log"
                 echo "Proxy Log: $PROXY_LOG"
 
-                python3 "$BENCH_SCRIPT" \
+                vllm bench serve \
                     --host 127.0.0.1 \
                     --port $BENCH_PORT \
                     --seed $BENCH_SEED \
@@ -791,6 +753,7 @@ main() {
                     --num-prompts $BENCH_NUM_PROMPTS \
                     --burstiness $BENCH_BURSTINESS \
                     --request-rate "$request_rate" \
+                    --ready-check-timeout-sec "$BENCH_READY_CHECK_TIMEOUT_SEC" \
                     --goodput "ttft:$BENCH_GOODPUT_TTFT_MS" "tpot:$BENCH_GOODPUT_TPOT_MS" \
                     --ignore-eos \
                     > "$combo_log" 2>&1 &

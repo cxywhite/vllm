@@ -9,6 +9,7 @@ import uuid
 import asyncio
 import json
 import re
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -21,29 +22,83 @@ from quart import Quart, jsonify, make_response, request
 count = 0
 prefill_instances: dict[str, Any] = {}  # http_address: (zmq_address, stamp)
 decode_instances: dict[str, Any] = {}  # http_address: (zmq_address, stamp)
+# [source] original proxy only tracked decode_instances heartbeat map.
+# decode_instances: dict[str, Any] = {}  # http_address: (zmq_address, stamp)
+# [wt] avoid oom decode temporary capacity reports keyed by decode http address.
+decode_capacity: dict[str, dict[str, float]] = {}
+# [wt] avoid oom monotonic version for near-real-time waiter wakeup.
+decode_capacity_version = 0
+
+# [wt] avoid oom global waiting queue for requests blocked by decode capacity.
+waiting_queue: deque[str] = deque()
+waiting_queue_max = int(os.environ.get("WT_WAITING_QUEUE_MAX", "2048"))
+waiting_timeout_s = float(os.environ.get("WT_WAITING_TIMEOUT_S", "1200"))
+waiting_poll_s = float(os.environ.get("WT_WAITING_POLL_S", "0.02"))
+
+# [wt] avoid oom reserve headroom to prevent near-threshold bursts.
+capacity_safety_ratio = float(os.environ.get("WT_CAPACITY_SAFETY_RATIO", "1.15"))
+require_capacity_report = os.environ.get("WT_REQUIRE_CAPACITY_REPORT", "1") in (
+    "1",
+    "true",
+    "TRUE",
+    "yes",
+    "YES",
+)
+# [end]
 
 prefill_cv = threading.Condition()
 decode_cv = threading.Condition()
+waiting_cv = threading.Condition()
 
 DEFAULT_PING_SECONDS = 5
 
 
-def _remove_oldest_instances(instances: dict[str, Any]) -> None:
-    oldest_key = next(iter(instances), None)
-    while oldest_key is not None:
-        value = instances[oldest_key]
-        if value[1] > time.time():
-            break
-        print(f"🔴Remove [HTTP:{oldest_key}, ZMQ:{value[0]}, stamp:{value[1]}]")
-        instances.pop(oldest_key, None)
-        oldest_key = next(iter(instances), None)
+def _remove_oldest_instances(instances: dict[str, Any]) -> list[str]:
+    # [source] previous implementation removed only oldest in-order entries.
+    # def _remove_oldest_instances(instances: dict[str, Any]) -> None:
+    #     oldest_key = next(iter(instances), None)
+    #     while oldest_key is not None:
+    #         value = instances[oldest_key]
+    #         if value[1] > time.time():
+    #             break
+    #         print(f"🔴Remove [HTTP:{oldest_key}, ZMQ:{value[0]}, stamp:{value[1]}]")
+    #         instances.pop(oldest_key, None)
+    #         oldest_key = next(iter(instances), None)
+    # [wt] avoid oom return stale nodes so capacity cache can be cleaned too.
+    now = time.time()
+    removed: list[str] = []
+    keys_to_del = [k for k, v in instances.items() if v[1] < now]
+    for k in keys_to_del:
+        val = instances.pop(k, None)
+        if val:
+            removed.append(k)
+            print(f"🔴Remove [HTTP:{k}, ZMQ:{val[0]}]")
+    return removed
 
-# def _remove_oldest_instances(instances: dict) -> None:
-#     now = time.time()
-#     keys_to_del = [k for k, v in instances.items() if v[1] < now]
-#     for k in keys_to_del:
-#         val = instances.pop(k, None)
-#         if val: print(f"🔴Remove [HTTP:{k}, ZMQ:{val[0]}]")
+
+def _to_float(data: dict[str, Any], key: str) -> Optional[float]:
+    value = data.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bump_capacity_version_locked() -> None:
+    global decode_capacity_version
+    decode_capacity_version += 1
+
+
+def _get_capacity_version() -> int:
+    with decode_cv:
+        return decode_capacity_version
+
+
+# [end]
+
+
 def _listen_for_register(poller, router_socket):
     while True:
         socks = dict(poller.poll(1000))
@@ -67,12 +122,45 @@ def _listen_for_register(poller, router_socket):
                 global decode_instances
                 global decode_cv
                 with decode_cv:
+                    # [source] original D branch only refreshed decode_instances.
+                    # node = decode_instances.get(data["http_address"], None)
+                    # decode_instances[data["http_address"]] = (
+                    #     data["zmq_address"],
+                    #     time.time() + DEFAULT_PING_SECONDS,
+                    # )
                     node = decode_instances.get(data["http_address"], None)
                     decode_instances[data["http_address"]] = (
                         data["zmq_address"],
                         time.time() + DEFAULT_PING_SECONDS,
                     )
-                    _remove_oldest_instances(decode_instances)
+                    # [wt] avoid oom keep latest decode temporary capacity.
+                    cap = decode_capacity.setdefault(data["http_address"], {})
+                    kv_buffer_free = _to_float(data, "kv_buffer_free_bytes")
+                    pool_free = _to_float(data, "pool_free_bytes")
+                    kv_buffer_cap = _to_float(data, "kv_buffer_capacity_bytes")
+                    pool_total = _to_float(data, "pool_total_bytes")
+                    pool_used = _to_float(data, "pool_used_bytes")
+                    if kv_buffer_free is not None:
+                        cap["kv_buffer_free_bytes"] = kv_buffer_free
+                    if pool_free is not None:
+                        cap["pool_free_bytes"] = pool_free
+                    if kv_buffer_cap is not None:
+                        cap["kv_buffer_capacity_bytes"] = kv_buffer_cap
+                    if pool_total is not None:
+                        cap["pool_total_bytes"] = pool_total
+                    if pool_used is not None:
+                        cap["pool_used_bytes"] = pool_used
+                    cap["stamp"] = time.time()
+
+                    removed = _remove_oldest_instances(decode_instances)
+                    for addr in removed:
+                        decode_capacity.pop(addr, None)
+
+                    # [wt] avoid oom near-real-time wakeup for blocked waiters.
+                    _bump_capacity_version_locked()
+                    with waiting_cv:
+                        waiting_cv.notify_all()
+                    # [end]
             else:
                 print(
                     "Unexpected, Received message from %s, data: %s",
@@ -158,7 +246,6 @@ class DecodeMonitor:
         self.stats: Dict[str, dict] = {}
         self.latest_load: Dict[str, dict] = {}
         self.is_running = True
-        # [wt] startup self-check tracks config source and parse errors.
         self.config_path = config_path
         self.config, self.config_source, self.config_error = self._load_config(config_path)
         self.precision = precision.lower()
@@ -194,7 +281,6 @@ class DecodeMonitor:
             mem_capacity_gb=self.mem_capacity,
             tpot=self.tpot,
         )
-        # [wt] print effective runtime constants once at startup.
         self._log_startup_self_check()
         self._last_log_time = 0.0
         self.log_interval = 1.0
@@ -223,7 +309,6 @@ class DecodeMonitor:
         )
 
     def _log_startup_self_check(self):
-        # [wt] self-check explains what config/precision/tpot the proxy really uses.
         c = self.config
         lm = self.load_model
         bw_bytes_ms = (lm.bandwidth_gbs * 1e9) / 1000
@@ -395,6 +480,222 @@ async def start_monitor():
     asyncio.create_task(monitor.fetch_metrics())
 
 
+def _normalize_ratio(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    return value / 100.0 if value > 1.5 else value
+
+
+def _estimate_prompt_tokens(req_data: dict[str, Any]) -> int:
+    # [wt] avoid oom keep token estimate cheap and deterministic.
+    token_ids = req_data.get("prompt_token_ids")
+    if isinstance(token_ids, list):
+        return len(token_ids)
+
+    input_ids = req_data.get("input_ids")
+    if isinstance(input_ids, list):
+        return len(input_ids)
+
+    prompt = req_data.get("prompt")
+    if isinstance(prompt, list):
+        return len(prompt)
+    if isinstance(prompt, str):
+        return max(1, len(prompt) // 4)
+
+    messages = req_data.get("messages")
+    if isinstance(messages, list):
+        total_chars = 0
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total_chars += len(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        total_chars += len(part["text"])
+        if total_chars > 0:
+            return max(1, total_chars // 4)
+
+    return 1
+
+
+def _estimate_request_kv_bytes(req_data: dict[str, Any]) -> int:
+    # [wt] avoid oom estimate prefill KV footprint before dispatch.
+    prompt_tokens = _estimate_prompt_tokens(req_data)
+    cfg = monitor.config
+    # [wt] avoid oom kv_dim is per-token KV width across all KV heads:
+    # head_dim * num_key_value_heads.
+    kv_dim = (cfg.hidden_size // cfg.num_attention_heads) * cfg.num_key_value_heads
+    # [wt] avoid oom factor 2 = K tensor + V tensor per layer.
+    kv_bytes = (
+        2
+        * cfg.num_hidden_layers
+        * prompt_tokens
+        * kv_dim
+        * cfg.bytes_per_param
+    )
+    return max(1, int(kv_bytes * capacity_safety_ratio))
+
+
+def _decode_total_free_bytes_locked(addr: str) -> Optional[int]:
+    cap = decode_capacity.get(addr)
+    if cap is None:
+        return None
+    # [source] previous admission used additive free bytes:
+    # return int(kv_buffer_free + pool_free)
+    # [wt] avoid oom tensors are stored as a single object in either
+    # kv_buffer or pool (no split), so admission must require a single target
+    # to fit the full request.
+    kv_buffer_free = max(0.0, cap.get("kv_buffer_free_bytes", 0.0))
+    pool_free = max(0.0, cap.get("pool_free_bytes", 0.0))
+    return int(max(kv_buffer_free, pool_free))
+
+
+def _decode_total_capacity_bytes_locked(addr: str) -> Optional[int]:
+    cap = decode_capacity.get(addr)
+    if cap is None:
+        return None
+    # [source] previous impossible-request gate used additive capacities:
+    # return int(kv_buffer_cap + pool_total)
+    # [wt] avoid oom align with single-target placement semantics.
+    kv_buffer_cap = max(0.0, cap.get("kv_buffer_capacity_bytes", 0.0))
+    pool_total = max(0.0, cap.get("pool_total_bytes", 0.0))
+    return int(max(kv_buffer_cap, pool_total))
+
+
+def _select_prefill_rr(rr_index: int) -> tuple[Optional[str], Optional[str]]:
+    with prefill_cv:
+        prefill_list = list(prefill_instances.items())
+        if not prefill_list:
+            return None, None
+        prefill_addr, prefill_zmq_addr = prefill_list[rr_index % len(prefill_list)]
+        return prefill_addr, prefill_zmq_addr[0]
+
+
+def _select_decode_rr_by_capacity(
+    rr_index: int,
+    required_bytes: int,
+) -> tuple[Optional[str], Optional[str], str]:
+    # [wt] avoid oom preserve RR order, but skip nodes with insufficient space.
+    with decode_cv:
+        decode_list = list(decode_instances.items())
+        if not decode_list:
+            return None, None, "no_decode_instance"
+
+        num_decode = len(decode_list)
+        start = rr_index % num_decode
+        first_unknown: Optional[tuple[str, str]] = None
+        for i in range(num_decode):
+            decode_addr, decode_zmq_addr = decode_list[(start + i) % num_decode]
+            free_bytes = _decode_total_free_bytes_locked(decode_addr)
+            if free_bytes is None:
+                if first_unknown is None:
+                    first_unknown = (decode_addr, decode_zmq_addr[0])
+                continue
+            if free_bytes >= required_bytes:
+                return decode_addr, decode_zmq_addr[0], f"rr_step={i}"
+
+        if not require_capacity_report and first_unknown is not None:
+            return first_unknown[0], first_unknown[1], "rr_unknown_capacity"
+
+        return None, None, "capacity_insufficient"
+
+
+def _is_impossible_request(required_bytes: int) -> bool:
+    # [wt] avoid oom fail fast for requests larger than any decode capacity.
+    with decode_cv:
+        decode_list = list(decode_instances.keys())
+        if not decode_list:
+            return False
+        max_capacity = 0
+        has_known_capacity = False
+        for decode_addr in decode_list:
+            cap = _decode_total_capacity_bytes_locked(decode_addr)
+            if cap is None:
+                continue
+            has_known_capacity = True
+            if cap > max_capacity:
+                max_capacity = cap
+        if not has_known_capacity:
+            return False
+        return required_bytes > max_capacity
+
+
+def _enqueue_waiter(waiter_id: str) -> bool:
+    with waiting_cv:
+        if len(waiting_queue) >= waiting_queue_max:
+            return False
+        waiting_queue.append(waiter_id)
+        return True
+
+
+def _dequeue_waiter(waiter_id: str) -> None:
+    with waiting_cv:
+        try:
+            waiting_queue.remove(waiter_id)
+        except ValueError:
+            return
+
+
+def _is_waiter_head(waiter_id: str) -> bool:
+    with waiting_cv:
+        return bool(waiting_queue) and waiting_queue[0] == waiter_id
+
+
+def _pop_waiter_head(waiter_id: str) -> None:
+    with waiting_cv:
+        if waiting_queue and waiting_queue[0] == waiter_id:
+            waiting_queue.popleft()
+
+
+async def _acquire_decode_with_queue(
+    rr_index: int,
+    required_bytes: int,
+) -> tuple[Optional[str], Optional[str], str]:
+    decode_addr, decode_zmq_addr, reason = _select_decode_rr_by_capacity(
+        rr_index,
+        required_bytes,
+    )
+    if decode_addr is not None:
+        return decode_addr, decode_zmq_addr, reason
+
+    waiter_id = random_uuid()
+    if not _enqueue_waiter(waiter_id):
+        return None, None, "waiting_queue_full"
+
+    # [wt] avoid oom queue timeout prevents unbounded memory growth.
+    deadline = time.time() + waiting_timeout_s
+    observed_capacity_version = _get_capacity_version()
+    try:
+        while True:
+            if _is_waiter_head(waiter_id):
+                decode_addr, decode_zmq_addr, reason = _select_decode_rr_by_capacity(
+                    rr_index,
+                    required_bytes,
+                )
+                if decode_addr is not None:
+                    _pop_waiter_head(waiter_id)
+                    return decode_addr, decode_zmq_addr, reason
+
+            if time.time() >= deadline:
+                return None, None, "waiting_timeout"
+
+            # [wt] avoid oom non-blocking wait keeps Quart loop responsive.
+            current_capacity_version = _get_capacity_version()
+            if current_capacity_version != observed_capacity_version:
+                observed_capacity_version = current_capacity_version
+                await asyncio.sleep(0)
+                continue
+            await asyncio.sleep(waiting_poll_s)
+    finally:
+        _dequeue_waiter(waiter_id)
+
+
+# [end]
+
+
 def random_uuid() -> str:
     return str(uuid.uuid4().hex)
 
@@ -427,31 +728,71 @@ async def handle_request():
         if "max_completion_tokens" in prefill_request:
             prefill_request["max_completion_tokens"] = 1
 
-        global count
-        global prefill_instances
-        global prefill_cv
-        with prefill_cv:
-            prefill_list = list(prefill_instances.items())
-            if not prefill_list:
-                return jsonify({"error": "No prefill instance available"}), 503
-            prefill_addr, prefill_zmq_addr = prefill_list[count % len(prefill_list)]
-            prefill_zmq_addr = prefill_zmq_addr[0]
+        # [source] original routing did direct RR selection without capacity admission.
+        # global count
+        # global prefill_instances
+        # global prefill_cv
+        # with prefill_cv:
+        #     prefill_list = list(prefill_instances.items())
+        #     if not prefill_list:
+        #         return jsonify({"error": "No prefill instance available"}), 503
+        #     prefill_addr, prefill_zmq_addr = prefill_list[count % len(prefill_list)]
+        #     prefill_zmq_addr = prefill_zmq_addr[0]
+        #
+        # global decode_instances
+        # global decode_cv
+        # with decode_cv:
+        #     decode_list = list(decode_instances.items())
+        #     if not decode_list:
+        #         return jsonify({"error": "No decode instance available"}), 503
+        #     decode_addr, decode_zmq_addr = decode_list[count % len(decode_list)]
+        #     decode_zmq_addr = decode_zmq_addr[0]
 
-        global decode_instances
-        global decode_cv
-        with decode_cv:
-            decode_list = list(decode_instances.items())
-            if not decode_list:
-                return jsonify({"error": "No decode instance available"}), 503
-            decode_addr, decode_zmq_addr = decode_list[count % len(decode_list)]
-            decode_zmq_addr = decode_zmq_addr[0]
+        global count
+        rr_index = count
+        count += 1
+
+        # [wt] avoid oom estimate KV bytes before any prefill dispatch.
+        required_kv_bytes = _estimate_request_kv_bytes(original_request_data)
+        if _is_impossible_request(required_kv_bytes):
+            return (
+                jsonify(
+                    {
+                        "error": "request_too_large_for_decode_capacity",
+                        "required_kv_bytes": required_kv_bytes,
+                    }
+                ),
+                413,
+            )
+
+        # [wt] avoid oom enter global waiting queue when all decode are full.
+        decode_addr, decode_zmq_addr, decode_reason = await _acquire_decode_with_queue(
+            rr_index,
+            required_kv_bytes,
+        )
+        if decode_addr is None:
+            return (
+                jsonify(
+                    {
+                        "error": "decode_capacity_blocked",
+                        "detail": decode_reason,
+                        "required_kv_bytes": required_kv_bytes,
+                    }
+                ),
+                503,
+            )
+
+        prefill_addr, prefill_zmq_addr = _select_prefill_rr(rr_index)
+        if prefill_addr is None:
+            return jsonify({"error": "No prefill instance available"}), 503
+        # [end]
 
         print(
             f"handle_request count: {count}, [HTTP:{prefill_addr}, "
             f"ZMQ:{prefill_zmq_addr}] 👉 [HTTP:{decode_addr}, "
-            f"ZMQ:{decode_zmq_addr}]"
+            f"ZMQ:{decode_zmq_addr}], required_kv_bytes:{required_kv_bytes}, "
+            f"reason:{decode_reason}"
         )
-        count += 1
 
         request_id = (
             f"___prefill_addr_{prefill_zmq_addr}___decode_addr_"
