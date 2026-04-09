@@ -108,7 +108,7 @@ class DecodeMonitor:
         self.precision_bytes = precision_map.get(self.precision, 2)
         self.config.bytes_per_param = self.precision_bytes
 
-        self.bandwidth_gbs = 1935
+        self.bandwidth_gbs = 2039
         self.mem_capacity = 80
         self.tpot = float(tpot)
 

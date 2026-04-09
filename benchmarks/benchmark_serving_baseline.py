@@ -748,6 +748,58 @@ def save_to_pytorch_benchmark_format(
         write_to_json(pt_file, pt_records)
 
 
+def infer_dataset_name_from_path(dataset_name: str, dataset_path: Optional[str]) -> str:
+    if dataset_name != "auto":
+        return dataset_name
+
+    if not dataset_path:
+        raise ValueError("--dataset-name auto requires --dataset-path")
+
+    lowered_path = dataset_path.lower()
+    file_name = Path(dataset_path).name.lower()
+
+    if "qwen_new" in file_name or "qwen_new" in lowered_path:
+        resolved = "qwen_new"
+    elif (
+        "lmsyschat" in file_name
+        or "lmsys-chat" in file_name
+        or "lmsys_chat" in file_name
+        or "lmsyschat" in lowered_path
+        or "lmsys-chat" in lowered_path
+        or "lmsys_chat" in lowered_path
+    ):
+        resolved = "lmsyschat"
+    elif "mysharegpt" in file_name or "mysharegpt" in lowered_path:
+        resolved = "mysharegpt"
+    elif "trace" in file_name or "mooncake_trace" in lowered_path:
+        resolved = "trace"
+    elif "qwen" in file_name or "qwen" in lowered_path:
+        resolved = "qwen"
+    else:
+        # CSV schema fallback for ambiguous names.
+        resolved = "custom"
+        if dataset_path.endswith(".csv"):
+            try:
+                header_df = pd.read_csv(dataset_path, nrows=1)
+                cols = set(header_df.columns)
+                if "timestamp" in cols:
+                    resolved = "trace"
+                elif "req_id" in cols and ("prompt_len" in cols or "prompt_tokens" in cols):
+                    resolved = "lmsyschat"
+                elif "id" in cols and "prompt_tokens" in cols:
+                    resolved = "mysharegpt"
+                elif "prompt" in cols:
+                    resolved = "mysharegpt"
+            except Exception:
+                resolved = "custom"
+
+    print(
+        f"[dataset] auto resolved dataset_name='{resolved}' "
+        f"from dataset_path='{dataset_path}'"
+    )
+    return resolved
+
+
 def main(args: argparse.Namespace):
     print(args)
     random.seed(args.seed)
@@ -798,42 +850,86 @@ def main(args: argparse.Namespace):
             "'--dataset-path' if required."
         )
 
-    if args.dataset_name == "custom" or args.dataset_name == "mysharegpt" or args.dataset_name == "lmsyschat" or args.dataset_name == "qwen" or args.dataset_name == "qwen_new":
-        if args.dataset_name == "lmsyschat":
-            # 读取指定csv文件
-            df = pd.read_csv(args.dataset_path)
-            # shuffle the dataframe to ensure randomness
-            df = df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
-            # 随机选择num_prompts条数据
+    args.dataset_name = infer_dataset_name_from_path(
+        args.dataset_name,
+        args.dataset_path,
+    )
+
+    if args.dataset_name == "custom" or args.dataset_name == "mysharegpt" or args.dataset_name == "lmsyschat" or args.dataset_name == "qwen" or args.dataset_name == "qwen_new" or args.dataset_name == "trace":
+        # Unified tabular loader for llama/qwen CSVs; supports legacy column aliases.
+        df = pd.read_csv(args.dataset_path)
+
+        # Keep trace/lmsyschat chronological by default.
+        if args.dataset_name == "trace" and "timestamp" in df.columns:
+            df = df.sort_values("timestamp", kind="stable").reset_index(drop=True)
+
+        if args.num_prompts is not None and args.num_prompts > 0:
             df = df.head(args.num_prompts)
-            input_requests: List[SampleRequest] = []
-            for idx, row in df.iterrows():
-                req_id=str(row['req_id'])
-                prompt=row['prompt']
-                prompt_tokens=row['prompt_len']
-                expected_output_len=row['output_tokens']
-                temperature=row['temperature']
-                top_p=row['top_p']
-                top_k=row['top_k']
-                repetition_penalty=row['repetition_penalty']
-                input_requests.append(
-                    SampleRequest(
-                        req_id=req_id,
-                        prompt=str(prompt),
-                        prompt_len=int(prompt_tokens),
-                        expected_output_len=int(expected_output_len),
-                        temperature=round(float(temperature), 2),
-                        top_p=round(float(top_p), 2),
-                        top_k=int(top_k),
-                        repetition_penalty=round(float(repetition_penalty), 2),
-                    )
+
+        has_req_id = "req_id" in df.columns
+        has_id = "id" in df.columns
+        has_prompt = "prompt" in df.columns
+        has_text = "text" in df.columns
+        has_prompt_len = "prompt_len" in df.columns
+        has_prompt_tokens = "prompt_tokens" in df.columns
+        has_output_tokens = "output_tokens" in df.columns
+        has_custom_max_tokens = "custom_max_tokens" in df.columns
+
+        if not (has_prompt or has_text):
+            raise ValueError(
+                "Dataset must include a 'prompt' or 'text' column. "
+                f"columns={list(df.columns)}"
+            )
+        if not (has_prompt_len or has_prompt_tokens):
+            raise ValueError(
+                "Dataset must include 'prompt_len' or 'prompt_tokens'. "
+                f"columns={list(df.columns)}"
+            )
+        if not (has_output_tokens or has_custom_max_tokens):
+            raise ValueError(
+                "Dataset must include 'output_tokens' or 'custom_max_tokens'. "
+                f"columns={list(df.columns)}"
+            )
+
+        input_requests: List[SampleRequest] = []
+        for idx, row in df.iterrows():
+            if has_req_id:
+                req_id = str(row["req_id"])
+            elif has_id:
+                req_id = str(row["id"])
+            else:
+                req_id = str(idx)
+
+            prompt = row["prompt"] if has_prompt else row["text"]
+            prompt_tokens = row["prompt_len"] if has_prompt_len else row["prompt_tokens"]
+            expected_output_len = row["output_tokens"] if has_output_tokens else row["custom_max_tokens"]
+
+            temperature = row["temperature"] if "temperature" in df.columns else 0.0
+            top_p = row["top_p"] if "top_p" in df.columns else 1.0
+            top_k = row["top_k"] if "top_k" in df.columns else -1
+            repetition_penalty = (
+                row["repetition_penalty"] if "repetition_penalty" in df.columns else 1.0
+            )
+
+            input_requests.append(
+                SampleRequest(
+                    req_id=req_id,
+                    prompt=str(prompt),
+                    prompt_len=int(prompt_tokens),
+                    expected_output_len=int(expected_output_len),
+                    temperature=round(float(temperature), 2),
+                    top_p=round(float(top_p), 2),
+                    top_k=int(top_k),
+                    repetition_penalty=round(float(repetition_penalty), 2),
                 )
-            # 打印前几条请求进行验证
-            for i, req in enumerate(input_requests[:3]):
-                print(f"Request {i}: req_id={req.req_id}, prompt_len={req.prompt_len}, "
-                    f"expected_output_len={req.expected_output_len}, "
-                    f"temperature={req.temperature}, top_p={req.top_p}, "
-                    f"top_k={req.top_k}, repetition_penalty={req.repetition_penalty}")
+            )
+
+        # 打印前几条请求进行验证
+        for i, req in enumerate(input_requests[:3]):
+            print(f"Request {i}: req_id={req.req_id}, prompt_len={req.prompt_len}, "
+                f"expected_output_len={req.expected_output_len}, "
+                f"temperature={req.temperature}, top_p={req.top_p}, "
+                f"top_k={req.top_k}, repetition_penalty={req.repetition_penalty}")
             # #读取指定目录下的所有CSV 文件
             # df_list = []
             # for file in os.listdir(args.dataset_path):
@@ -873,36 +969,7 @@ def main(args: argparse.Namespace):
             #         f"expected_output_len={req.expected_output_len}, "
             #         f"temperature={req.temperature}, top_p={req.top_p}, "
             #         f"top_k={req.top_k}, repetition_penalty={req.repetition_penalty}")
-        elif args.dataset_name == "mysharegpt":
-            df=pd.read_csv(args.dataset_path)
-            input_requests: List[SampleRequest] = []
-            for idx, row in df.iterrows():
-                req_id=row['id']
-                prompt=row['prompt']
-                prompt_tokens=row['prompt_tokens']
-                expected_output_len=row['output_tokens']
-                temperature=row['temperature']
-                top_p=row['top_p']
-                top_k=row['top_k']
-                repetition_penalty=row['repetition_penalty']
-                input_requests.append(
-                    SampleRequest(
-                        req_id=req_id,
-                        prompt=str(prompt),
-                        prompt_len=int(prompt_tokens),
-                        expected_output_len=int(expected_output_len),
-                        temperature=round(float(temperature), 2),
-                        top_p=round(float(top_p), 2),
-                        top_k=int(top_k),
-                        repetition_penalty=round(float(repetition_penalty), 2),
-                    )
-                )
-            # 打印前几条请求进行验证
-            for i, req in enumerate(input_requests[:3]):
-                print(f"Request {i}: req_id={req.req_id}, prompt_len={req.prompt_len}, "
-                    f"expected_output_len={req.expected_output_len}, "
-                    f"temperature={req.temperature}, top_p={req.top_p}, "
-                    f"top_k={req.top_k}, repetition_penalty={req.repetition_penalty}")
+
         # if args.dataset_name == "mysharegpt":
         #     df=pd.read_csv(args.dataset_path)
         #     input_requests: List[SampleRequest] = []
@@ -1292,7 +1359,7 @@ def create_argument_parser():
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf", "custom","mysharegpt","lmsyschat","qwen","qwen_new"],
+        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf", "custom", "mysharegpt", "lmsyschat", "qwen", "qwen_new", "trace", "auto"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(

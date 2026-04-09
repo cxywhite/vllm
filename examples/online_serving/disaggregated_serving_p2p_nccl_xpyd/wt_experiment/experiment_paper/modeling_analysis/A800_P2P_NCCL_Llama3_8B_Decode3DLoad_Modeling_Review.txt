@@ -1,0 +1,192 @@
+A800-SXM4-80GB + P2P NCCL Connector 下 Prefill/Decode 解耦部署
+Decode 侧三维负载建模（计算/访存/显存占用）过程说明与错误检查
+
+作者说明：本说明面向论文评审专家，目标是解释该建模公式的来源、可解释性、与代码实现一致性，以及当前版本的边界与潜在误差。
+
+============================================================
+1. 实验场景与目标
+============================================================
+场景：
+- 部署形态：prefill/decode 解耦，P2P NCCL connector。
+- 硬件假设：NVIDIA A800-SXM4-80GB。
+- 模型：Meta-Llama-3-8B-Instruct。
+- 监控位置：proxy 对 decode 实例进行在线负载建模。
+
+目标：
+- 以统一标量 Load_Bottle = max(Load_Compute, Load_Memory, Load_Memory_Capacity)
+  近似描述 decode 实例压力，并用于瓶颈判断与调度决策参考。
+
+============================================================
+2. 证据链与代码路径
+============================================================
+2.1 软硬件环境采集（openrlhf conda 环境）
+- 采集方式：在 conda 环境 openrlhf 中运行 python -m vllm.collect_env。
+- 关键结果：
+  - GPU: 8 x NVIDIA A800-SXM4-80GB (81920 MiB)
+  - Driver: 550.54.14
+  - CUDA runtime: 12.8.61
+  - PyTorch: 2.8.0+cu128
+  - vLLM: 0.11.0
+  - GPU 拓扑：GPU 间 NV8/NVLink 互联（collect_env 输出已记录）
+- 原始采集文件：
+  - /tmp/wt_collect_env_output.txt
+  - /tmp/wt_nvidia_smi_L.txt
+  - /tmp/wt_nvidia_smi_query.txt
+
+2.2 Proxy 中 decode 三维负载建模代码
+- 文件：
+  /root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py
+- 关键点：
+  - 从 /metrics 抓取 vllm:kv_cache_usage_perc, vllm:running_tokens, vllm:num_requests_running
+  - 使用模型结构参数 + A800 常数进行 Load_Compute / Load_Memory / Load_Memory_Capacity 计算
+  - 记录 [WT][MONITOR] 日志并给出 bottle 值
+
+2.3 Scheduler 中回传指标来源
+- 文件：
+  /root/predict-schedule/vllm/vllm/v1/core/sched/scheduler.py
+  /root/predict-schedule/vllm/vllm/v1/metrics/loggers.py
+- 关键链路：
+  - scheduler 维护 running_tokens / running_predict_tokens / waiting_tokens
+  - Prometheus logger 将其导出为 vllm:running_tokens 等指标
+  - kv_cache_usage_perc 文档定义为 1 表示 100%（不是 100）
+
+============================================================
+3. Llama-3-8B-Instruct 的参数化过程
+============================================================
+3.1 配置来源
+- proxy 启动时通过环境变量 MODEL_CONFIG_PATH 读取模型 config.json。
+- 实验脚本普遍传入：MODEL_CONFIG_PATH=${MODEL}/config.json。
+- 运行日志自检显示已读取文件而非 fallback 默认值：
+  [WT][SELF-CHECK] config_source=file
+
+3.2 在一次真实运行中的自检值（来自 proxy bootstrap 日志）
+- hidden_size = 4096
+- num_hidden_layers = 32
+- intermediate_size = 14336
+- num_attention_heads = 32
+- num_key_value_heads = 8
+- vocab_size = 128256
+- precision_bytes = 2 (bfloat16)
+
+这些参数与 Llama-3-8B-Instruct 的结构特征一致（特别是 GQA: kv_heads=8）。
+
+============================================================
+4. 三维负载公式与量纲解释
+============================================================
+记：
+- n_req = running requests 数
+- m_tok = running tokens 总数
+- kv_usage = KV cache 使用率（0~1）
+
+4.1 结构系数
+- kv_dim = (hidden_size / num_attention_heads) * num_key_value_heads
+- layer_params = h*(h+2*kv_dim) + h*h + 3*h*i
+- total_params = L*layer_params + vocab*h
+- weights_vram = total_params * precision_bytes
+
+4.2 计算负载 Load_Compute
+- flops = n_req * linear_flops_coeff + attn_flops_coeff * m_tok
+  其中
+  linear_flops_coeff = 2*(L*layer_params + vocab*h)
+  attn_flops_coeff = 4*L*h
+- t_compute_ms = (flops / 1e12) / peak_tflops * 1000
+- Load_Compute = t_compute_ms / TPOT_ms
+
+解释：将当前步估计计算耗时与 TPOT 预算对齐，得到无量纲“计算压力比”。
+
+4.3 访存负载 Load_Memory
+- kv_vram_bytes = 2 * L * m_tok * kv_dim * precision_bytes
+- activation_vram_bytes = n_req * L * (2*h + 2*i) * precision_bytes
+- memory_denominator = BW_bytes_per_ms * TPOT_ms - weights_vram
+- Load_Memory = (kv_vram_bytes + activation_vram_bytes) / memory_denominator
+
+解释：该式把“动态状态规模”映射到“在 TPOT 窗口内除去权重占用后的可用访存预算”。
+它是工程近似指标，目标是排序/比较，不是严格的硬件微架构带宽模型。
+
+4.4 显存占用负载 Load_Memory_Capacity
+- Load_Memory_Capacity = kv_usage
+
+解释：直接使用 vLLM 导出的 KV cache 占用比例，天然无量纲且可在线获取。
+
+4.5 总瓶颈指标
+- Load_Bottle = max(Load_Compute, Load_Memory, Load_Memory_Capacity)
+
+解释：三者取最大，符合“最紧约束决定系统瓶颈”的思想。
+
+============================================================
+5. 与实测日志的一致性校验
+============================================================
+5.1 启动自检与模型常数一致
+在 proxy 日志中可见：
+- kv_dim=1024
+- weights_vram_gb=15.009
+- bw_gbs=1935
+- memory_denominator_gb=81.741
+- peak_tflops=312
+
+这些值与 A800 + Llama-3-8B + bf16 假设一致。
+
+5.2 单点复算（示例）
+取日志样本（in50_out500_rr8 过程中的一条监控）：
+- requests=77, tokens=23624, capacity=0.064
+日志给出：
+- compute=0.075, memory=0.040, bottle=0.075
+
+按代码公式复算：
+- Load_Compute = 0.074878...
+- Load_Memory  = 0.040103...
+- Load_Bottle  = 0.074878...
+与日志一致（仅小数截断差异）。
+
+5.3 运行趋势合理性
+在该批次日志中，随着 running_requests / running_tokens 上升：
+- Load_Compute 单调上升并常为主导
+- Load_Memory 与 Load_Memory_Capacity 也上升但低于计算项
+表现为 compute-dominant，这与 A800 高带宽、该工作负载下算力主导现象一致。
+
+============================================================
+6. 错误检查结论（是否存在问题）
+============================================================
+6.1 结论：未发现“实现与公式不一致”的硬错误
+- 公式定义、代码实现、日志输出三者一致。
+- scheduler 指标导出链路完整，proxy 拉取字段与目标字段匹配。
+
+6.2 发现的工程近似与潜在误差（建议在论文中明示）
+(1) Load_Memory 的物理含义是“预算化近似”，不是严格带宽仿真。
+- 公式中 kv_vram_bytes/activation_vram_bytes 更接近状态规模或工作集近似，
+  与严格每步 DRAM transaction 仍有差异。
+- 建议在论文表述为“proxy-side online heuristic memory pressure model”。
+
+(2) 常数绑定 A800。
+- peak_tflops=312, bandwidth_gbs=1935 在代码中为固定值。
+- 若迁移到非 A800 或不同功耗档位，需重新标定，否则绝对值会偏。
+
+(3) TPOT 作为预算参数敏感。
+- TPOT 直接参与归一化，若业务 SLA 改变，Load_* 的绝对量级会变化。
+- 但相对排序（用于调度）通常仍稳定。
+
+(4) 服务发现过期清理函数有潜在边界问题（非本次三维公式核心，但建议修复）。
+- _remove_oldest_instances 仅从 dict 头部开始清理；在部分更新时间序场景下，
+  可能残留已过期但不在头部的实例。
+- 该问题会影响实例可用性判断，但不直接改变三维负载公式本身。
+
+============================================================
+7. 对“公式合理性”的论文级结论
+============================================================
+可以给出如下结论：
+- 该三维负载模型是“可解释、在线可观测、与实现一致、与日志一致”的工程化瓶颈指标。
+- 对 decode 实例调度场景，它能把计算压力、动态访存压力、KV 容量压力统一到同一尺度。
+- 在 A800 + Llama-3-8B-Instruct + p2p nccl 解耦部署下，实测显示模型判断稳定，
+  且对 compute bottleneck 的识别与观测一致。
+- 该模型适合用于在线调度与瓶颈归因，不应被解释为 cycle-level 精确硬件性能模型。
+
+============================================================
+8. 可直接用于论文的方法表述（建议）
+============================================================
+建议在论文中使用如下措辞：
+“我们在 proxy 侧构建了一个轻量级在线三维负载估计器。该估计器利用 scheduler 导出的
+运行请求数、运行 token 数与 KV cache 使用率，分别估计计算压力、访存压力与容量压力，
+并使用其最大值作为当前 decode 实例的瓶颈负载。该方法不依赖离线 profile，可在线实时更新，
+在 A800 + Llama-3-8B-Instruct 的生产式解耦部署中表现出稳定的瓶颈识别能力。”
+
+（完）

@@ -85,6 +85,15 @@ def _listen_for_register(poller, router_socket):
                 print(f"🔵Add [HTTP:{data['http_address']}, ZMQ:{data['zmq_address']}]")
 
 
+def _parse_ms_env_value(raw_value: str, default_value: float) -> float:
+    """Parse values like 'ttft:1000' or '1000' into float milliseconds."""
+    try:
+        parsed = raw_value.split(":", 1)[1] if ":" in raw_value else raw_value
+        return float(parsed)
+    except Exception:
+        return float(default_value)
+
+
 def start_service_discovery(hostname, port):
     if not hostname:
         hostname = socket.gethostname()
@@ -175,7 +184,7 @@ class DecodeMonitor:
         self.precision_bytes = precision_map.get(self.precision, 2)
         self.config.bytes_per_param = self.precision_bytes
 
-        self.bandwidth_gbs = 1935
+        self.bandwidth_gbs = 2039
         self.mem_capacity = 80
         self.tpot = float(tpot)
 
@@ -378,13 +387,15 @@ class DecodeMonitor:
         }
 
 
+_ttft_raw = os.environ.get("TTFT", "ttft:1000")
 _tpot_raw = os.environ.get("TPOT", "tpot:50")
-_tpot_value = _tpot_raw.split(":", 1)[1] if ":" in _tpot_raw else _tpot_raw
+TARGET_TTFT_MS = _parse_ms_env_value(_ttft_raw, 1000.0)
+TARGET_TPOT_MS = _parse_ms_env_value(_tpot_raw, 50.0)
 
 monitor = DecodeMonitor(
     config_path=os.environ.get("MODEL_CONFIG_PATH", "model_config.json"),
     precision=os.environ.get("VLLM_DTYPE", "bf16"),
-    tpot=_tpot_value,
+    tpot=TARGET_TPOT_MS,
     check_interval=0.01,
     enable_monitor_log=True,
 )
@@ -449,7 +460,9 @@ async def handle_request():
         print(
             f"handle_request count: {count}, [HTTP:{prefill_addr}, "
             f"ZMQ:{prefill_zmq_addr}] 👉 [HTTP:{decode_addr}, "
-            f"ZMQ:{decode_zmq_addr}]"
+            f"ZMQ:{decode_zmq_addr}] "
+            f"ttft_target_ms={TARGET_TTFT_MS:.2f} "
+            f"tpot_target_ms={TARGET_TPOT_MS:.2f}"
         )
         count += 1
 
@@ -487,6 +500,13 @@ async def handle_request():
 if __name__ == "__main__":
     proxy_port = int(os.environ.get("PROXY_PORT", "30001"))
     bench_port = int(os.environ.get("BENCH_PORT", "10001"))
+    print(
+        "[WT][TEST-CONFIG] "
+        f"ttft_target_ms={TARGET_TTFT_MS:.2f} "
+        f"tpot_target_ms={TARGET_TPOT_MS:.2f} "
+        f"proxy_port={proxy_port} bench_port={bench_port}",
+        flush=True,
+    )
     t = start_service_discovery("0.0.0.0", proxy_port)
     app.run(host="0.0.0.0", port=bench_port)
     t.join()

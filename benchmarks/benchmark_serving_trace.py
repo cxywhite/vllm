@@ -781,6 +781,55 @@ def save_to_pytorch_benchmark_format(
         write_to_json(pt_file, pt_records)
 
 
+def infer_dataset_name_from_path(dataset_name: str, dataset_path: Optional[str]) -> str:
+    if dataset_name != "auto":
+        return dataset_name
+
+    if not dataset_path:
+        raise ValueError("--dataset-name auto requires --dataset-path")
+
+    lowered_path = dataset_path.lower()
+    file_name = Path(dataset_path).name.lower()
+
+    if "qwen_new" in file_name or "qwen_new" in lowered_path:
+        resolved = "qwen_new"
+    elif (
+        "lmsyschat" in file_name
+        or "lmsys-chat" in file_name
+        or "lmsys_chat" in file_name
+        or "lmsyschat" in lowered_path
+        or "lmsys-chat" in lowered_path
+        or "lmsys_chat" in lowered_path
+    ):
+        resolved = "lmsyschat"
+    elif "mysharegpt" in file_name or "mysharegpt" in lowered_path:
+        resolved = "mysharegpt"
+    elif "trace" in file_name or "mooncake_trace" in lowered_path:
+        resolved = "trace"
+    elif "qwen" in file_name or "qwen" in lowered_path:
+        resolved = "qwen"
+    else:
+        # Fallback to lightweight schema-based detection for csv-like datasets.
+        resolved = "mysharegpt"
+        if dataset_path.endswith(".csv"):
+            try:
+                header_df = pd.read_csv(dataset_path, nrows=1)
+                if "timestamp" in header_df.columns:
+                    resolved = "trace"
+                elif "prompt" in header_df.columns:
+                    resolved = "mysharegpt"
+                else:
+                    resolved = "custom"
+            except Exception:
+                resolved = "custom"
+
+    print(
+        f"[dataset] auto resolved dataset_name='{resolved}' "
+        f"from dataset_path='{dataset_path}'"
+    )
+    return resolved
+
+
 def main(args: argparse.Namespace):
     print(args)
     random.seed(args.seed)
@@ -831,6 +880,11 @@ def main(args: argparse.Namespace):
             "'--dataset-path' if required."
         )
 
+    args.dataset_name = infer_dataset_name_from_path(
+        args.dataset_name,
+        args.dataset_path,
+    )
+
     request_timestamps: Optional[list[float]] = None
     trace_timestamp_scale = 1.0
 
@@ -860,8 +914,15 @@ def main(args: argparse.Namespace):
             for idx, row in df.iterrows():
 
                 req_id = str(row["req_id"]) if "req_id" in df.columns else str(idx)
-                if args.dataset_name == "trace":
+                if "prompt" in df.columns:
                     prompt = row["prompt"]
+                elif "text" in df.columns:
+                    prompt = row["text"]
+                else:
+                    raise ValueError(
+                        "Dataset must include a 'prompt' or 'text' column. "
+                        f"columns={list(df.columns)}"
+                    )
                 if "prompt_len" in df.columns:
                     prompt_tokens = row["prompt_len"]+10 #llama加上了特殊token
                 else:
@@ -1225,7 +1286,7 @@ def create_argument_parser():
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf", "custom","mysharegpt","lmsyschat","qwen","qwen_new","trace"],
+        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf", "custom", "mysharegpt", "lmsyschat", "qwen", "qwen_new", "trace", "auto"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(

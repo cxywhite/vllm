@@ -560,18 +560,18 @@ def main():
     parser.set_defaults(trace_type="qwen")# qwen,burstgpt,mooncake, azure
     parser.add_argument(
         "--trace",
-        default="/root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/5-DynamicQPS/tmp_dataset/qwen_thinking_blksz_16_th8192_ts2000000_5000000.jsonl",
+        default="/root/.cache/huggingface/hub/datasets/wt_predictor/filter_trace_8192/qwen_trace/qwen_thinking_blksz_16_th8192.jsonl",
         help="输入 trace 文件路径"
     )
 
     parser.add_argument(
         "--output",
-        default="/root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/5-DynamicQPS/dataset/qwen/qwen_thinking_blksz_16_th8192_ts2000000_5000000.csv",
+        default="/root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/5-DynamicQPS/tmp_dataset/qwen_thinking_blksz_16_th8192.csv",
     )
 
     parser.add_argument(
         "--model",
-        default="/root/.cache/huggingface/hub/models/Meta-Llama-3-8B-Instruct"
+        default="/root/.cache/huggingface/hub/Meta-Llama-3-8B-Instruct"
     )
     # /root/share/models/Meta-Llama-3-8B-Instruct
     # /root/share/models/Qwen2.5-7B-Instruct

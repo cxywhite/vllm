@@ -30,8 +30,8 @@ QUART_DEBUG=${QUART_DEBUG:-0}
 LOG_NO_COLOR=${LOG_NO_COLOR:-1}
 
 # Default 1P1D configuration for A/B comparison with launch_nixl_disagg.sh
-PREFILL_GPUS=${PREFILL_GPUS:-0}
-DECODE_GPUS=${DECODE_GPUS:-1}
+PREFILL_GPUS=${PREFILL_GPUS:-3}
+DECODE_GPUS=${DECODE_GPUS:-5}
 PREFILL_PORTS=${PREFILL_PORTS:-20103}
 DECODE_PORTS=${DECODE_PORTS:-20105}
 
@@ -52,14 +52,14 @@ BENCH_PORT=${BENCH_PORT:-10002}
 BENCH_SEED=${BENCH_SEED:-$(date +%s)}
 BENCH_RANDOM_INPUT_LEN=${BENCH_RANDOM_INPUT_LEN:-1}
 BENCH_RANDOM_OUTPUT_LEN=${BENCH_RANDOM_OUTPUT_LEN:-1}
-BENCH_RANDOM_INPUT_LENS=${BENCH_RANDOM_INPUT_LENS:-4000,6000}
-BENCH_RANDOM_OUTPUT_LENS=${BENCH_RANDOM_OUTPUT_LENS:-50,100,200,500,1000,2000,4000,6000}
+BENCH_RANDOM_INPUT_LENS=${BENCH_RANDOM_INPUT_LENS:-1000,4000,6000}
+BENCH_RANDOM_OUTPUT_LENS=${BENCH_RANDOM_OUTPUT_LENS:-50,100,500,1000,4000,6000}
 BENCH_NUM_PROMPTS=${BENCH_NUM_PROMPTS:-1000}
 BENCH_BURSTINESS=${BENCH_BURSTINESS:-1}
 BENCH_REQUEST_RATE=${BENCH_REQUEST_RATE:-inf}
-BENCH_REQUEST_RATES=${BENCH_REQUEST_RATES:-1,2,4,8,100}
+BENCH_REQUEST_RATES=${BENCH_REQUEST_RATES:-1,2,4,100}
 BENCH_GOODPUT_TTFT_MS=${BENCH_GOODPUT_TTFT_MS:-500}
-BENCH_GOODPUT_TPOT_MS=${BENCH_GOODPUT_TPOT_MS:-50}
+BENCH_GOODPUT_TPOT_MS=${BENCH_GOODPUT_TPOT_MS:-30}
 # Set to 0 to skip vllm bench's initial single-prompt ready check.
 BENCH_READY_CHECK_TIMEOUT_SEC=${BENCH_READY_CHECK_TIMEOUT_SEC:-0}
 BENCH_SCRIPT=${BENCH_SCRIPT:-../../../benchmarks/benchmark_serving_baseline.py}
@@ -653,10 +653,7 @@ if total == 0:
 ratios = {k: counts[k] / total for k in counts}
 top_metric = max(order, key=lambda k: ratios[k])
 top_ratio = ratios[top_metric]
-if top_ratio > 0.5:
-    label = f"{top_metric}({top_ratio*100:.1f}%)"
-else:
-    label = f"NO_DOMINANT(top={top_metric},{top_ratio*100:.1f}%)"
+label = f"{top_metric}({top_ratio*100:.1f}%)"
 
 print(f"{label}|{total}|{counts['compute']}|{counts['memory']}|{counts['capacity']}")
 PY
@@ -759,6 +756,15 @@ main() {
                 if [ "$request_rate" = "100" ] && [ $((input_len + output_len)) -gt 1000 ]; then
                     echo "Skipping qps=100 combo: in${input_len}_out${output_len} (sum>1000)"
                     continue
+                fi
+                # 如果输入长度和输出长度相差10倍以上则跳过这个组合
+                if [ $input_len -gt 0 ] && [ $output_len -gt 0 ]; then
+                    local ratio1=$((input_len / output_len))
+                    local ratio2=$((output_len / input_len))
+                    if [ "$ratio1" -ge 10 ] || [ "$ratio2" -ge 10 ]; then
+                        echo "Skipping combo: in${input_len}_out${output_len}_rr${rate_tag} (input/output length ratio > 10)"
+                        continue
+                    fi
                 fi
                 total_runs=$((total_runs + 1))
                 local rate_tag="${request_rate//./p}"

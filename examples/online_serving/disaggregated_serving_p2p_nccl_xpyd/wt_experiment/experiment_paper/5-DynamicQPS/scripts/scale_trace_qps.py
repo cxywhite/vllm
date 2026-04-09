@@ -75,7 +75,7 @@ def main() -> None:
     parser.add_argument(
         "--target-avg-qps",
         type=float,
-        default=6.0,
+        default=8.0,
         help="Target average QPS after scaling",
     )
     parser.add_argument(

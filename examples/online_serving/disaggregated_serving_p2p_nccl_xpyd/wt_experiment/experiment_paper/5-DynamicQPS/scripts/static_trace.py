@@ -340,7 +340,7 @@ if __name__ == "__main__":
     parser.set_defaults(trace_type="qwen")
     parser.add_argument(
         "--file",
-        default='/root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/5-DynamicQPS/tmp_dataset/qwen_thinking_blksz_16_th8192_ts2000000_5000000_avg6.jsonl',
+        default='/root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/experiment_paper/5-DynamicQPS/tmp_dataset/qwen_thinking_blksz_16_th8192_avg8.jsonl',
         help="输入 trace 文件路径"
     )
     # 添加输出目录前缀
