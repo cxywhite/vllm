@@ -25,15 +25,15 @@ set -e
 # Configuration - can be overridden via environment variables
 MODEL=${MODEL:-/root/.cache/huggingface/hub/Meta-Llama-3-8B-Instruct}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
-PROXY_PORT=${PROXY_PORT:-30002}
+PROXY_PORT=${PROXY_PORT:-30001}
 QUART_DEBUG=${QUART_DEBUG:-0}
 LOG_NO_COLOR=${LOG_NO_COLOR:-1}
 
 # Default 1P1D configuration for A/B comparison with launch_nixl_disagg.sh
-PREFILL_GPUS=${PREFILL_GPUS:-3}
-DECODE_GPUS=${DECODE_GPUS:-5}
-PREFILL_PORTS=${PREFILL_PORTS:-20103}
-DECODE_PORTS=${DECODE_PORTS:-20105}
+PREFILL_GPUS=${PREFILL_GPUS:-6}
+DECODE_GPUS=${DECODE_GPUS:-7}
+PREFILL_PORTS=${PREFILL_PORTS:-20003}
+DECODE_PORTS=${DECODE_PORTS:-20005}
 
 # Model/runtime configuration aligned with launch_nixl_disagg.sh
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
@@ -48,21 +48,27 @@ UCX_TLS=${UCX_TLS:-tcp,cuda_copy}
 
 # Benchmark configuration aligned with launch_nixl_disagg.sh
 # Note: disagg_proxy_p2p_nccl_xpyd.py listens on HTTP port 10001 by design.
-BENCH_PORT=${BENCH_PORT:-10002}
+BENCH_PORT=${BENCH_PORT:-10001}
 BENCH_SEED=${BENCH_SEED:-$(date +%s)}
 BENCH_RANDOM_INPUT_LEN=${BENCH_RANDOM_INPUT_LEN:-1}
 BENCH_RANDOM_OUTPUT_LEN=${BENCH_RANDOM_OUTPUT_LEN:-1}
-BENCH_RANDOM_INPUT_LENS=${BENCH_RANDOM_INPUT_LENS:-1000,4000,6000}
-BENCH_RANDOM_OUTPUT_LENS=${BENCH_RANDOM_OUTPUT_LENS:-50,100,500,1000,4000,6000}
+BENCH_RANDOM_INPUT_LENS=${BENCH_RANDOM_INPUT_LENS:-50,100,200,500,1000,2000,4000,6000}
+BENCH_RANDOM_OUTPUT_LENS=${BENCH_RANDOM_OUTPUT_LENS:-50,100,200,500,1000,2000,4000,6000}
 BENCH_NUM_PROMPTS=${BENCH_NUM_PROMPTS:-1000}
 BENCH_BURSTINESS=${BENCH_BURSTINESS:-1}
 BENCH_REQUEST_RATE=${BENCH_REQUEST_RATE:-inf}
-BENCH_REQUEST_RATES=${BENCH_REQUEST_RATES:-1,2,4,100}
+BENCH_REQUEST_RATES=${BENCH_REQUEST_RATES:-1,2,4}
+# Split all valid benchmark combos across shards; this script runs shard 0 by default.
+BENCH_SHARD_COUNT=${BENCH_SHARD_COUNT:-2}
+BENCH_SHARD_INDEX=${BENCH_SHARD_INDEX:-0}
 BENCH_GOODPUT_TTFT_MS=${BENCH_GOODPUT_TTFT_MS:-500}
 BENCH_GOODPUT_TPOT_MS=${BENCH_GOODPUT_TPOT_MS:-30}
 # Set to 0 to skip vllm bench's initial single-prompt ready check.
 BENCH_READY_CHECK_TIMEOUT_SEC=${BENCH_READY_CHECK_TIMEOUT_SEC:-0}
 BENCH_SCRIPT=${BENCH_SCRIPT:-../../../benchmarks/benchmark_serving_baseline.py}
+ENABLE_BENCH_SKIP_KNOWN_RESULT=${ENABLE_BENCH_SKIP_KNOWN_RESULT:-1}
+BENCH_SKIP_SUCCESS_DIR=${BENCH_SKIP_SUCCESS_DIR:-/root/.cache/huggingface/hub/datasets/wt_predictor/result_random_input_len_output_len_qps/tmpresult/tpot30ms/benchmark_log_success}
+BENCH_SKIP_FAILED_DIR=${BENCH_SKIP_FAILED_DIR:-/root/.cache/huggingface/hub/datasets/wt_predictor/result_random_input_len_output_len_qps/tmpresult/tpot30ms/benchmark_log_failed}
 
 # GPU watchdog: if both prefill and decode groups stay at 0 util too long,
 # current combo is marked failed, services are restarted, and next combo runs.
@@ -75,7 +81,7 @@ ENABLE_GLOBAL_PKILL_FALLBACK=${ENABLE_GLOBAL_PKILL_FALLBACK:-0}
 
 # Logs (aligned with 5-D style directory layout)
 BASE_RESULT_DIR=${BASE_RESULT_DIR:-$(dirname "${BASH_SOURCE[0]}")/wt_experiment/test_runs}
-LOG_SUFFIX=${LOG_SUFFIX:-run2_g0g1}
+LOG_SUFFIX=${LOG_SUFFIX:-}
 
 BENCH_INPUT_TAG=$(echo "$BENCH_RANDOM_INPUT_LENS" | sed -E 's/[ ,\/]+/-/g; s/^-+//; s/-+$//; s/-+/-/g; s/\./p/g')
 BENCH_OUTPUT_TAG=$(echo "$BENCH_RANDOM_OUTPUT_LENS" | sed -E 's/[ ,\/]+/-/g; s/^-+//; s/-+$//; s/-+/-/g; s/\./p/g')
@@ -109,8 +115,6 @@ PREFILL_MEM_POOL_SIZE_GB=${PREFILL_MEM_POOL_SIZE_GB:-32}
 DECODE_MEM_POOL_SIZE_GB=${DECODE_MEM_POOL_SIZE_GB:-32}
 PREFILL_KV_BUFFER_SIZE=${PREFILL_KV_BUFFER_SIZE:-1e1}
 DECODE_KV_BUFFER_SIZE=${DECODE_KV_BUFFER_SIZE:-8e9}
-PREFILL_KV_PORT_BASE=${PREFILL_KV_PORT_BASE:-21101}
-DECODE_KV_PORT_BASE=${DECODE_KV_PORT_BASE:-22101}
 
 echo "Warning: P2P NCCL disaggregated prefill XpYd support for vLLM v1 is experimental and subject to change."
 echo ""
@@ -120,8 +124,6 @@ echo "  Prefill GPUs: $PREFILL_GPUS, Ports: $PREFILL_PORTS"
 echo "  Decode GPUs: $DECODE_GPUS, Ports: $DECODE_PORTS"
 echo "  Prefill Mem Pool (GB): $PREFILL_MEM_POOL_SIZE_GB, KV Buffer: $PREFILL_KV_BUFFER_SIZE"
 echo "  Decode Mem Pool (GB): $DECODE_MEM_POOL_SIZE_GB, KV Buffer: $DECODE_KV_BUFFER_SIZE"
-echo "  Prefill KV Port Base: $PREFILL_KV_PORT_BASE"
-echo "  Decode KV Port Base: $DECODE_KV_PORT_BASE"
 echo "  Proxy Port: $PROXY_PORT"
 echo "  Benchmark Port: $BENCH_PORT"
 echo "  Benchmark Script: $BENCH_SCRIPT"
@@ -139,12 +141,18 @@ echo "  GPU Idle Timeout (s): $GPU_IDLE_TIMEOUT_SECONDS"
 echo "  GPU Idle Check Interval (s): $GPU_IDLE_CHECK_INTERVAL_SECONDS"
 echo "  Global pkill fallback: $ENABLE_GLOBAL_PKILL_FALLBACK"
 echo "  Bench Ready Check Timeout (s): $BENCH_READY_CHECK_TIMEOUT_SEC"
+echo "  Skip Known Result: $ENABLE_BENCH_SKIP_KNOWN_RESULT"
+echo "  Skip Success Dir: $BENCH_SKIP_SUCCESS_DIR"
+echo "  Skip Failed Dir: $BENCH_SKIP_FAILED_DIR"
+echo "  Bench Shard: $BENCH_SHARD_INDEX / $BENCH_SHARD_COUNT"
 echo "  Timeout: ${TIMEOUT_SECONDS}s"
 echo ""
 
 PIDS=()
 PROXY_PID=""
 CURRENT_BOTTLENECK="unknown"
+declare -A SKIP_COMBOS=()
+SKIP_COMBO_COUNT=0
 
 record_pid() {
     local pid="$1"
@@ -152,6 +160,43 @@ record_pid() {
     if [ -n "$PID_TRACK_FILE" ]; then
         echo "$pid" >> "$PID_TRACK_FILE"
     fi
+}
+
+load_skip_combos() {
+    SKIP_COMBOS=()
+    SKIP_COMBO_COUNT=0
+
+    if ! is_truthy "$ENABLE_BENCH_SKIP_KNOWN_RESULT"; then
+        echo "Known-result skip is disabled."
+        return 0
+    fi
+
+    local dir
+    local file
+    local bn
+    local key
+
+    for dir in "$BENCH_SKIP_SUCCESS_DIR" "$BENCH_SKIP_FAILED_DIR"; do
+        if [[ ! -d "$dir" ]]; then
+            echo "[WARN] Skip directory not found: $dir"
+            continue
+        fi
+
+        shopt -s nullglob
+        for file in "$dir"/bench_in*_out*_rr*_*.log; do
+            bn=$(basename "$file")
+            if [[ "$bn" =~ ^bench_(in[0-9]+_out[0-9]+_rr[^_]+)_.*\.log$ ]]; then
+                key="${BASH_REMATCH[1]}"
+                if [[ -z "${SKIP_COMBOS[$key]+x}" ]]; then
+                    SKIP_COMBOS["$key"]=1
+                    SKIP_COMBO_COUNT=$((SKIP_COMBO_COUNT + 1))
+                fi
+            fi
+        done
+        shopt -u nullglob
+    done
+
+    echo "Known benchmark combos to skip: $SKIP_COMBO_COUNT"
 }
 
 # Switch to the directory of the current script
@@ -223,6 +268,11 @@ dump_run_config_json() {
     "bench_random_input_lens": "$BENCH_RANDOM_INPUT_LENS",
     "bench_random_output_lens": "$BENCH_RANDOM_OUTPUT_LENS",
     "bench_request_rates": "$BENCH_REQUEST_RATES",
+    "enable_bench_skip_known_result": "$ENABLE_BENCH_SKIP_KNOWN_RESULT",
+    "bench_skip_success_dir": "$BENCH_SKIP_SUCCESS_DIR",
+    "bench_skip_failed_dir": "$BENCH_SKIP_FAILED_DIR",
+    "bench_shard_count": "$BENCH_SHARD_COUNT",
+    "bench_shard_index": "$BENCH_SHARD_INDEX",
     "bench_num_prompts": "$BENCH_NUM_PROMPTS",
     "bench_burstiness": "$BENCH_BURSTINESS",
     "bench_ready_check_timeout_sec": "$BENCH_READY_CHECK_TIMEOUT_SEC",
@@ -483,7 +533,7 @@ launch_model_servers() {
     for i in "${!PREFILL_GPU_ARRAY[@]}"; do
         local gpu_id=${PREFILL_GPU_ARRAY[$i]}
         local port=${PREFILL_PORT_ARRAY[$i]}
-        local kv_port=$((PREFILL_KV_PORT_BASE + i))
+        local kv_port=$((21001 + i))
         local prefill_log="$LOG_DIR/prefill$((i+1))_${RUN_TIMESTAMP}_${tag}.log"
 
         echo "  Prefill server $((i+1)): GPU $gpu_id, Port $port, KV Port $kv_port"
@@ -509,7 +559,7 @@ launch_model_servers() {
     for i in "${!DECODE_GPU_ARRAY[@]}"; do
         local gpu_id=${DECODE_GPU_ARRAY[$i]}
         local port=${DECODE_PORT_ARRAY[$i]}
-        local kv_port=$((DECODE_KV_PORT_BASE + i))
+        local kv_port=$((22001 + i))
         local decode_log="$LOG_DIR/decode$((i+1))_${RUN_TIMESTAMP}_${tag}.log"
 
         echo "  Decode server $((i+1)): GPU $gpu_id, Port $port, KV Port $kv_port"
@@ -723,12 +773,25 @@ main() {
         cleanup 1
     fi
 
+    if ! [[ "$BENCH_SHARD_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+        echo "BENCH_SHARD_COUNT must be a positive integer, got: $BENCH_SHARD_COUNT"
+        cleanup 1
+    fi
+    if ! [[ "$BENCH_SHARD_INDEX" =~ ^[0-9]+$ ]] || [ "$BENCH_SHARD_INDEX" -ge "$BENCH_SHARD_COUNT" ]; then
+        echo "BENCH_SHARD_INDEX must be in [0, BENCH_SHARD_COUNT-1], got: $BENCH_SHARD_INDEX"
+        cleanup 1
+    fi
+
+    load_skip_combos
+
     echo "Benchmark configuration:"
     echo "  model: $MODEL"
     echo "  port: $BENCH_PORT"
     echo "  random_input_lens: ${input_lens[*]}"
     echo "  random_output_lens: ${output_lens[*]}"
     echo "  request_rates: ${request_rates[*]}"
+    echo "  known_skip_combos: $SKIP_COMBO_COUNT"
+    echo "  shard: $BENCH_SHARD_INDEX / $BENCH_SHARD_COUNT"
     echo "  goodput_ttft_ms: $BENCH_GOODPUT_TTFT_MS"
     echo "  goodput_tpot_ms: $BENCH_GOODPUT_TPOT_MS"
     echo "  num_prompts: $BENCH_NUM_PROMPTS"
@@ -736,6 +799,8 @@ main() {
     echo ""
 
     local total_runs=0
+    local candidate_runs=0
+    local selected_runs=0
     local success_runs=0
     local failed_runs=0
     local final_exit_code=0
@@ -747,28 +812,42 @@ main() {
     for input_len in "${input_lens[@]}"; do
         for output_len in "${output_lens[@]}"; do
             for request_rate in "${request_rates[@]}"; do
-                # 如果input_len+output_len>=8192则跳过这个组合
-                if [ $((input_len + output_len)) -ge 8192 ]; then
-                    echo "Skipping combo: in${input_len}_out${output_len}_rr${rate_tag}"
-                    continue
-                fi
-                # [wt] qps=100 仅在总长度不超过 1000 时测试。
-                if [ "$request_rate" = "100" ] && [ $((input_len + output_len)) -gt 1000 ]; then
-                    echo "Skipping qps=100 combo: in${input_len}_out${output_len} (sum>1000)"
-                    continue
-                fi
-                # 如果输入长度和输出长度相差10倍以上则跳过这个组合
-                if [ $input_len -gt 0 ] && [ $output_len -gt 0 ]; then
-                    local ratio1=$((input_len / output_len))
-                    local ratio2=$((output_len / input_len))
-                    if [ "$ratio1" -ge 10 ] || [ "$ratio2" -ge 10 ]; then
-                        echo "Skipping combo: in${input_len}_out${output_len}_rr${rate_tag} (input/output length ratio > 10)"
-                        continue
-                    fi
-                fi
-                total_runs=$((total_runs + 1))
                 local rate_tag="${request_rate//./p}"
                 local combo_tag="in${input_len}_out${output_len}_rr${rate_tag}"
+                # 如果input_len+output_len>=8192则跳过这个组合
+                if [ $((input_len + output_len)) -ge 8192 ]; then
+                    echo "Skipping combo: $combo_tag"
+                    continue
+                fi
+
+                if is_truthy "$ENABLE_BENCH_SKIP_KNOWN_RESULT" && [[ -n "${SKIP_COMBOS[$combo_tag]+x}" ]]; then
+                    echo "Skipping known combo from history: $combo_tag"
+                    continue
+                fi
+                # # [wt] qps=100 仅在总长度不超过 1000 时测试。
+                # if [ "$request_rate" = "100" ] && [ $((input_len + output_len)) -gt 1000 ]; then
+                #     echo "Skipping qps=100 combo: in${input_len}_out${output_len} (sum>1000)"
+                #     continue
+                # fi
+                # # 如果输入长度和输出长度相差10倍以上则跳过这个组合
+                # if [ $input_len -gt 0 ] && [ $output_len -gt 0 ]; then
+                #     local ratio1=$((input_len / output_len))
+                #     local ratio2=$((output_len / input_len))
+                #     if [ "$ratio1" -ge 10 ] || [ "$ratio2" -ge 10 ]; then
+                #         echo "Skipping combo: $combo_tag (input/output length ratio > 10)"
+                #         continue
+                #     fi
+                # fi
+
+                local shard_slot=$((candidate_runs % BENCH_SHARD_COUNT))
+                candidate_runs=$((candidate_runs + 1))
+                if [ "$shard_slot" -ne "$BENCH_SHARD_INDEX" ]; then
+                    echo "Skipping combo by shard: $combo_tag (slot=$shard_slot, shard=$BENCH_SHARD_INDEX/$BENCH_SHARD_COUNT)"
+                    continue
+                fi
+
+                selected_runs=$((selected_runs + 1))
+                total_runs=$((total_runs + 1))
                 local combo_log="$LOG_DIR/bench_${combo_tag}_${RUN_TIMESTAMP}.log"
                 local combo_proxy_log
 
@@ -849,6 +928,7 @@ main() {
     } | tee -a "$summary_log"
 
     echo ""
+    echo "Shard coverage: candidate=$candidate_runs selected=$selected_runs shard=$BENCH_SHARD_INDEX/$BENCH_SHARD_COUNT"
     echo "Benchmark finished. total=$total_runs success=$success_runs failed=$failed_runs"
     echo "Benchmark summary: $summary_log"
     echo ""

@@ -1,0 +1,356 @@
+Llama 示例下 P2P NCCL（PUT_ASYNC）Prefill/Decode 分离调用链梳理
+
+生成时间: 2026-04-09
+
+说明
+- 本文以以下代码为准进行定位与梳理:
+  1) baseline 的 P2P NCCL connector/engine 代码
+     - /root/predict-schedule/baseline_experiment/vllm/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py
+     - /root/predict-schedule/baseline_experiment/vllm/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py
+  2) 当前 disagg proxy 入口代码
+     - /root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py
+  3) vLLM v1 调度与执行主链路
+     - /root/predict-schedule/baseline_experiment/vllm/vllm/v1/engine/core.py
+     - /root/predict-schedule/baseline_experiment/vllm/vllm/v1/core/sched/scheduler.py
+     - /root/predict-schedule/baseline_experiment/vllm/vllm/v1/worker/gpu_model_runner.py
+     - /root/predict-schedule/baseline_experiment/vllm/vllm/v1/worker/kv_connector_model_runner_mixin.py
+     - /root/predict-schedule/baseline_experiment/vllm/vllm/attention/layer.py
+     - /root/predict-schedule/baseline_experiment/vllm/vllm/model_executor/models/llama.py
+
+  注: 行号基于当前本地代码版本；后续代码变更可能导致行号漂移。
+
+==================================================
+一、先给结论（与你的问题对齐）
+==================================================
+在原生 P2P NCCL + PUT_ASYNC 逻辑中:
+1) prefill 在每层 attention 计算后触发 save_kv_layer，按 request 和 layer 切片当前层 KV。
+2) send_tensor 在 PUT_ASYNC 下只是入发送队列，后台线程异步出队并真正发送。
+3) decode 侧通过 start_load_kv 对 request 的每层逐个 recv_tensor 并注入到对应 layer 的 kv_cache。
+4) 由于发送是异步线程执行，prefill 可继续跑后续层前向，与网络传输并行。
+
+==================================================
+二、端到端流程（Llama 示例）
+==================================================
+示例假设
+- 模型: Llama（例如 hidden_size=4096, num_layers=32）
+- prefill 批次: 同时有 R1、R2 两个请求
+- 拆分模式: prefill 实例与 decode 实例分离
+- KV 传输: P2P NCCL, send_type=PUT_ASYNC
+
+--------------------------------------------------
+Step 0: Proxy 选择 prefill/decode 实例并构造 request_id
+--------------------------------------------------
+关键代码
+- 路由入口:
+  /root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py:429
+- 选择 prefill 实例:
+  :445, :448
+- 选择 decode 实例:
+  :454, :457
+- prefill 请求强制 max_tokens=1:
+  :437
+- 构造 request_id，编码 prefill/decode 的 zmq 地址:
+  :469-470
+- 先执行 prefill，再转发 decode:
+  :475, :481
+
+含义
+- 这个 request_id 之后会被 connector.parse_request_id 解析，用于确定对端地址。
+
+--------------------------------------------------
+Step 1: 请求进入 scheduler，被调度成本 step 的 token 预算
+--------------------------------------------------
+关键代码
+- EngineCore 每步执行:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/v1/engine/core.py:272
+- step 内调用 scheduler.schedule():
+  :283
+- Scheduler.schedule 定义:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/v1/core/sched/scheduler.py:179
+- 构造 SchedulerOutput:
+  :624
+- 若配置 KV connector，则附带 connector metadata:
+  :648
+
+含义
+- scheduler 计算每个请求本步要算多少 token（num_scheduled_tokens），并把新请求、缓存请求、block 信息等打包成 SchedulerOutput。
+
+--------------------------------------------------
+Step 2: 在 worker 里把 batch 展平为 total_num_tokens（对应 [num_tokens, hidden_dim] 的前置）
+--------------------------------------------------
+关键代码
+- execute_model 入口:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/v1/worker/gpu_model_runner.py:2231
+- _prepare_inputs 中 total_num_scheduled_tokens:
+  :935
+- 每请求 token 数数组 num_scheduled_tokens:
+  :947
+- req_indices = np.repeat(...), 做批次展平:
+  见 :950 附近逻辑
+- token_indices 与 input_ids gather:
+  :973-983
+- 生成 positions:
+  :960-964
+
+含义
+- 多请求批次先在 scheduler 维度组织，再在 model runner 维度展开成一个连续 token 视图。
+- 之后进入 Llama embedding 时，hidden_states 就是 [num_tokens, hidden_size] 语义。
+
+--------------------------------------------------
+Step 3: 进入 forward context，同时挂载 KV connector 生命周期
+--------------------------------------------------
+关键代码
+- execute_model 里 set_forward_context + maybe_get_kv_connector_output:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/v1/worker/gpu_model_runner.py:2287-2298
+- maybe_get_kv_connector_output 仅返回上下文管理器:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/v1/worker/kv_connector_model_runner_mixin.py:87
+- _get_kv_connector_output 内执行 bind/start:
+  :97, :107, :114
+- _get_kv_connector_output finally 内执行 wait_for_save/get_finished:
+  :119, :122
+
+含义
+- 同一次 forward 中，KV connector 的加载/保存都被 _get_kv_connector_output 上下文封装。
+
+--------------------------------------------------
+Step 4: Llama 每层前向（Attention + MLP）
+--------------------------------------------------
+关键代码
+- LlamaModel.forward:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/model_executor/models/llama.py:381
+- 输入嵌入到 hidden_states:
+  :393
+- 遍历各 decoder layer:
+  :401, :405
+- LlamaDecoderLayer.forward:
+  :309
+- 先 self_attn:
+  :322
+- 再 mlp:
+  :328
+
+含义
+- 这就是你要求的“执行模型每一层前向（attention + mlp）”主干。
+
+--------------------------------------------------
+Step 5: Attention 层里触发 KV connector 的加载与保存钩子
+--------------------------------------------------
+关键代码
+- unified_attention 主入口:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/attention/layer.py:560
+- unified_attention 内调用前置等待:
+  :566
+- wait_for_kv_layer_from_connector 内实际调用 wait_for_layer_load:
+  :539
+- unified_attention 内调用 attention impl.forward（传入 kv_cache）:
+  :574
+- unified_attention 内调用 maybe_save_kv_layer_to_connector:
+  :577
+- maybe_save_kv_layer_to_connector 内实际调用 save_kv_layer:
+  :556
+
+补充
+- Attention.forward 在常见路径下走 torch.ops.vllm.unified_attention:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/attention/layer.py:344
+- 直接调用 impl.forward 的路径在:
+  :341
+
+含义
+- 每层 attention 完成后，会把该层 kv_cache 交给 connector.save_kv_layer。
+
+--------------------------------------------------
+Step 6: Prefill 侧 save_kv_layer 切片并发起发送
+--------------------------------------------------
+关键代码
+- save_kv_layer 定义:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py:219
+- 仅 producer 执行保存:
+  :233-235
+- 按 connector_metadata.requests 遍历请求:
+  :271
+- 从 request_id 解析 decode 地址:
+  :462（parse_request_id）, 调用点 :273
+- 当前层按 block_ids 切片 KV:
+  :276
+- 发送 tensor_id = request_id + "#" + layer_name:
+  :277
+
+含义
+- 粒度是“每请求-每层”。
+
+--------------------------------------------------
+Step 7: PUT_ASYNC 异步发送线程与模型后续层前向并行
+--------------------------------------------------
+关键代码
+- send_type 默认 PUT_ASYNC:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py:128-129
+- 初始化启动发送线程:
+  :138, :140
+- send_tensor 在 PUT_ASYNC 下只入队并返回:
+  :219
+- 发送线程循环出队:
+  :411, :416
+- 出队后调用 send_sync:
+  :419, :432
+- send_sync 先发 PUT 控制消息，再 NCCL send:
+  :448, :450, :461
+
+含义
+- save_kv_layer 调 send_tensor 后不会阻塞到真正网络发送完成。
+- 因此 prefill 线程可继续执行下一层 attention/mlp，后台线程并行搬运上一层 KV。
+
+--------------------------------------------------
+Step 8: Decode 侧接收每层 KV，并写入本地 recv_store
+--------------------------------------------------
+关键代码
+- listener 线程启动:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py:155, :157
+- 处理 PUT 命令:
+  :334
+- 分配接收 tensor，NCCL recv:
+  :344
+- 写入 recv_store 并 notify:
+  :367
+- 接收后计算 tensor_size:
+  :345
+- 超阈值则转存到 pinned memory pool（if 分支）:
+  :346-350
+- 未超阈值则仅增加 buffer_size（else 分支）:
+  :356
+
+含义
+- decode 侧先收到每层 KV 并缓存，供后续 start_load_kv 读取。
+
+--------------------------------------------------
+Step 9: Decode 侧 start_load_kv 按请求按层取回 KV 并注入层缓存
+--------------------------------------------------
+关键代码
+- start_load_kv 定义:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py:95
+- 仅 consumer 侧执行（producer 直接 return）:
+  :111
+- 外层遍历 request:
+  :182
+- 内层遍历 no_compile_layers（逐层）:
+  :186
+- 每层 recv_tensor(request_id#layer_name):
+  :198
+- 将收到的 kv_cache 注入对应 layer:
+  :205
+- recv_tensor 在 PUT 模式阻塞等待 tensor_id 到达:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py:265
+- 若是 pool tuple，则 load_tensor 恢复:
+  :272
+
+重要说明
+- attention 层里对 wait_for_kv_layer_from_connector 的调用点在 layer.py:566，
+  其函数内部调用 wait_for_layer_load 在 layer.py:539。
+  但 p2p connector 的 wait_for_layer_load 当前是空实现:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py:208
+- 所以本实现主要靠 start_load_kv 的层循环来完成加载。
+
+--------------------------------------------------
+Step 10: Decode 实例开始 decode 调度与逐步生成
+--------------------------------------------------
+关键代码
+- Proxy 在 prefill 完成后转发原始请求到 decode:
+  /root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py:481
+- decode 侧也是同一条 EngineCore.step -> Scheduler.schedule -> execute_model 链:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/v1/engine/core.py:272-287
+- execute_model 后处理 logits 与采样:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/v1/worker/gpu_model_runner.py:2330-2331, :2367
+- scheduler.update_from_output 入口与输出容器构建:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/v1/core/sched/scheduler.py:903, :916
+- scheduler._update_request_with_output 把新 token 追加回 request:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/v1/core/sched/scheduler.py:1076
+
+含义
+- decode 每步生成增量 token，attention impl.forward 也会把本步新 token 的 K/V 写入本地 paged KV。
+- 这里“保存增量 KV”主要是保存到 decode 本地 KV cache（而不是回传给别的实例）。
+
+--------------------------------------------------
+Step 11: 请求结束与清理
+--------------------------------------------------
+关键代码
+- scheduler 路径: stopped 后释放请求并触发 request_finished
+  /root/predict-schedule/baseline_experiment/vllm/vllm/v1/core/sched/scheduler.py:974-975
+- _free_request:
+  :1189
+- _connector_finished:
+  :1265
+- 调 connector.request_finished:
+  :1277
+- p2p connector.request_finished 当前返回 False, None:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py:437, :455
+
+- worker/model runner 路径: execute_model 的 connector 上下文 finally
+  内调用 wait_for_save/get_finished
+  /root/predict-schedule/baseline_experiment/vllm/vllm/v1/worker/kv_connector_model_runner_mixin.py:119, :122
+- p2p engine.get_finished 中按 finished_req_ids 清理 recv_store:
+  /root/predict-schedule/baseline_experiment/vllm/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py:468, :483-486
+
+含义
+- request_finished 与 get_finished 不是并行执行，而是在同一 step 的不同时机串行触发:
+  先在 execute_model 的 connector 上下文 finally 触发 get_finished，
+  后在同一 step 的 scheduler.update_from_output 中按停止条件触发 request_finished。
+
+==================================================
+三、按你提出的“完整过程”做一句话对照
+==================================================
+你要求的链路:
+- prefill scheduler 调度 -> 展平为 [num_tokens, hidden_dim] -> 每层 attention/mlp 前向 -> 每层 attention 后保存 kv cache -> 异步发送线程并行发送 -> decode 侧接收每层 kv -> decode scheduler 调度 -> 每层 attention/mlp 前向 -> 生成增量 token 并更新本地 KV -> 输出完整结果。
+
+与源码一致，并且关键并行点是:
+- prefill 计算线程与 send_async 发送线程并行（PUT_ASYNC）。
+
+==================================================
+四、关键实现细节与易误解点
+==================================================
+1) decode 的 wait_for_layer_load 在 p2p connector 里当前是空实现（:208）。
+   真实加载主要发生在 start_load_kv 的层循环（:182, :186, :198, :205）。
+
+2) baseline 版 recv_tensor 在 PUT/PUT_ASYNC 分支读的是 recv_store[tensor_id]，
+   默认不立刻 pop（p2p_nccl_engine.py:265 之后逻辑）。
+   生命周期清理主要在 get_finished（:468 之后）做。
+
+3) 当接收缓存超过阈值时会进 TensorMemoryPool（store/load）:
+   - store: p2p_nccl_engine.py:349
+   - load: p2p_nccl_engine.py:272
+   对应 pool 实现在:
+   /root/predict-schedule/baseline_experiment/vllm/vllm/distributed/kv_transfer/kv_connector/v1/p2p/tensor_memory_pool.py
+
+4) decode 侧一般不是 producer，save_kv_layer 入口会直接 return（:234-235）。
+   因此 decode 的“增量 KV 保存”是本地 attention KV cache 更新，不是再走一次远端发送。
+
+==================================================
+五、最小调用图（文本版）
+==================================================
+Proxy handle_request
+  -> forward_request(prefill_url, prefill_request_dict, request_id)
+  -> prefill EngineCore.step
+    -> Scheduler.schedule
+      -> connector.build_connector_meta
+    -> GPUModelRunner.execute_model
+      -> set_forward_context + maybe_get_kv_connector_output
+        -> _get_kv_connector_output
+          -> bind_connector_metadata
+          -> start_load_kv (consumer 才做)
+      -> LlamaModel.forward (layer loop)
+        -> LlamaDecoderLayer.forward
+          -> self_attn -> unified_attention
+            -> wait_for_kv_layer_from_connector
+              -> wait_for_layer_load
+            -> impl.forward(..., kv_cache, ...)
+            -> save_kv_layer
+              -> send_tensor(request#layer)
+                -> PUT_ASYNC queue
+      -> _get_kv_connector_output finally
+        -> wait_for_save
+        -> get_finished
+  -> forward_request(decode_url, original_request_data, request_id)
+  -> decode EngineCore.step (同上)
+    -> 逐步生成 token
+    -> scheduler.update_from_output
+    -> 请求结束后 _free_request
+
+(完)

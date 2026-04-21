@@ -30,7 +30,7 @@ QUART_DEBUG=${QUART_DEBUG:-0}
 LOG_NO_COLOR=${LOG_NO_COLOR:-1}
 
 # Default 1P1D configuration for A/B comparison with launch_nixl_disagg.sh
-PREFILL_GPUS=${PREFILL_GPUS:-3}
+PREFILL_GPUS=${PREFILL_GPUS:-4}
 DECODE_GPUS=${DECODE_GPUS:-5,6,7}
 PREFILL_PORTS=${PREFILL_PORTS:-20003}
 DECODE_PORTS=${DECODE_PORTS:-20005,20006,20007}
@@ -61,6 +61,12 @@ BENCH_GOODPUT_TPOT_MS_LIST=${BENCH_GOODPUT_TPOT_MS_LIST:-30,50,100}
 # Set to 0 to skip vllm bench's initial single-prompt ready check.
 BENCH_READY_CHECK_TIMEOUT_SEC=${BENCH_READY_CHECK_TIMEOUT_SEC:-0}
 BENCH_SCRIPT=${BENCH_SCRIPT:-../../../benchmarks/benchmark_serving_baseline.py}
+
+# Skip controls.
+# - SKIP_DATASET_LABELS: comma-separated CURRENT_BENCH_DATASET_LABEL values
+# - SKIP_COMBO_TAGS: comma-separated combo tags (e.g., dsxxx_rr6_tpot50)
+SKIP_DATASET_LABELS=${SKIP_DATASET_LABELS:-}
+SKIP_COMBO_TAGS=${SKIP_COMBO_TAGS:-dsmatched_qwen-lmsys-chat-updated_by_reqid_from_llama-lmsys-chat-updated_n2000_seed42_20260408_145129_rr4_tpot30,dsmatched_qwen-lmsys-chat-updated_by_reqid_from_llama-lmsys-chat-updated_n2000_seed42_20260408_145129_rr4_tpot50,dsmatched_qwen-lmsys-chat-updated_by_reqid_from_llama-lmsys-chat-updated_n2000_seed42_20260408_145129_rr4_tpot100,dsmatched_qwen-lmsys-chat-updated_by_reqid_from_llama-lmsys-chat-updated_n2000_seed42_20260408_145129_rr6_tpot30}
 
 # GPU watchdog: if both prefill and decode groups stay at 0 util too long,
 # current combo is marked failed, services are restarted, and next combo runs.
@@ -285,6 +291,21 @@ is_truthy() {
     local v
     v=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
     [[ "$v" == "1" || "$v" == "true" || "$v" == "yes" || "$v" == "y" ]]
+}
+
+csv_contains_exact() {
+    local csv="$1"
+    local target="$2"
+    local item
+    IFS=',' read -ra _CSV_ITEMS <<< "$csv"
+    for item in "${_CSV_ITEMS[@]}"; do
+        item=$(echo "$item" | xargs)
+        [[ -z "$item" ]] && continue
+        if [[ "$item" == "$target" ]]; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 kill_process_tree() {
@@ -783,19 +804,28 @@ main() {
     echo "  goodput_ttft_ms: $BENCH_GOODPUT_TTFT_MS"
     echo "  num_prompts: $BENCH_NUM_PROMPTS"
     echo "  burstiness: $BENCH_BURSTINESS"
+    echo "  skip_dataset_labels: ${SKIP_DATASET_LABELS:-<none>}"
+    echo "  skip_combo_tags: ${SKIP_COMBO_TAGS:-<none>}"
     echo ""
 
     local total_runs=0
     local success_runs=0
     local failed_runs=0
+    local skipped_runs=0
     local final_exit_code=0
     local summary_log="$RESULT_DIR/benchmark_summary_${RUN_TIMESTAMP}.log"
     local -a success_configs=()
     local -a failed_configs=()
+    local -a skipped_configs=()
     : > "$summary_log"
 
     for dataset_path in "${DATASET_PATH_ARRAY[@]}"; do
         set_current_dataset "$dataset_path"
+        if csv_contains_exact "$SKIP_DATASET_LABELS" "$CURRENT_BENCH_DATASET_LABEL"; then
+            echo "[SKIP][DATASET] dataset=${CURRENT_BENCH_DATASET_PATH} label=${CURRENT_BENCH_DATASET_LABEL}"
+            echo "dataset=${CURRENT_BENCH_DATASET_PATH}, status=skipped, reason=dataset_label_skip, label=${CURRENT_BENCH_DATASET_LABEL}" | tee -a "$summary_log"
+            continue
+        fi
         for request_rate in "${request_rates[@]}"; do
             for tpot_ms in "${tpot_values[@]}"; do
                 total_runs=$((total_runs + 1))
@@ -804,6 +834,14 @@ main() {
                 local combo_tag="ds${CURRENT_BENCH_DATASET_LABEL}_rr${rate_tag}_tpot${tpot_tag}"
                 local combo_log="$LOG_DIR/bench_${combo_tag}_${RUN_TIMESTAMP}.log"
                 local combo_proxy_log
+
+                if csv_contains_exact "$SKIP_COMBO_TAGS" "$combo_tag"; then
+                    skipped_runs=$((skipped_runs + 1))
+                    skipped_configs+=("$combo_tag(manual_skip)")
+                    echo "[SKIP][COMBO] dataset=${CURRENT_BENCH_DATASET_PATH}, request_rate=$request_rate, tpot_ms=$tpot_ms, combo=$combo_tag"
+                    echo "dataset=${CURRENT_BENCH_DATASET_PATH}, request_rate=$request_rate, tpot_ms=$tpot_ms, status=skipped, reason=manual_skip, combo=$combo_tag" | tee -a "$summary_log"
+                    continue
+                fi
 
                 if ! restart_proxy_server "$combo_tag" "$tpot_ms"; then
                     echo "Failed to restart proxy for combo: $combo_tag"
@@ -878,10 +916,14 @@ main() {
         for cfg in "${failed_configs[@]}"; do
             echo "failed_config=$cfg"
         done
+        echo "skipped_configs_count=${#skipped_configs[@]}"
+        for cfg in "${skipped_configs[@]}"; do
+            echo "skipped_config=$cfg"
+        done
     } | tee -a "$summary_log"
 
     echo ""
-    echo "Benchmark finished. total=$total_runs success=$success_runs failed=$failed_runs"
+    echo "Benchmark finished. total=$total_runs success=$success_runs failed=$failed_runs skipped=$skipped_runs"
     echo "Benchmark summary: $summary_log"
     echo ""
 

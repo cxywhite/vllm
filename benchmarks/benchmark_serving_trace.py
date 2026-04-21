@@ -923,10 +923,15 @@ def main(args: argparse.Namespace):
                         "Dataset must include a 'prompt' or 'text' column. "
                         f"columns={list(df.columns)}"
                     )
-                if "prompt_len" in df.columns:
-                    prompt_tokens = row["prompt_len"]+10 #llama加上了特殊token
-                else:
+                if "prompt_tokens" in df.columns:
                     prompt_tokens = row["prompt_tokens"]
+                elif "prompt_len" in df.columns:
+                    prompt_tokens = row["prompt_len"]
+                else:
+                    raise ValueError(
+                        "Dataset must include a 'prompt_tokens' or 'prompt_len' column. "
+                        f"columns={list(df.columns)}"
+                    )
                 expected_output_len = row["output_tokens"]
 
                 # mooncake-like traces may not include sampling params.
