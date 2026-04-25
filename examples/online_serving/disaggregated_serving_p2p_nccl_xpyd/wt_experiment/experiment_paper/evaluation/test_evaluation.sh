@@ -12,14 +12,17 @@ set -euo pipefail
 ####################
 
 # Which subtree to run:
-#   llama -> evaluation_dataset/llama/**/*.csv
-#   qwen  -> evaluation_dataset/qwen/**/*.csv
-#   all   -> evaluation_dataset/**/*.csv
-MODEL_TYPE=${MODEL_TYPE:-qwen}
+#   llama -> llama model + llama dataset + all configured PD/TPOT combos
+#   qwen  -> qwen model + qwen dataset + all configured PD/TPOT combos
+#   all   -> llama and qwen both
+MODEL_TYPE=${MODEL_TYPE:-all}
 
-TEST_MODEL=${TEST_MODEL:-qwen}
-# MODEL=${MODEL:-/root/.cache/huggingface/hub/Meta-Llama-3-8B-Instruct}
-MODEL=${MODEL:-/root/.cache/huggingface/hub/Qwen-2.5-7b-Instruct}
+LLAMA_MODEL_PATH=${LLAMA_MODEL_PATH:-/root/.cache/huggingface/hub/Meta-Llama-3-8B-Instruct}
+QWEN_MODEL_PATH=${QWEN_MODEL_PATH:-/root/.cache/huggingface/hub/Qwen-2.5-7b-Instruct}
+
+# Active model fields are populated at runtime from MODEL_TYPE.
+TEST_MODEL=""
+MODEL=""
 # Relative to this script directory, or absolute path.
 DATASET_BASE_DIR=${DATASET_BASE_DIR:-../../dataset/evaluation_dataset}
 
@@ -33,17 +36,11 @@ PROXY_PORT=${PROXY_PORT:-28002}
 BENCH_PORT=${BENCH_PORT:-22007}
 VLLM_DTYPE=${VLLM_DTYPE:-bfloat16}
 
-# Keep current 1p1d defaults unless explicitly overridden.
-PREFILL_GPUS=${PREFILL_GPUS:-0}
-PREFILL_PORTS=${PREFILL_PORTS:-20002}
-PREFILL_KV_PORTS=${PREFILL_KV_PORTS:-20010}
+# Shared runtime knobs across all PD ratios.
 PREFILL_GPU_MEMORY_UTILIZATION=${PREFILL_GPU_MEMORY_UTILIZATION:-0.8}
 PREFILL_TENSOR_PARALLEL_SIZE=${PREFILL_TENSOR_PARALLEL_SIZE:-1}
 PREFILL_TENSOR_POOL_MEMORY=${PREFILL_TENSOR_POOL_MEMORY:-32}
 
-DECODE_GPUS=${DECODE_GPUS:-1,2,3}
-DECODE_PORTS=${DECODE_PORTS:-20020,20021,20022}
-DECODE_KV_PORTS=${DECODE_KV_PORTS:-20030,20031,20032}
 DECODE_GPU_MEMORY_UTILIZATION=${DECODE_GPU_MEMORY_UTILIZATION:-0.8}
 DECODE_TENSOR_PARALLEL_SIZE=${DECODE_TENSOR_PARALLEL_SIZE:-1}
 DECODE_TENSOR_POOL_MEMORY=${DECODE_TENSOR_POOL_MEMORY:-32}
@@ -62,12 +59,12 @@ DECODE_VLLM_MAX_NUM_BATCHED_TOKENS=${DECODE_VLLM_MAX_NUM_BATCHED_TOKENS:-8192}
 VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-1024}
 
 BENCH_SCRIPT=${BENCH_SCRIPT:-../../../../../../benchmarks/benchmark_serving_trace.py}
-BENCH_MODEL=${BENCH_MODEL:-$MODEL}
+BENCH_MODEL=${BENCH_MODEL:-}
 BENCH_BACKEND=${BENCH_BACKEND:-openai-chat}
 BENCH_ENDPOINT=${BENCH_ENDPOINT:-/v1/chat/completions}
 BENCH_DATASET_NAME=${BENCH_DATASET_NAME:-trace}
 BENCH_MAX_CONCURRENCY=${BENCH_MAX_CONCURRENCY:-1024}
-BENCH_GOODPUT="${BENCH_GOODPUT:-ttft:1000 tpot:50}"
+BENCH_GOODPUT_TTFT_MS=${BENCH_GOODPUT_TTFT_MS:-1000}
 
 BENCH_TEMPERATURE=${BENCH_TEMPERATURE:-0.8}
 BENCH_TOP_P=${BENCH_TOP_P:-0.7}
@@ -79,14 +76,45 @@ SAVE_SAMPLE=${SAVE_SAMPLE:-true}
 BENCH_IGNORE_EOS=${BENCH_IGNORE_EOS:-ignore-eos}
 
 USE_TRACE_TIMESTAMPS=${USE_TRACE_TIMESTAMPS:-true}
-BENCH_REQUEST_RATE_LIST=${BENCH_REQUEST_RATE_LIST:-"8,6"}
-NUM_PROMPTS_LIST=${NUM_PROMPTS_LIST:-"1000"}
-BENCH_MAX_TOKENS_LIST=${BENCH_MAX_TOKENS_LIST:-"8192"}
+PD_RATIO_LIST=${PD_RATIO_LIST:-"2:6,4:4"}
+TPOT_MS_LIST=${TPOT_MS_LIST:-"30,50"}
+
+# PD profile mappings (override these to match your machine layout).
+PD_1P3D_PREFILL_GPUS=${PD_1P3D_PREFILL_GPUS:-0}
+PD_1P3D_PREFILL_PORTS=${PD_1P3D_PREFILL_PORTS:-22001}
+PD_1P3D_PREFILL_KV_PORTS=${PD_1P3D_PREFILL_KV_PORTS:-22011}
+PD_1P3D_DECODE_GPUS=${PD_1P3D_DECODE_GPUS:-1,2,3}
+PD_1P3D_DECODE_PORTS=${PD_1P3D_DECODE_PORTS:-22020,22021,22022}
+PD_1P3D_DECODE_KV_PORTS=${PD_1P3D_DECODE_KV_PORTS:-22032,22033,22034}
+
+PD_2P6D_PREFILL_GPUS=${PD_2P6D_PREFILL_GPUS:-0,1}
+PD_2P6D_PREFILL_PORTS=${PD_2P6D_PREFILL_PORTS:-22001,22002}
+PD_2P6D_PREFILL_KV_PORTS=${PD_2P6D_PREFILL_KV_PORTS:-22011,22012}
+PD_2P6D_DECODE_GPUS=${PD_2P6D_DECODE_GPUS:-2,3,4,5,6,7}
+PD_2P6D_DECODE_PORTS=${PD_2P6D_DECODE_PORTS:-22020,22021,22022,22023,22024,22025}
+PD_2P6D_DECODE_KV_PORTS=${PD_2P6D_DECODE_KV_PORTS:-22032,22033,22034,22035,22036,22037}
+
+PD_4P4D_PREFILL_GPUS=${PD_4P4D_PREFILL_GPUS:-0,1,2,3}
+PD_4P4D_PREFILL_PORTS=${PD_4P4D_PREFILL_PORTS:-22001,22002,22003,22004}
+PD_4P4D_PREFILL_KV_PORTS=${PD_4P4D_PREFILL_KV_PORTS:-22011,22012,22013,22014}
+PD_4P4D_DECODE_GPUS=${PD_4P4D_DECODE_GPUS:-4,5,6,7}
+PD_4P4D_DECODE_PORTS=${PD_4P4D_DECODE_PORTS:-22020,22021,22022,22023}
+PD_4P4D_DECODE_KV_PORTS=${PD_4P4D_DECODE_KV_PORTS:-22032,22033,22034,22035}
+
+# Active runtime assignment is selected by configure_pd_ratio().
+# Initialize with 1:3 profile so cleanup paths always have valid values.
+PREFILL_GPUS="$PD_1P3D_PREFILL_GPUS"
+PREFILL_PORTS="$PD_1P3D_PREFILL_PORTS"
+PREFILL_KV_PORTS="$PD_1P3D_PREFILL_KV_PORTS"
+DECODE_GPUS="$PD_1P3D_DECODE_GPUS"
+DECODE_PORTS="$PD_1P3D_DECODE_PORTS"
+DECODE_KV_PORTS="$PD_1P3D_DECODE_KV_PORTS"
 
 RUN_REPEAT_PER_CONFIG=${RUN_REPEAT_PER_CONFIG:-1}
 SLEEP_BETWEEN_RUNS=${SLEEP_BETWEEN_RUNS:-5}
 
-CACULATE_GOODPUT="${CACULATE_GOODPUT:-tpot:50}"
+BENCH_GOODPUT=""
+CACULATE_GOODPUT=""
 INSTANCE_DOWN_TIMEOUT_SECONDS=${INSTANCE_DOWN_TIMEOUT_SECONDS:-120}
 INSTANCE_HEALTH_CHECK_INTERVAL_SECONDS=${INSTANCE_HEALTH_CHECK_INTERVAL_SECONDS:-5}
 
@@ -108,12 +136,27 @@ DECODE_PIDS=()
 
 CURRENT_BENCH_DATASET_PATH=""
 CURRENT_BENCH_DATASET_LABEL=""
+CURRENT_BENCH_DATASET_TAG=""
 
 BENCHMARK_DIR=""
 CONFIG_DIR=""
 LOG_DIR=""
 RESULT_DIR=""
 MODEL_MT_TAG_FOR_NAME=""
+CURRENT_MODEL_NAME=""
+CURRENT_DATASET_ROOT=""
+CURRENT_PD_RATIO=""
+CURRENT_PD_RATIO_TAG=""
+CURRENT_TPOT_MS=""
+CURRENT_DATASET_SIZE=""
+CURRENT_BENCH_MAX_TOKENS=""
+CURRENT_BENCH_MODEL=""
+RUN_BATCH_TIMESTAMP=${RUN_BATCH_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
+FAILED_CONFIG_LOG=""
+SUMMARY_CSV=""
+
+USER_VLLM_MAX_MODEL_LEN_OVERRIDE=${VLLM_MAX_MODEL_LEN:-}
+USER_PREFILL_VLLM_MAX_NUM_BATCHED_TOKENS_OVERRIDE=${PREFILL_VLLM_MAX_NUM_BATCHED_TOKENS:-}
 
 _CLEANED_UP=0
 
@@ -156,7 +199,7 @@ apply_model_dependent_defaults() {
 
 resolve_model_mt_tag_for_name() {
     local type_lc model_lc test_model_lc
-    type_lc="$(echo "$MODEL_TYPE" | tr '[:upper:]' '[:lower:]')"
+    type_lc="$(echo "$CURRENT_MODEL_NAME" | tr '[:upper:]' '[:lower:]')"
     model_lc="$(echo "$MODEL" | tr '[:upper:]' '[:lower:]')"
     test_model_lc="$(echo "$TEST_MODEL" | tr '[:upper:]' '[:lower:]')"
 
@@ -168,6 +211,229 @@ resolve_model_mt_tag_for_name() {
         # Fallback to current runtime max model len when model family is unclear.
         MODEL_MT_TAG_FOR_NAME="${VLLM_MAX_MODEL_LEN}"
     fi
+}
+
+join_by_comma() {
+    local result=""
+    local item
+    for item in "$@"; do
+        if [[ -z "$result" ]]; then
+            result="$item"
+        else
+            result+=",$item"
+        fi
+    done
+    printf '%s' "$result"
+}
+
+generate_comma_range() {
+    local start="$1"
+    local count="$2"
+    local values=()
+    local index
+    for ((index = 0; index < count; index++)); do
+        values+=("$((start + index))")
+    done
+    join_by_comma "${values[@]}"
+}
+
+generate_port_list() {
+    local base_port="$1"
+    local count="$2"
+    generate_comma_range "$base_port" "$count"
+}
+
+get_selected_model_names() {
+    case "${MODEL_TYPE,,}" in
+        llama)
+            printf '%s\n' "llama"
+            ;;
+        qwen)
+            printf '%s\n' "qwen"
+            ;;
+        all)
+            printf '%s\n%s\n' "llama" "qwen"
+            ;;
+        *)
+            echo "ERROR: unsupported MODEL_TYPE=${MODEL_TYPE}, expected llama/qwen/all"
+            return 1
+            ;;
+    esac
+}
+
+configure_active_model() {
+    local model_name="$1"
+
+    CURRENT_MODEL_NAME="$model_name"
+    case "$model_name" in
+        llama)
+            MODEL="$LLAMA_MODEL_PATH"
+            TEST_MODEL="llama"
+            CURRENT_DATASET_ROOT="${DATASET_BASE_DIR}/llama"
+            ;;
+        qwen)
+            MODEL="$QWEN_MODEL_PATH"
+            TEST_MODEL="qwen"
+            CURRENT_DATASET_ROOT="${DATASET_BASE_DIR}/qwen"
+            ;;
+        *)
+            echo "ERROR: unsupported model_name=${model_name}"
+            return 1
+            ;;
+    esac
+
+    VLLM_MAX_MODEL_LEN="$USER_VLLM_MAX_MODEL_LEN_OVERRIDE"
+    PREFILL_VLLM_MAX_NUM_BATCHED_TOKENS="$USER_PREFILL_VLLM_MAX_NUM_BATCHED_TOKENS_OVERRIDE"
+    apply_model_dependent_defaults
+    resolve_model_mt_tag_for_name
+
+    CURRENT_BENCH_MAX_TOKENS="$MODEL_MT_TAG_FOR_NAME"
+    if [[ -n "$BENCH_MODEL" ]]; then
+        CURRENT_BENCH_MODEL="$BENCH_MODEL"
+    else
+        CURRENT_BENCH_MODEL="$MODEL"
+    fi
+}
+
+configure_pd_ratio() {
+    local pd_ratio="$1"
+    CURRENT_PD_RATIO="$pd_ratio"
+    CURRENT_PD_RATIO_TAG="$(printf '%s' "$pd_ratio" | sed -E 's/^([0-9]+):([0-9]+)$/\1p\2d/')"
+
+    case "$pd_ratio" in
+        1:3)
+            PREFILL_GPUS="$PD_1P3D_PREFILL_GPUS"
+            PREFILL_PORTS="$PD_1P3D_PREFILL_PORTS"
+            PREFILL_KV_PORTS="$PD_1P3D_PREFILL_KV_PORTS"
+            DECODE_GPUS="$PD_1P3D_DECODE_GPUS"
+            DECODE_PORTS="$PD_1P3D_DECODE_PORTS"
+            DECODE_KV_PORTS="$PD_1P3D_DECODE_KV_PORTS"
+            ;;
+        2:6)
+            PREFILL_GPUS="$PD_2P6D_PREFILL_GPUS"
+            PREFILL_PORTS="$PD_2P6D_PREFILL_PORTS"
+            PREFILL_KV_PORTS="$PD_2P6D_PREFILL_KV_PORTS"
+            DECODE_GPUS="$PD_2P6D_DECODE_GPUS"
+            DECODE_PORTS="$PD_2P6D_DECODE_PORTS"
+            DECODE_KV_PORTS="$PD_2P6D_DECODE_KV_PORTS"
+            ;;
+        4:4)
+            PREFILL_GPUS="$PD_4P4D_PREFILL_GPUS"
+            PREFILL_PORTS="$PD_4P4D_PREFILL_PORTS"
+            PREFILL_KV_PORTS="$PD_4P4D_PREFILL_KV_PORTS"
+            DECODE_GPUS="$PD_4P4D_DECODE_GPUS"
+            DECODE_PORTS="$PD_4P4D_DECODE_PORTS"
+            DECODE_KV_PORTS="$PD_4P4D_DECODE_KV_PORTS"
+            ;;
+        *)
+            echo "ERROR: unsupported PD ratio=${pd_ratio}, expected 1:3 / 2:6 / 4:4"
+            return 1
+            ;;
+    esac
+}
+
+configure_tpot() {
+    local tpot_ms="$1"
+    CURRENT_TPOT_MS="$tpot_ms"
+    BENCH_GOODPUT="ttft:${BENCH_GOODPUT_TTFT_MS} tpot:${tpot_ms}"
+    sync_tpot_between_proxy_and_benchmark
+}
+
+resolve_dataset_paths() {
+    local query_dir="$CURRENT_DATASET_ROOT"
+
+    if [[ ! -d "$query_dir" ]]; then
+        echo "ERROR: dataset directory not found: $query_dir"
+        exit 1
+    fi
+
+    mapfile -d '' -t DATASET_PATH_ARRAY < <(find "$query_dir" -type f -name '*.csv' -print0 | sort -z)
+    if [[ ${#DATASET_PATH_ARRAY[@]} -eq 0 ]]; then
+        echo "ERROR: no CSV datasets found under: $query_dir"
+        exit 1
+    fi
+}
+
+log_failed_config() {
+    local reason="$1"
+    mkdir -p "$BASE_RESULT_DIR"
+    if [[ -z "$FAILED_CONFIG_LOG" ]]; then
+        FAILED_CONFIG_LOG="${BASE_RESULT_DIR}/failed_configs_${RUN_BATCH_TIMESTAMP}.log"
+    fi
+    printf '%s | model=%s | dataset=%s | pd=%s | tpot=%sms | reason=%s\n' \
+        "$(date --iso-8601=seconds)" \
+        "$CURRENT_MODEL_NAME" \
+        "$CURRENT_BENCH_DATASET_PATH" \
+        "$CURRENT_PD_RATIO" \
+        "$CURRENT_TPOT_MS" \
+        "$reason" >> "$FAILED_CONFIG_LOG"
+}
+
+csv_escape() {
+    local value="${1:-}"
+    value="${value//\"/\"\"}"
+    printf '"%s"' "$value"
+}
+
+init_summary_csv() {
+    if [[ -z "$SUMMARY_CSV" ]]; then
+        SUMMARY_CSV="${BASE_RESULT_DIR}/summary_${RUN_BATCH_TIMESTAMP}.csv"
+    fi
+    if [[ ! -f "$SUMMARY_CSV" ]]; then
+        printf '%s\n' 'timestamp,status,model,dataset_path,pd_ratio,tpot_ms,repeat_idx,result_dir,failure_reason' > "$SUMMARY_CSV"
+    fi
+}
+
+append_summary_csv() {
+    local status="$1"
+    local repeat_idx="$2"
+    local result_dir="$3"
+    local reason="$4"
+    init_summary_csv
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$(csv_escape "$(date --iso-8601=seconds)")" \
+        "$(csv_escape "$status")" \
+        "$(csv_escape "$CURRENT_MODEL_NAME")" \
+        "$(csv_escape "$CURRENT_BENCH_DATASET_PATH")" \
+        "$(csv_escape "$CURRENT_PD_RATIO")" \
+        "$(csv_escape "${CURRENT_TPOT_MS}")" \
+        "$(csv_escape "$repeat_idx")" \
+        "$(csv_escape "$result_dir")" \
+        "$(csv_escape "$reason")" >> "$SUMMARY_CSV"
+}
+
+check_selected_gpus_idle() {
+    local all_gpu_ids=()
+    local gpu_index memory_used gpu_util
+    local status_output
+    local selected_gpu_lookup="," 
+
+    IFS=',' read -ra _prefill_gpu_array <<< "$PREFILL_GPUS"
+    IFS=',' read -ra _decode_gpu_array <<< "$DECODE_GPUS"
+    all_gpu_ids=("${_prefill_gpu_array[@]}" "${_decode_gpu_array[@]}")
+
+    for gpu_index in "${all_gpu_ids[@]}"; do
+        selected_gpu_lookup+="${gpu_index},"
+    done
+
+    status_output=$(nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits)
+    while IFS=',' read -r gpu_index memory_used gpu_util; do
+        gpu_index="$(echo "$gpu_index" | xargs)"
+        memory_used="$(echo "$memory_used" | xargs)"
+        gpu_util="$(echo "$gpu_util" | xargs)"
+
+        if [[ "$selected_gpu_lookup" != *",${gpu_index},"* ]]; then
+            continue
+        fi
+
+        if [[ "$memory_used" != "0" || "$gpu_util" != "0" ]]; then
+            echo "GPU busy: gpu=${gpu_index}, memory_used_mib=${memory_used}, util_percent=${gpu_util}"
+            log_failed_config "gpu_not_idle(gpu=${gpu_index},memory=${memory_used},util=${gpu_util})"
+            return 1
+        fi
+    done <<< "$status_output"
+
+    return 0
 }
 
 sync_tpot_between_proxy_and_benchmark() {
@@ -215,44 +481,70 @@ array_to_json() {
     printf ']'
 }
 
-resolve_dataset_paths() {
-    local root="$DATASET_BASE_DIR"
-    local query_dir
-    case "$MODEL_TYPE" in
-        llama) query_dir="${root}/llama" ;;
-        qwen) query_dir="${root}/qwen" ;;
-        all|*) query_dir="${root}" ;;
-    esac
+count_csv_records() {
+    local dataset_path="$1"
+    python3 - "$dataset_path" <<'PY'
+import csv
+import sys
 
-    if [[ ! -d "$query_dir" ]]; then
-        echo "ERROR: dataset directory not found: $query_dir"
-        exit 1
-    fi
-
-    # Use NUL-delimited paths to safely handle any special characters.
-    mapfile -d '' -t DATASET_PATH_ARRAY < <(find "$query_dir" -type f -name '*.csv' -print0 | sort -z)
-    if [[ ${#DATASET_PATH_ARRAY[@]} -eq 0 ]]; then
-        echo "ERROR: no CSV datasets found under: $query_dir"
-        exit 1
-    fi
+path = sys.argv[1]
+try:
+    csv.field_size_limit(sys.maxsize)
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        rows = sum(1 for _ in csv.reader(f))
+    print(max(rows - 1, 0))
+except Exception:
+    print("na")
+PY
 }
 
 set_current_dataset() {
     local dataset_path="$1"
     local dataset_file_name
+    local dataset_name_no_ext
+    local dataset_name_norm
+    local parsed_dataset_size
+    local filename_dataset_size
     dataset_file_name="$(basename "$dataset_path")"
+    dataset_name_no_ext="${dataset_file_name%.csv}"
+    dataset_name_norm="$(echo "$dataset_name_no_ext" | tr '[:upper:]' '[:lower:]' | sed 's/_/-/g')"
 
     CURRENT_BENCH_DATASET_PATH="$dataset_path"
-    CURRENT_BENCH_DATASET_LABEL="$(sanitize_name "${dataset_file_name%.csv}")"
+    CURRENT_BENCH_DATASET_LABEL="$(sanitize_name "$dataset_name_no_ext")"
+
+    case "$dataset_name_norm" in
+        *lmsys-chat*|*lmsys*)
+            CURRENT_BENCH_DATASET_TAG="${CURRENT_MODEL_NAME}-lmsys-chat"
+            ;;
+        *mysharegpt*|*sharegpt*)
+            CURRENT_BENCH_DATASET_TAG="${CURRENT_MODEL_NAME}-mysharegpt"
+            ;;
+        *)
+            CURRENT_BENCH_DATASET_TAG="${CURRENT_MODEL_NAME}-$(echo "$dataset_name_norm" | sed 's/[^a-z0-9-]/-/g')"
+            ;;
+    esac
+
+    filename_dataset_size=""
+    if [[ "$dataset_file_name" =~ (^|[_-])n([0-9]+)([_-]|\.) ]]; then
+        filename_dataset_size="${BASH_REMATCH[2]}"
+    fi
+
+    # Prefer real CSV record count (header excluded), not raw line count.
+    parsed_dataset_size="$(count_csv_records "$dataset_path")"
+    if [[ "$parsed_dataset_size" =~ ^[0-9]+$ ]]; then
+        CURRENT_DATASET_SIZE="$parsed_dataset_size"
+    elif [[ -n "$filename_dataset_size" ]]; then
+        CURRENT_DATASET_SIZE="$filename_dataset_size"
+    else
+        CURRENT_DATASET_SIZE="na"
+    fi
 }
 
 setup_directories() {
-    local req_rate="$1"
-    local max_tokens="$2"
-    local timestamp="$3"
-    local repeat_idx="$4"
+    local timestamp="$1"
+    local repeat_idx="$2"
 
-    BENCHMARK_DIR="${BASE_RESULT_DIR}/benchmark_ds${CURRENT_BENCH_DATASET_LABEL}_rr${req_rate}_mt${MODEL_MT_TAG_FOR_NAME}_${timestamp}_rep${repeat_idx}"
+    BENCHMARK_DIR="${BASE_RESULT_DIR}/${CURRENT_MODEL_NAME}_${CURRENT_BENCH_DATASET_TAG}_n${CURRENT_DATASET_SIZE}_pd${CURRENT_PD_RATIO_TAG}_tpot${CURRENT_TPOT_MS}ms_rep${repeat_idx}_${timestamp}"
     CONFIG_DIR="${BENCHMARK_DIR}/config"
     LOG_DIR="${BENCHMARK_DIR}/log"
     RESULT_DIR="${BENCHMARK_DIR}/dataset_result"
@@ -282,8 +574,8 @@ check_num_gpus() {
     fi
     local num_gpus
     num_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
-    if [[ "$num_gpus" -lt 2 ]]; then
-        echo "ERROR: need at least 2 GPUs, found $num_gpus"
+    if [[ "$num_gpus" -lt 8 ]]; then
+        echo "ERROR: need at least 8 GPUs for configured PD ratios 1:3, 2:6, 4:4, found $num_gpus"
         exit 1
     fi
 }
@@ -296,20 +588,21 @@ ensure_python_library_installed() {
 }
 
 dump_config_json() {
-    local req_rate="$1"
-    local max_tokens="$2"
-    local repeat_idx="$3"
-    local ts="$4"
+        local repeat_idx="$1"
+        local ts="$2"
     local cfgfile="${CONFIG_DIR}/config_${ts}.json"
 
     cat > "$cfgfile" <<EOF
 {
   "generated_at": "$(date --iso-8601=seconds)",
-  "model_type": "${MODEL_TYPE}",
+    "selected_model_type": "${MODEL_TYPE}",
+    "current_model_name": "${CURRENT_MODEL_NAME}",
   "model": "${MODEL}",
   "test_model": "${TEST_MODEL}",
   "dataset_path": "${CURRENT_BENCH_DATASET_PATH}",
   "dataset_label": "${CURRENT_BENCH_DATASET_LABEL}",
+    "pd_ratio": "${CURRENT_PD_RATIO}",
+    "tpot_ms": ${CURRENT_TPOT_MS},
   "timeout_seconds": ${TIMEOUT_SECONDS},
   "proxy_port": ${PROXY_PORT},
   "bench_port": ${BENCH_PORT},
@@ -341,11 +634,12 @@ dump_config_json() {
   },
   "benchmark": {
     "bench_script": "${BENCH_SCRIPT}",
+        "bench_model": "${CURRENT_BENCH_MODEL}",
     "backend": "${BENCH_BACKEND}",
     "endpoint": "${BENCH_ENDPOINT}",
     "dataset_name": "${BENCH_DATASET_NAME}",
-    "request_rate": "${req_rate}",
-    "maxtokenscustom": ${max_tokens},
+        "request_rate": "trace",
+        "maxtokenscustom": ${CURRENT_BENCH_MAX_TOKENS},
     "repeat_idx": ${repeat_idx},
     "save_output": "${SAVE_OUTPUT}",
     "save_sample": "${SAVE_SAMPLE}",
@@ -633,23 +927,21 @@ run_benchmark_with_health_guard() {
 }
 
 run_one_benchmark() {
-    local req_rate="$1"
-    local max_tokens="$2"
-    local repeat_idx="$3"
-    local timestamp="$4"
-    local log_file="${LOG_DIR}/bench_rr${req_rate}_mt${MODEL_MT_TAG_FOR_NAME}_rep${repeat_idx}.log"
+    local repeat_idx="$1"
+    local timestamp="$2"
+    local log_file="${LOG_DIR}/bench_trace_pd${CURRENT_PD_RATIO_TAG}_tpot${CURRENT_TPOT_MS}ms_mt${MODEL_MT_TAG_FOR_NAME}_rep${repeat_idx}.log"
 
     local bench_cmd=(
         python3 "$BENCH_SCRIPT"
         --backend "$BENCH_BACKEND"
         --port "$BENCH_PORT"
         --endpoint "$BENCH_ENDPOINT"
-        --model "$BENCH_MODEL"
+        --model "$CURRENT_BENCH_MODEL"
         --dataset-name "$BENCH_DATASET_NAME"
         --dataset-path "$CURRENT_BENCH_DATASET_PATH"
         --save-output "$SAVE_OUTPUT"
         --out-path "$RESULT_DIR"
-        --maxtokenscustom "$max_tokens"
+        --maxtokenscustom "$CURRENT_BENCH_MAX_TOKENS"
         --seed "$VLLM_SEED"
         --max-concurrency "$BENCH_MAX_CONCURRENCY"
         --temperature "$BENCH_TEMPERATURE"
@@ -662,15 +954,6 @@ run_one_benchmark() {
     if [[ -n "$BENCH_GOODPUT" ]]; then
         read -r -a goodput_arr <<< "$BENCH_GOODPUT"
         bench_cmd+=(--goodput "${goodput_arr[@]}")
-    fi
-
-    if ! is_true "$USE_TRACE_TIMESTAMPS"; then
-        bench_cmd+=(--request-rate "$req_rate")
-    fi
-
-    if [[ "$BENCH_DATASET_NAME" != "trace" && "$BENCH_DATASET_NAME" != "lmsyschat" ]]; then
-        IFS=',' read -ra NUM_PROMPTS_ARRAY <<< "$NUM_PROMPTS_LIST"
-        bench_cmd+=(--num-prompts "${NUM_PROMPTS_ARRAY[0]}")
     fi
 
     if [[ -n "$BENCH_IGNORE_EOS" ]]; then
@@ -702,6 +985,7 @@ run_one_benchmark() {
 
     if [[ "$bench_exit_code" -ne 0 ]]; then
         echo "ERROR: benchmark failed with exit code ${bench_exit_code}"
+        log_failed_config "benchmark_exit_code=${bench_exit_code}"
         return "$bench_exit_code"
     fi
 
@@ -716,9 +1000,6 @@ main() {
     # aborts the remaining datasets. Individual error paths use explicit checks.
     set +e
 
-    apply_model_dependent_defaults
-    resolve_model_mt_tag_for_name
-    sync_tpot_between_proxy_and_benchmark
     check_required_files
     check_num_gpus
 
@@ -727,84 +1008,120 @@ main() {
     ensure_python_library_installed vllm
     ensure_python_library_installed quart
 
-    resolve_dataset_paths
+    mkdir -p "$BASE_RESULT_DIR"
+    FAILED_CONFIG_LOG="${BASE_RESULT_DIR}/failed_configs_${RUN_BATCH_TIMESTAMP}.log"
+    SUMMARY_CSV="${BASE_RESULT_DIR}/summary_${RUN_BATCH_TIMESTAMP}.csv"
+    init_summary_csv
 
-    echo "Found ${#DATASET_PATH_ARRAY[@]} dataset(s)."
-    for i in "${!DATASET_PATH_ARRAY[@]}"; do
-        echo "  [$((i + 1))/${#DATASET_PATH_ARRAY[@]}] ${DATASET_PATH_ARRAY[$i]}"
-    done
-    echo "MODEL=${MODEL}"
-    echo "VLLM_DTYPE=${VLLM_DTYPE}"
-    echo "VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN}"
-    echo "MODEL_MT_TAG_FOR_NAME=${MODEL_MT_TAG_FOR_NAME}"
-    echo "PREFILL_VLLM_MAX_NUM_BATCHED_TOKENS=${PREFILL_VLLM_MAX_NUM_BATCHED_TOKENS}"
-    echo "DECODE_VLLM_MAX_NUM_BATCHED_TOKENS=${DECODE_VLLM_MAX_NUM_BATCHED_TOKENS}"
-
-    IFS=',' read -ra REQUEST_RATE_ARRAY <<< "$BENCH_REQUEST_RATE_LIST"
-    IFS=',' read -ra MAX_TOKENS_ARRAY <<< "$BENCH_MAX_TOKENS_LIST"
-    if is_true "$USE_TRACE_TIMESTAMPS"; then
-        REQUEST_RATE_ARRAY=("trace")
-    fi
+    mapfile -t SELECTED_MODEL_ARRAY < <(get_selected_model_names)
+    IFS=',' read -ra PD_RATIO_ARRAY <<< "$PD_RATIO_LIST"
+    IFS=',' read -ra TPOT_ARRAY <<< "$TPOT_MS_LIST"
 
     local failed=0
-    local total_datasets="${#DATASET_PATH_ARRAY[@]}"
+    local total_datasets=0
+    local model_name pd_ratio tpot_ms dataset_idx dataset_path repeat_idx timestamp code
 
-    for dataset_idx in "${!DATASET_PATH_ARRAY[@]}"; do
-        local dataset_path="${DATASET_PATH_ARRAY[$dataset_idx]}"
-        set_current_dataset "$dataset_path"
-        local dataset_should_skip=false
+    for model_name in "${SELECTED_MODEL_ARRAY[@]}"; do
+        if ! configure_active_model "$model_name"; then
+            failed=$((failed + 1))
+            continue
+        fi
+
+        resolve_dataset_paths
+        total_datasets="${#DATASET_PATH_ARRAY[@]}"
 
         echo "============================================================"
-        echo "Dataset [$((dataset_idx + 1))/${total_datasets}]: ${CURRENT_BENCH_DATASET_PATH}"
+        echo "Model=${CURRENT_MODEL_NAME}"
+        echo "Dataset root=${CURRENT_DATASET_ROOT}"
+        echo "Found ${total_datasets} dataset(s)."
+        for dataset_idx in "${!DATASET_PATH_ARRAY[@]}"; do
+            echo "  [$((dataset_idx + 1))/${total_datasets}] ${DATASET_PATH_ARRAY[$dataset_idx]}"
+        done
+        echo "MODEL=${MODEL}"
+        echo "VLLM_DTYPE=${VLLM_DTYPE}"
+        echo "VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN}"
+        echo "MODEL_MT_TAG_FOR_NAME=${MODEL_MT_TAG_FOR_NAME}"
+        echo "PREFILL_VLLM_MAX_NUM_BATCHED_TOKENS=${PREFILL_VLLM_MAX_NUM_BATCHED_TOKENS}"
+        echo "DECODE_VLLM_MAX_NUM_BATCHED_TOKENS=${DECODE_VLLM_MAX_NUM_BATCHED_TOKENS}"
+        echo "PD_RATIO_LIST=${PD_RATIO_LIST}"
+        echo "TPOT_MS_LIST=${TPOT_MS_LIST}"
         echo "============================================================"
 
-        for req_rate in "${REQUEST_RATE_ARRAY[@]}"; do
-            [[ "$dataset_should_skip" == true ]] && break
-            for max_tokens in "${MAX_TOKENS_ARRAY[@]}"; do
-                [[ "$dataset_should_skip" == true ]] && break
-                for repeat_idx in $(seq 1 "$RUN_REPEAT_PER_CONFIG"); do
-                    [[ "$dataset_should_skip" == true ]] && break
+        for pd_ratio in "${PD_RATIO_ARRAY[@]}"; do
+            pd_ratio="$(echo "$pd_ratio" | xargs)"
+            [[ -z "$pd_ratio" ]] && continue
+            if ! configure_pd_ratio "$pd_ratio"; then
+                failed=$((failed + 1))
+                continue
+            fi
 
-                    local timestamp
-                    timestamp=$(date +%Y%m%d_%H%M%S)
+            for tpot_ms in "${TPOT_ARRAY[@]}"; do
+                tpot_ms="$(echo "$tpot_ms" | xargs)"
+                [[ -z "$tpot_ms" ]] && continue
+                configure_tpot "$tpot_ms"
 
-                    setup_directories "$req_rate" "$max_tokens" "$timestamp" "$repeat_idx"
-                    dump_config_json "$req_rate" "$max_tokens" "$repeat_idx" "$timestamp"
+                for dataset_idx in "${!DATASET_PATH_ARRAY[@]}"; do
+                    dataset_path="${DATASET_PATH_ARRAY[$dataset_idx]}"
+                    set_current_dataset "$dataset_path"
 
-                    echo "Run: dataset=${CURRENT_BENCH_DATASET_LABEL}, rate=${req_rate}, max_tokens=${max_tokens}, repeat=${repeat_idx}/${RUN_REPEAT_PER_CONFIG}"
+                    echo "============================================================"
+                    echo "Model=${CURRENT_MODEL_NAME} Dataset [$((dataset_idx + 1))/${total_datasets}]: ${CURRENT_BENCH_DATASET_PATH}"
+                    echo "PD=${CURRENT_PD_RATIO} TPOT=${CURRENT_TPOT_MS}ms"
+                    echo "============================================================"
 
-                    if ! start_servers "$timestamp"; then
-                        echo "ERROR: failed to start servers"
-                        failed=$((failed + 1))
-                        stop_servers
-                        continue
-                    fi
+                    for repeat_idx in $(seq 1 "$RUN_REPEAT_PER_CONFIG"); do
+                        timestamp=$(date +%Y%m%d_%H%M%S)
 
-                    if run_one_benchmark "$req_rate" "$max_tokens" "$repeat_idx" "$timestamp"; then
-                        echo "Benchmark finished successfully"
-                    else
-                        local code=$?
-                        if [[ "$code" -eq 2 ]]; then
-                            dataset_should_skip=true
+                        if ! check_selected_gpus_idle; then
+                            echo "SKIP: GPUs are not idle for model=${CURRENT_MODEL_NAME}, pd=${CURRENT_PD_RATIO}, tpot=${CURRENT_TPOT_MS}ms, dataset=${CURRENT_BENCH_DATASET_PATH}"
                             failed=$((failed + 1))
-                        else
-                            failed=$((failed + 1))
+                            append_summary_csv "skipped_gpu_busy" "$repeat_idx" "" "gpu_not_idle"
+                            sleep "$SLEEP_BETWEEN_RUNS"
+                            continue
                         fi
-                    fi
 
-                    stop_servers
+                        setup_directories "$timestamp" "$repeat_idx"
+                        dump_config_json "$repeat_idx" "$timestamp"
 
-                    local all_ports=()
-                    IFS=',' read -ra PREFILL_PORT_ARRAY <<< "$PREFILL_PORTS"
-                    IFS=',' read -ra DECODE_PORT_ARRAY <<< "$DECODE_PORTS"
-                    all_ports+=("${PROXY_PORT}")
-                    all_ports+=("${PREFILL_PORT_ARRAY[@]}")
-                    all_ports+=("${DECODE_PORT_ARRAY[@]}")
-                    for p in "${all_ports[@]}"; do
-                        wait_for_port_free "$p" 15 || true
+                        echo "Run: model=${CURRENT_MODEL_NAME}, dataset=${CURRENT_BENCH_DATASET_LABEL}, pd=${CURRENT_PD_RATIO}, tpot=${CURRENT_TPOT_MS}ms, repeat=${repeat_idx}/${RUN_REPEAT_PER_CONFIG}"
+
+                        if ! start_servers "$timestamp"; then
+                            echo "ERROR: failed to start servers"
+                            log_failed_config "start_servers_failed"
+                            failed=$((failed + 1))
+                            append_summary_csv "start_failed" "$repeat_idx" "$BENCHMARK_DIR" "start_servers_failed"
+                            stop_servers
+                            continue
+                        fi
+
+                        if run_one_benchmark "$repeat_idx" "$timestamp"; then
+                            echo "Benchmark finished successfully"
+                            append_summary_csv "success" "$repeat_idx" "$BENCHMARK_DIR" ""
+                        else
+                            code=$?
+                            failed=$((failed + 1))
+                            if [[ "$code" -eq 2 ]]; then
+                                echo "Benchmark stopped due to instance health failure"
+                                append_summary_csv "benchmark_failed" "$repeat_idx" "$BENCHMARK_DIR" "instance_health_failure"
+                            else
+                                append_summary_csv "benchmark_failed" "$repeat_idx" "$BENCHMARK_DIR" "benchmark_exit_code=${code}"
+                            fi
+                        fi
+
+                        stop_servers
+
+                        local all_ports=()
+                        IFS=',' read -ra PREFILL_PORT_ARRAY <<< "$PREFILL_PORTS"
+                        IFS=',' read -ra DECODE_PORT_ARRAY <<< "$DECODE_PORTS"
+                        all_ports+=("${PROXY_PORT}")
+                        all_ports+=("${PREFILL_PORT_ARRAY[@]}")
+                        all_ports+=("${DECODE_PORT_ARRAY[@]}")
+                        for p in "${all_ports[@]}"; do
+                            wait_for_port_free "$p" 15 || true
+                        done
+
+                        sleep "$SLEEP_BETWEEN_RUNS"
                     done
-
-                    sleep "$SLEEP_BETWEEN_RUNS"
                 done
             done
         done
@@ -814,6 +1131,8 @@ main() {
     echo "Evaluation finished"
     echo "Failed runs: $failed"
     echo "Results root: $(realpath "$BASE_RESULT_DIR")"
+    echo "Failed config log: $FAILED_CONFIG_LOG"
+    echo "Summary CSV: $SUMMARY_CSV"
     echo "============================================================"
 }
 

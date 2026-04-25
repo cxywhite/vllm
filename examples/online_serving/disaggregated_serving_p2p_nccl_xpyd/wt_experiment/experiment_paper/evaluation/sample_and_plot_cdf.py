@@ -1,3 +1,66 @@
+"""
+脚本作用
+--------
+从一个或多个输入 CSV 中按指定数量做“无放回随机采样”，并输出：
+1) 采样后的 CSV
+2) 输入/输出长度统计文本（min/max/mean/p50/p90/p95/p99）
+3) 输入/输出长度 CDF 图
+
+另外可选按 req_id 联动提取 qwen 侧对应样本，并同样输出 CSV/统计/CDF。
+
+用法
+----
+1) 常用最小示例（处理默认两个输入 CSV）
+python sample_and_plot_cdf.py \
+    --sample-size 2262 \
+    --output-dir /root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/dataset/test_dataset
+
+2) 完整参数示例（覆盖全部参数）
+python sample_and_plot_cdf.py \
+    --input-csv \
+        /root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/dataset/dataset/llama-lmsys-chat-updated.csv \
+        /root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/dataset/dataset/llama-mysharegpt-updated.csv \
+    --sample-size 2262 \
+    --output-dir /root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/dataset/test_dataset \
+    --seed 42 \
+    --input-len-col prompt_len \
+    --output-len-col output_tokens \
+    --chunksize 200000 \
+    --paired-qwen-csv /root/predict-schedule/vllm/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/wt_experiment/dataset/dataset/qwen-lmsys-chat-updated.csv \
+    --req-id-col req_id \
+    --qwen-req-id-col req_id \
+    --qwen-input-len-col prompt_len \
+    --qwen-output-len-col output_tokens \
+    --filter-arrow-dataset /root/myshare/predict_project/act_predictor_train/llama_dataset/llama_4_sample_range_50_lens_compute_means_and_probabilities_20250603_121645
+
+参数说明
+--------
+--input-csv
+    输入 CSV 列表；可传多个路径。默认是 lmsys-chat + mysharegpt 两个 llama CSV。
+--sample-size
+    每个输入 CSV 的采样条数（必填，且不放回）。
+--output-dir
+    输出目录，保存 sampled_*.csv、length_stats_*.txt、length_cdf_*.png。
+--seed
+    随机种子。
+--input-len-col / --output-len-col
+    输入/输出长度列名；不确定时可用默认并让脚本自动识别。
+--chunksize
+    分块读取 CSV 的块大小，用于大文件降内存。
+--paired-qwen-csv
+    指定 qwen 配对 CSV；不传则按命名规则自动推断。
+--req-id-col
+    llama 侧 req_id 列名。
+--qwen-req-id-col
+    qwen 侧 req_id 列名；默认与 --req-id-col 相同。
+--qwen-input-len-col / --qwen-output-len-col
+    qwen 侧输入/输出长度列名。
+--disable-reqid-pairing
+    关闭 qwen 侧 req_id 联动提取，仅处理 llama 采样。
+--filter-arrow-dataset
+    Arrow 数据集路径；用于对默认 lmsys-chat 输入先做“按 id 排除”再采样。
+"""
+
 import argparse
 from datetime import datetime
 from pathlib import Path

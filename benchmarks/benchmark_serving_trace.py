@@ -37,6 +37,20 @@ On the client side, run:
     when using tgi backend, add
         --endpoint /generate_stream
     to the end of the command above.
+
+按时间戳发送请求的代码执行链（trace 回放）:
+1. main() 读取 trace CSV 的 timestamp 列并按 timestamp 稳定排序。
+2. 将 timestamp 从毫秒转换为秒，填充到 request_timestamps。
+3. benchmark() 检测到 request_timestamps 后，切换到 get_request_from_timestamps()。
+4. get_request_from_timestamps() 以首条 timestamp 为基准，计算每条请求目标偏移并 sleep 到点后发送。
+5. 发送时记录 input_timestamp_ms 与 send_timestamp_ms，gather 后回填到 outputs 供 CSV 导出。
+
+请求结果收集与保存顺序:
+1. 请求在发送循环中按顺序创建 asyncio task 并追加到 tasks。
+2. 结果通过 asyncio.gather(*tasks) 一次性收集，返回顺序与 tasks 创建顺序一致。
+3. 因此不是“先完成先收集”，而是“按任务创建顺序收集”。
+4. save_test_outputs() 按 outputs 顺序逐行写入 CSV，不做额外排序。
+5. 在 trace 模式下，因任务创建顺序通常与 timestamp 顺序一致，落盘顺序通常也与 timestamp 顺序一致。
 """
 
 import argparse
@@ -425,6 +439,7 @@ async def benchmark(
     distribution = "Poisson process" if burstiness == 1.0 else "Gamma distribution"
 
     if request_timestamps is not None:
+        # [wt] 进入 trace 回放模式: 后续由输入时间戳控制请求发送节奏。
         print("Traffic replay mode: sending requests according to dataset timestamps.")
     elif ramp_up_strategy is not None:
         print(
@@ -470,6 +485,7 @@ async def benchmark(
         requests: list[SampleRequest],
         timestamps: list[float],
     ):
+        # [wt] 时间戳回放核心逻辑: 基于输入 timestamp 计算目标发送时刻并等待到点发送。
         if len(requests) != len(timestamps):
             raise ValueError(
                 "Length mismatch between input requests and timestamps "
@@ -479,31 +495,42 @@ async def benchmark(
         if not timestamps:
             return
 
+        # [wt] 以首条请求时间作为相对时间原点，避免依赖绝对 wall-clock。
         base_ts = float(timestamps[0])
         start_time = time.perf_counter()
         for request, ts in zip(requests, timestamps):
+            # [wt] 目标偏移=当前请求时间-首条时间；sleep 到该偏移后立即发送。
             target_offset = max(0.0, float(ts) - base_ts)
             elapsed = time.perf_counter() - start_time
             sleep_time = target_offset - elapsed
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
-            yield request, request_rate
+            # Yield source timestamp (seconds) so caller can persist it.
+            yield request, request_rate, float(ts)
 
-    if request_timestamps is not None:
-        request_generator = get_request_from_timestamps(
-            input_requests, request_timestamps
-        )
-    else:
-        request_generator = get_request(
+    async def get_request_without_input_timestamps():
+        async for request, current_request_rate in get_request(
             input_requests,
             request_rate,
             burstiness,
             ramp_up_strategy,
             ramp_up_start_rps,
             ramp_up_end_rps,
-        )
+        ):
+            yield request, current_request_rate, None
 
-    async for request, current_request_rate in request_generator:
+    if request_timestamps is not None:
+        # [wt] 有输入时间戳时，使用“按时间戳发送”的请求生成器。
+        request_generator = get_request_from_timestamps(
+            input_requests, request_timestamps
+        )
+    else:
+        request_generator = get_request_without_input_timestamps()
+
+    send_timestamps_ms: list[int] = []
+    input_timestamps_ms: list[Optional[int]] = []
+
+    async for request, current_request_rate, input_timestamp_s in request_generator:
         if ramp_up_strategy is not None:
             current_int_rps = int(current_request_rate)
             if current_int_rps > last_int_rps:
@@ -556,10 +583,37 @@ async def benchmark(
             extra_body=sampling_params,
             req_id=request.req_id
         )
+
+        # [wt] 记录两类时间戳:
+        # [wt] 1) input_timestamp_ms: 输入数据中的原始时间戳（回放目标）
+        # [wt] 2) send_timestamp_ms: 客户端实际发起请求任务的时刻
+        send_timestamp_ms = int(time.time() * MILLISECONDS_TO_SECONDS_CONVERSION)
+        input_timestamp_ms = (
+            int(round(float(input_timestamp_s) * MILLISECONDS_TO_SECONDS_CONVERSION))
+            if input_timestamp_s is not None
+            else None
+        )
+        request_func_input.send_timestamp_ms = send_timestamp_ms
+        request_func_input.input_timestamp_ms = (
+            "" if input_timestamp_ms is None else input_timestamp_ms
+        )
+        send_timestamps_ms.append(send_timestamp_ms)
+        input_timestamps_ms.append(input_timestamp_ms)
         
         task = limited_request_func(request_func_input=request_func_input, pbar=pbar)
         tasks.append(asyncio.create_task(task))
     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+
+    if len(outputs) != len(send_timestamps_ms):
+        raise RuntimeError(
+            "Internal error: outputs count does not match send timestamp records."
+        )
+
+    # [wt] 回填输入/发送时间戳到输出对象，确保结果导出阶段可直接落盘。
+    for output, send_ts, input_ts in zip(outputs, send_timestamps_ms, input_timestamps_ms):
+        output.send_timestamp_ms = send_ts
+        output.input_timestamp_ms = "" if input_ts is None else input_ts
+
     # if args.save_output:
     #     result_paths = save_outputs_grouped_csv_by_base_reqid(outputs, out_path=args.out_path,run_config=vars(args))
     #     print("Saved:", result_paths)
@@ -885,6 +939,7 @@ def main(args: argparse.Namespace):
         args.dataset_path,
     )
 
+    # [wt] 时间戳回放链路入口: 初始化时间戳容器，仅在 trace 数据集场景填充。
     request_timestamps: Optional[list[float]] = None
     trace_timestamp_scale = 1.0
 
@@ -893,13 +948,13 @@ def main(args: argparse.Namespace):
             # 读取指定csv文件
             df = pd.read_csv(args.dataset_path)
             if args.dataset_name == "trace":
-                # trace timestamps are in milliseconds; convert to seconds for replay.
+                # [wt] trace 的 timestamp 原始单位是毫秒，回放调度统一换算为秒。
                 trace_timestamp_scale = 1e-3
                 if "timestamp" not in df.columns:
                     raise ValueError(
                         "trace dataset must include a 'timestamp' column."
                     )
-                # Trace replay should preserve chronological request order.
+                # [wt] 按 timestamp 稳定排序，确保请求严格按时间顺序回放。
                 df = df.sort_values("timestamp", kind="stable").reset_index(drop=True)
                 # if args.num_prompts is not None and args.num_prompts > 0:
                 #     df = df.head(args.num_prompts)
@@ -909,6 +964,7 @@ def main(args: argparse.Namespace):
             # df = df.head(args.num_prompts)
             input_requests: List[SampleRequest] = []
             if "timestamp" in df.columns:
+                # [wt] 初始化输入时间戳列表，并与 input_requests 保持一一对应。
                 request_timestamps = []
 
             for idx, row in df.iterrows():
@@ -962,6 +1018,7 @@ def main(args: argparse.Namespace):
                         f"top_k={top_k}, repetition_penalty={repetition_penalty}")
                 
                 if request_timestamps is not None:
+                    # [wt] 收集每条请求的输入 timestamp（秒），供发送阶段调度。
                     request_timestamps.append(float(row["timestamp"]) * trace_timestamp_scale)
             # 打印前几条请求进行验证
             for i, req in enumerate(input_requests[:12]):

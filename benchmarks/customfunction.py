@@ -231,7 +231,7 @@ def save_test_outputs(
     csv_path = base_dir / csv_filename
 
     # CSV header
-    header = ["req_id","send_timestamp_ms","prompt","prompt_len","output_tokens","expect_output_len",
+    header = ["req_id","input_timestamp_ms","send_timestamp_ms","prompt","prompt_len","output_tokens","expect_output_len",
               "temperature","top_p","top_k","repetition_penalty","latency",
               "ttft","tpot","itl"]
 
@@ -243,6 +243,7 @@ def save_test_outputs(
         
         for out in outputs:
             req_id = getattr(out, "req_id", "unknown")
+            input_timestamp_ms = getattr(out, "input_timestamp_ms", "")
             send_timestamp_ms = getattr(out, "send_timestamp_ms", "")
             prompt = getattr(out, "prompt", "")
             prompt_len = getattr(out, "prompt_len", 0)
@@ -266,6 +267,7 @@ def save_test_outputs(
 
             writer.writerow([
                 req_id,
+                input_timestamp_ms,
                 send_timestamp_ms,
                 prompt,
                 prompt_len,
@@ -416,7 +418,7 @@ def save_full_outputs(
     csv_path = base_dir / csv_filename
     json_path = base_dir / json_filename
     # CSV header
-    header = ["req_id", "send_timestamp_ms", "output_tokens","expect_output_len","prompt","prompt_len","generated_text","success","latency","ttft","itl","tpot","error"]
+    header = ["req_id", "input_timestamp_ms", "send_timestamp_ms", "output_tokens","expect_output_len","prompt","prompt_len","generated_text","success","latency","ttft","itl","tpot","error"]
 
     # 写 CSV
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -424,6 +426,7 @@ def save_full_outputs(
         writer.writerow(header)
         for out in outputs:
             req_id = getattr(out, "req_id", "unknown")
+            input_timestamp_ms = getattr(out, "input_timestamp_ms", "")
             send_timestamp_ms = getattr(out, "send_timestamp_ms", "")
             output_tokens = getattr(out, "output_tokens", 0)
             expect_output_len = getattr(out, "expect_output_len", 0)
@@ -438,6 +441,7 @@ def save_full_outputs(
             error = getattr(out, "error", "")
             writer.writerow([
                 req_id,
+                input_timestamp_ms,
                 send_timestamp_ms,
                 output_tokens,
                 expect_output_len,

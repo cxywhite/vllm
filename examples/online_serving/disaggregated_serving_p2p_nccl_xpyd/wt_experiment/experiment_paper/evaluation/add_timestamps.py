@@ -1,13 +1,30 @@
 #!/usr/bin/env python3
 """
-为 evaluation_dataset 中的评估数据集添加 timestamp 列。
+脚本作用
+--------
+为 `evaluation_dataset` 中的评估 CSV 补齐或覆盖 `timestamp` 列。
+时间戳来源于 `select` 目录中的原始 trace，统一转换为毫秒整数后写回。
 
-读取 select/ 目录下各 trace 类型的原始时间戳，按照 trace_utils.py 中的逻辑
-统一转换为毫秒，然后写入 evaluation_dataset/ 下对应 trace 类型子目录中的
-所有 CSV 数据集（llama 和 qwen）。
+关键行为
+--------
+1. 严格校验“请求数量一致”：目标 CSV 的唯一请求数必须与 trace 时间戳数量完全一致，
+   不一致立即报错，防止错位写入。
+2. 一个请求只对应一个时间戳：同一请求若出现多行，所有行共享同一个 timestamp。
+3. 已有 `timestamp` 列会覆盖；没有则插入到第 2 列（`req_id` 后）。
+4. 支持 dry-run，仅打印检查结果，不落盘。
 
-使用方式:
-    python add_timestamps.py [--dry-run]
+用法
+----
+1) 正式写入
+    python add_timestamps.py
+
+2) 仅检查不写入（推荐先跑）
+    python add_timestamps.py --dry-run
+
+参数说明
+--------
+--dry-run
+  只执行读取、数量校验和打印，不修改任何文件。
 """
 
 import argparse
@@ -127,6 +144,33 @@ def format_timestamp_for_output(trace_type: str, timestamp_ms: float):
 
 # ── 给 CSV 添加 timestamp 列 ─────────────────────────────────────────
 
+REQ_ID_CANDIDATES = [
+    "req_id",
+    "request_id",
+    "ReqId",
+    "RequestId",
+    "id",
+]
+
+
+def _pick_request_id_column(columns: list[str]) -> str:
+    for name in REQ_ID_CANDIDATES:
+        if name in columns:
+            return name
+    raise ValueError(
+        "无法识别请求ID列，请确保CSV包含以下任一列: "
+        + ", ".join(REQ_ID_CANDIDATES)
+    )
+
+
+def _normalize_req_id_series(series, pd_module):
+    text = series.astype("string").str.strip()
+    numeric = pd_module.to_numeric(series, errors="coerce")
+    int_like_mask = numeric.notna() & (numeric % 1 == 0)
+    int_like_text = numeric.astype("Int64").astype("string")
+    text = text.mask(int_like_mask, int_like_text)
+    return text.fillna("")
+
 def add_timestamp_to_csv(csv_path: Path, timestamps_ms: list[float], trace_type: str, dry_run: bool = False):
     """读取 CSV，添加 timestamp 列后覆盖写回"""
     import pandas as pd
@@ -134,23 +178,42 @@ def add_timestamp_to_csv(csv_path: Path, timestamps_ms: list[float], trace_type:
     df = pd.read_csv(csv_path)
     n_rows = len(df)
     n_ts = len(timestamps_ms)
+    req_id_col = _pick_request_id_column(list(df.columns))
+    req_ids_norm = _normalize_req_id_series(df[req_id_col], pd)
 
-    if n_rows != n_ts:
+    if (req_ids_norm == "").any():
+        bad_rows = (req_ids_norm == "").sum()
         raise ValueError(
-            f"行数不匹配: {csv_path.name} 有 {n_rows} 行, "
+            f"请求ID列存在空值: {req_id_col} (空值行数={bad_rows})"
+        )
+
+    unique_req_ids = req_ids_norm.drop_duplicates(keep="first").tolist()
+    n_requests = len(unique_req_ids)
+
+    if n_requests != n_ts:
+        raise ValueError(
+            f"请求数不匹配: {csv_path.name} 有 {n_requests} 个唯一请求, "
             f"但 trace 有 {n_ts} 个时间戳"
         )
 
-    # 格式化时间戳
+    # 格式化时间戳并按“请求ID首次出现顺序”建立映射。
     formatted = [format_timestamp_for_output(trace_type, ts) for ts in timestamps_ms]
+    request_to_timestamp = dict(zip(unique_req_ids, formatted))
+    mapped_timestamp = req_ids_norm.map(request_to_timestamp)
 
     # 将 timestamp 插入为第二列 (req_id 之后)
     if "timestamp" in df.columns:
-        df["timestamp"] = formatted
-        print(f"  [更新] {csv_path.name}: 覆盖已有 timestamp 列")
+        df["timestamp"] = mapped_timestamp
+        print(
+            f"  [更新] {csv_path.name}: 覆盖已有 timestamp 列 "
+            f"(行数={n_rows}, 唯一请求数={n_requests}, req_id列={req_id_col})"
+        )
     else:
-        df.insert(1, "timestamp", formatted)
-        print(f"  [添加] {csv_path.name}: 插入 timestamp 列 ({n_rows} 行)")
+        df.insert(1, "timestamp", mapped_timestamp)
+        print(
+            f"  [添加] {csv_path.name}: 插入 timestamp 列 "
+            f"(行数={n_rows}, 唯一请求数={n_requests}, req_id列={req_id_col})"
+        )
 
     if not dry_run:
         df.to_csv(csv_path, index=False)
@@ -174,7 +237,7 @@ TRACE_CONFIG = {
         "trace_file": SELECT_DIR / "burstgpt" / "BurstGPT_without_fails_1_ts2978278_2979278.csv",
         "loader": load_burstgpt_timestamps,
     },
-    "qwen": {
+    "qwen_trace": {
         "trace_file": SELECT_DIR / "qwen" / "qwen_traceB_blksz_16_x0p25_ts7600000_7900000.jsonl",
         "loader": load_qwen_timestamps,
     },
