@@ -1,0 +1,4 @@
+平均 QPS: 6.00
+长度统计已保存为: /root/predict-schedule/bandwith_test/raw_trace_stats_20260629/stats/qwen__qwen_traceB_blksz_16_x0p25.txt
+图表已保存为: /root/predict-schedule/bandwith_test/raw_trace_stats_20260629/fig/qwen__qwen_traceB_blksz_16_x0p25.png
+
