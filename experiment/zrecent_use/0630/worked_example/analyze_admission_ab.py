@@ -37,12 +37,7 @@ BENCH_PATS = {
     "p99_ttft_ms": r"P99 TTFT \(ms\):\s+([\d.]+)",
 }
 
-GWF_RE = re.compile(
-    r"\[WT\]\[GWF\] steps=(\d+) admitted=(\d+) preempted=(\d+) "
-    r"recompute_tokens=(\d+) "
-    r"evicted_hopeless=(\d+) demoted=(\d+) hopeless_forced=(\d+) "
-    r"stop_window=(\d+) meas_tpot_ms=([-\d.]+) budget_ms=([\d.]+) "
-    r"window=(\d+) running=(\d+) waiting=(\d+)")
+GWF_RE = re.compile(r"\[WT\]\[GWF\] (.*)")
 
 
 def parse_benchmark_log(path: Path) -> dict:
@@ -59,7 +54,11 @@ def parse_benchmark_log(path: Path) -> dict:
 
 
 def parse_gwf_counters(decode_logs: list[Path]) -> dict:
-    """Sum the per-second GWF counters across a run's decode logs."""
+    """Sum the per-second GWF counters across a run's decode logs.
+
+    Uses key=value parsing so it tolerates both old (no recompute_tokens) and
+    new (with recompute_tokens) [WT][GWF] log formats.
+    """
     tot = {"steps": 0, "admitted": 0, "preempted": 0,
            "preempted_recompute_tokens": 0, "evicted_hopeless": 0,
            "demoted": 0, "hopeless_forced": 0, "stop_window": 0}
@@ -71,15 +70,16 @@ def parse_gwf_counters(decode_logs: list[Path]) -> dict:
             mm = GWF_RE.search(line)
             if not mm:
                 continue
-            tot["steps"] += int(mm.group(1))
-            tot["admitted"] += int(mm.group(2))
-            tot["preempted"] += int(mm.group(3))
-            tot["preempted_recompute_tokens"] += int(mm.group(4))
-            tot["evicted_hopeless"] += int(mm.group(5))
-            tot["demoted"] += int(mm.group(6))
-            tot["hopeless_forced"] += int(mm.group(7))
-            tot["stop_window"] += int(mm.group(8))
-            mt = float(mm.group(9))
+            kv = dict(re.findall(r"(\w+)=([-\d.]+)", mm.group(1)))
+            tot["steps"] += int(kv.get("steps", 0))
+            tot["admitted"] += int(kv.get("admitted", 0))
+            tot["preempted"] += int(kv.get("preempted", 0))
+            tot["preempted_recompute_tokens"] += int(kv.get("recompute_tokens", 0))
+            tot["evicted_hopeless"] += int(kv.get("evicted_hopeless", 0))
+            tot["demoted"] += int(kv.get("demoted", 0))
+            tot["hopeless_forced"] += int(kv.get("hopeless_forced", 0))
+            tot["stop_window"] += int(kv.get("stop_window", 0))
+            mt = float(kv.get("meas_tpot_ms", -1))
             if mt >= 0:
                 meas_tpots.append(mt)
     tot["meas_tpot_p50_ms"] = statistics.median(meas_tpots) if meas_tpots else None
