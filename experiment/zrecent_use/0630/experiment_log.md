@@ -36,6 +36,8 @@
 
 | 9 | 11-07 | 论文 mooncake trace（n=1790，6 req/s，output p90=12.7k） | 观察（别人在跑） | — | 首 7 分钟：greedy kv_usage **100 %**（80/1805 采样 ≥99.5 %）、running 257、waiting 18、**preempted_recompute_tokens=33,633**、日志 preempted 事件 1822 次、watchdog stalled 17 次 | **修正 #6 的过度概括**：长输出不是不能触发 GWF，准确门槛是「运行点平均 seq」——`slots=881616/avg_seq`，mooncake 运行时均值 ~4.6k → 仍有 ~190 slots > 128 门槛。这里 KV 打满 → 原生抢占+整段重算（--swap-space 0），正是论文 eV 该省的浪费。注意风险：100 % KV 时有 deadlock 看门狗警告，极端 20k 输出曾 exit 137，推进要小步（先 1.2× 到达率） |
 
+| 10 | 11-07 | 反思：为什么窗口从不收缩 | — | — | 由实测曲线 `meas_tpot ≈ 19.7+0.117×running` 反解 θ=120 ms 需要 running≈860，而实测峰值仅 338 → window 恒 256 | **重要认知**：dense_short 的 +3.6 % 只来自「淘汰 hopeless 的尾部清理」，不是论文窗口机制的收益。窗口收缩只能靠 KV 打满后的重算抖动把 meas_tpot 顶到 ≫120 ms。正确画像是「running 200–300 + KV 长期 100 % + 平均 seq 2000–4000」。判别：跑的时候看 `[WT][GWF]` 里 window 是否出现 128/64/32 |
+
 ## 踩过的坑（按时间，含修复）
 
 1. **模型权重路径**：脚本默认 `/root/.cache/.../Qwen-2.5-7b-Instruct` 在慢盘 /dev/sdb1 → 卡死。修复：`QWEN_MODEL_PATH=/root/myshare/models/...`（NVMe）。

@@ -296,3 +296,37 @@ mooncake 的 p90 是 12.7k token，但运行时均值只有 ~4.6k（长请求少
 `derived_datasets/mooncake_rate1p2x/qwen_lmsys_mooncake_1790_rate1p2x.csv`
 （1790 条不变、时间戳压缩到 247 s、7.3 req/s）。用途：把贪心再往 KV 悬崖里推 5–10 %，
 让 `preempted_recompute_tokens` 明显大于 0，从而让 GWF 的 eV 有东西可省。
+
+---
+
+## 2.5 为什么窗口一直不收缩——以及什么样的负载才能让它收缩
+
+GWF 的收缩条件是 `meas_tpot > θ = 120 ms` **且** `running ≥ A`（Algorithm 2）。
+用实测干净负载曲线 `meas_tpot ≈ 19.7 + 0.117×running`（dense_short，32→288 桶）反解：
+
+```
+120 ms  ->  running ≈ 860
+```
+
+而我们实测的 running 峰值只有 **338**（贪心，dense_short 最密突发），
+所以 `window` 从未低于 256，GWF 退化成「固定 256 上限 + 淘汰 hopeless」。
+
+**这意味着 dense_short 的 +3.6 % 只是「尾部清理」的收益，不是论文窗口机制的收益。**
+要让窗口真正从 256→128→64→32 收下来，必须让 `meas_tpot` 远超 120 ms。
+唯一现实途径是 **KV 打满后的抢占重算抖动**——也就是 2026-09-24 那次 4080 运行里
+`running ≥ 257 → meas_tpot 5264 ms` 的那个悬崖（当时由 30k-token extreme + KV thrash 造成）。
+
+所以工作负载的正确画像是：
+
+```
+running 卡在 200–300（跨过 demote/窗口门）
+  + KV 长期 ~100 %（迫使调度器不断抢占/重算，步长暴涨）
+  + 平均序列长度 2,000–4,000 token（slots = 881,616/avg_seq ≈ 220–440，刚好卡在这个区间）
+```
+
+mooncake（未截断）实测就是这个形态：4 个实例 kv 全部 100 %、running p50 144–181、
+单实例重算 15k–101k token。**截断到 8192 的版本会削弱它**（mean seq 3,301 → slots ≈ 267，
+压力变小），观测时要对比这两版。
+
+**判别方法（跑的时候就能看）**：GWF 变体的 `[WT][GWF]` 日志里如果出现
+`window=128/64/32`，说明窗口机制真的激活了；如果 `window` 恒 256，那这轮赢的仍然只是尾部清理。
