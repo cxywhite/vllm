@@ -235,3 +235,50 @@ python3 hw_workload_report.py --hw-csv admission_ab_confirm/hw_metrics_*.csv \
    并把 demote 的每步上限与真实值对齐（实测 1525 次/轮，模拟 615 次/轮 → 需按实例数归一）；
 2. 输出 TTFT/TPOT 分位数，与 bench 的 P50/P99 对齐；
 3. `--imbalance` 改为按「预测长度路由」建模（实测 1.0–1.3，默认 1.6 偏大）。
+
+---
+
+## 2.4 第三种regime：KV 受限区（论文自己的 mooncake trace 就在这里）
+
+之前我把「长输出」一棍子打死（output 8000/20000 → 并发被 KV 卡在 107/44，触发不了 128 门槛），
+**这个结论只对极端长输出成立**。准确的门槛是「运行点的平均序列长度」：
+
+```
+KV 上限并发 slots = 881,616 tokens / avg_seq     (avg_seq = prompt + output，运行时的均值)
+demote 门可达  <=>  slots >= 128   <=>  avg_seq <= 6,887
+窗口门可达    <=>  slots >= 256   <=>  avg_seq <= 3,444
+```
+
+实测（`admission_ab_mooncake`，论文 mooncake trace n=1790，4P4D，6.0 req/s）：
+
+| 指标 | 实测 |
+|---|---|
+| output p50 / p90 / max | 515 / 12,730 / 30,944 |
+| seq(prompt+out) p50 / p90 | 619 / 12,768 |
+| **kv_usage_pct** | p50 62.5 %，p90 95.6 %，**max 100 %（1805 个采样里 80 个 ≥99.5 %）** |
+| running | max **257**（略超 A_max=256） |
+| waiting | max 18 |
+| **preempted_recompute_tokens** | **33,633**（累计，单调递增）→ 真实发生了「抢占 + 整段重算」 |
+| 日志里 preempted 事件 | 1,822 次；watchdog `stalled` 警告 17 次 |
+
+**这是比 dense_short 更贴论文的场景**：KV 打满 → 原生调度器被迫抢占正在跑的请求、丢弃其 KV、
+从 0 重算（`--swap-space 0`，没有 CPU 换出）。GWF 的 eV（淘汰价值）正是为这里设计的。
+`preempted_recompute_tokens` 就是「白干的工作量」，GWF 若有效，这个数应该显著变小。
+
+**构造公式补全**：
+
+```
+peak_running ≈ min( λ_inst × min(B, S),  881,616 / avg_seq,  max_num_seqs )
+```
+
+注意 KV 项：`avg_seq` 用的是**运行中的均值**，不是 trace 里的最大值——
+mooncake 的 p90 是 12.7k token，但运行时均值只有 ~4.6k（长请求少、短请求多），所以 slots 还有 ~190。
+
+**风险**：KV 打到 100 % 时出现过 `GPU deadlock` 看门狗警告（17 次 stalled），
+极端长输出（20k）曾直接把 benchmark 打挂（exit 137）。所以往 KV 受限区推要**小步**：
+先 1.1–1.2× 到达率，不要一次把 output 拉到 20k。
+
+已备好一个 1.2× 到达率的派生 trace（不改原数据集，新建文件）：
+`derived_datasets/mooncake_rate1p2x/qwen_lmsys_mooncake_1790_rate1p2x.csv`
+（1790 条不变、时间戳压缩到 247 s、7.3 req/s）。用途：把贪心再往 KV 悬崖里推 5–10 %，
+让 `preempted_recompute_tokens` 明显大于 0，从而让 GWF 的 eV 有东西可省。

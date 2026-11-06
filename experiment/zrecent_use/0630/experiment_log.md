@@ -34,6 +34,8 @@
 
 | 8 | 11-07 | 硬件采样 + 离线模拟校准（不跑新 A/B） | — | — | 见 `hw_guided_workload_and_sim.md` 与 `worked_example/sim_vs_real_dense_short.md` | ① 采样开销实测 0 tick/58s，可全程常驻；② **GPU fb 不能当并发代理**（vLLM 预分配 KV，running 5→338 时 fb 只差几十 MiB），并发只能看新增的 `kv_usage_pct`；③ 修掉模拟器跨策略状态污染（旧 GWF 模拟从空队列起跑，`max_running=11`），修后仍**符号相反**（实测 +3.6% vs 模拟 −15.7%）→ 模拟器暂只能用来筛"到不了 128"的负载 |
 
+| 9 | 11-07 | 论文 mooncake trace（n=1790，6 req/s，output p90=12.7k） | 观察（别人在跑） | — | 首 7 分钟：greedy kv_usage **100 %**（80/1805 采样 ≥99.5 %）、running 257、waiting 18、**preempted_recompute_tokens=33,633**、日志 preempted 事件 1822 次、watchdog stalled 17 次 | **修正 #6 的过度概括**：长输出不是不能触发 GWF，准确门槛是「运行点平均 seq」——`slots=881616/avg_seq`，mooncake 运行时均值 ~4.6k → 仍有 ~190 slots > 128 门槛。这里 KV 打满 → 原生抢占+整段重算（--swap-space 0），正是论文 eV 该省的浪费。注意风险：100 % KV 时有 deadlock 看门狗警告，极端 20k 输出曾 exit 137，推进要小步（先 1.2× 到达率） |
+
 ## 踩过的坑（按时间，含修复）
 
 1. **模型权重路径**：脚本默认 `/root/.cache/.../Qwen-2.5-7b-Instruct` 在慢盘 /dev/sdb1 → 卡死。修复：`QWEN_MODEL_PATH=/root/myshare/models/...`（NVMe）。

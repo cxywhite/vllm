@@ -104,15 +104,16 @@ def main() -> int:
     # sort by timestamp so the benchmark replays in arrival order
     out_rows.sort(key=lambda r: int(r["timestamp"]))
 
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    out_path = Path(os.environ.get("OUT_PATH", str(OUT_PATH)))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     fn = list(out_rows[0].keys())
-    with open(OUT_PATH, "w", newline="", encoding="utf-8") as f:
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fn)
         w.writeheader()
         w.writerows(out_rows)
 
     n_long = sum(1 for r in out_rows if int(r["output_tokens"]) == out_long)
-    print(f"wrote {OUT_PATH}")
+    print(f"wrote {out_path}")
     print(f"  total={len(out_rows)}  long={n_long}  short={len(out_rows) - n_long}  "
           f"total_out_tokens={sum(int(r['output_tokens']) for r in out_rows)}")
     return 0
