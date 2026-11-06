@@ -203,7 +203,7 @@ def main() -> int:
         by_src: dict[str, list[dict]] = {}
         for r in recs:
             by_src.setdefault(r["src"], []).append(r)
-        print("| src | samples | running max/p50 | waiting max | kv_pct max | meas_tpot p50 (ms) | window min | demoted | stop_window | preempted |")
+        print("| src | samples | running max/p50 | waiting max | kv_pct max | meas_tpot p50 (ms) | window min | demoted max/Σ | stop_window max/Σ | preempted max/Σ |")
         print("|---|---|---|---|---|---|---|---|---|---|")
         for src, rs in by_src.items():
             run = [r["running"] for r in rs]
@@ -211,11 +211,13 @@ def main() -> int:
             kvp = [r["kv_pct"] for r in rs if r["kv_pct"] == r["kv_pct"]]
             tp = [r["tpot_ms"] for r in rs if r["tpot_ms"] == r["tpot_ms"] and r["tpot_ms"] > 0]
             win = [r["window"] for r in rs if r["window"] > 0]
+            kv_txt = f"{max(kvp):.1f}" if kvp else "n/a"
+            tp_txt = f"{st.median(tp):.1f}" if tp else "n/a"
             print(f"| {src} | {len(rs)} | {max(run)}/{st.median(run):.0f} | {max(wait) if wait else -1} | "
-                  f"{(max(kvp) if kvp else float('nan')):.1f} | "
-                  f"{(st.median(tp) if tp else float('nan')):.1f} | {min(win) if win else -1} | "
-                  f"{max(r['demoted'] for r in rs)} | {max(r['stop_window'] for r in rs)} | "
-                  f"{max(r['preempted'] for r in rs)} |")
+                  f"{kv_txt} | {tp_txt} | {min(win) if win else -1} | "
+                  f"{max(r['demoted'] for r in rs)}/{sum(r['demoted'] for r in rs)} | "
+                  f"{max(r['stop_window'] for r in rs)}/{sum(r['stop_window'] for r in rs)} | "
+                  f"{max(r['preempted'] for r in rs)}/{sum(r['preempted'] for r in rs)} |")
         run = [r["running"] for r in recs]
         mx = max(run)
         kvp = [r["kv_pct"] for r in recs if r["kv_pct"] == r["kv_pct"]]

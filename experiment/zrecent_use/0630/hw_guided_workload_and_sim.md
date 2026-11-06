@@ -184,3 +184,54 @@ python3 worked_example/sim_admission.py --trace <trace.csv> \
 
 注意：1 rep，尚未做 3 rep 中位数确认；`WT_SIMPLIFY_PREDICT=1` 是完美预测，
 不代表带 BERT 预测器的端到端效果。
+
+---
+
+## 5. 下一轮建议（按优先级）
+
+### 5.1 放大 GWF 的分离度：更密的突发，而不是更多的长请求
+
+第 6/7 轮（12000×200、突发 1200 条/5 s）已经让 GWF 赢 2.8 %/5.0 %，但贪心只到 running 338、
+GWF 撞 256 上限；把突发密度再提一档可以让分离度更明显，同时保持「40 req/s 平均」这个现实画像：
+
+```
+TRACE_SPAN_S=275 BURST_PERIOD_S=27.5 BURST_DURATION_S=5 \
+REQS_PER_BURST=2000 LONG_FRACTION=0 OUTPUT_SHORT_TOKENS=200 \
+  python3 build_bimodal_burst_trace.py        # 6 个突发 × 2000 条 = 12000 条
+```
+
+预期：`λ_inst = 2000/5/4 = 100/s`，`peak ≈ 100×5 = 500`（贪心）vs 256（GWF）——
+贪心的 P99 TTFT 会明显恶化，GWF 的限流窗口收益放大。KV 用量仍 < 15 %（500×256 token）。
+
+**不要**用「加长输出到 8000/20000」的方式加大压力：那会先撞 KV 容量
+（output 8000 → 每实例并发上限 ~107，到不了 128 门槛；output 20000 → 只有 ~44）。
+
+### 5.2 确认用的启动命令（带硬件采样）
+
+```bash
+cd /root/predict-schedule/experiment/zrecent_use/0630
+VLLM_HOST_IP=127.0.0.1 NCCL_SOCKET_IFNAME=lo GLOO_SOCKET_IFNAME=lo \
+no_proxy=localhost,127.0.0.1 NO_PROXY=localhost,127.0.0.1 \
+QWEN_MODEL_PATH=/root/myshare/models/Qwen-2.5-7b-Instruct \
+WT_SIMPLIFY_PREDICT=1 WT_NATIVE_LOG_INTERVAL_MS=1000 \
+COMPARE_EXPERIMENT_VARIANTS="scheme4 scheme4_gwf" PD_RATIO_LIST="4:4" \
+TPOT_MS_LIST="30" RUN_REPEAT_PER_CONFIG=3 TRACE_NAME=bimodal_burst \
+DATASET_BASE_DIR=$PWD/admission_ab_base \
+BASE_RESULT_DIR=$PWD/admission_ab_confirm \
+  bash run_ab_with_hw.sh
+```
+
+6 次运行 ≈ 45 min；产物里会多出 `hw_metrics_<stamp>.csv`（5 s 粒度）与
+`hw_metrics_<stamp>.sampler.log`。跑完立刻：
+
+```bash
+python3 hw_workload_report.py --hw-csv admission_ab_confirm/hw_metrics_*.csv \
+  --sched-glob 'admission_ab_confirm/*/log/decode*.log' --out admission_ab_confirm/hw_report.md
+```
+
+### 5.3 模拟器修复顺序（在用它排序工作负载之前）
+
+1. 让 `is_hopeless()` 只对「还没拿到首 token 且排队超 SLO」的请求生效，
+   并把 demote 的每步上限与真实值对齐（实测 1525 次/轮，模拟 615 次/轮 → 需按实例数归一）；
+2. 输出 TTFT/TPOT 分位数，与 bench 的 P50/P99 对齐；
+3. `--imbalance` 改为按「预测长度路由」建模（实测 1.0–1.3，默认 1.6 偏大）。
