@@ -45,7 +45,17 @@
    30ms 是由 **eV/demote** 保证，不是窗口；窗口只负责防悬崖。
 3. 合成 `dense_short` 的 +2.8%/+5.0% 只是"无悬崖时的尾部改善"，不能代表论文场景。
 
-## 5. 已否决的方向
+## 5. 模拟器的已知局限（解读预测时必须知道）
+
+对真实 mooncake 的模拟给出 `running≈69、waiting≈826、meas_tpot=313ms`。**running=69 是低估**：
+
+- `sim_admission.py` 的 KV 模型是"每个请求占住 KV 到结束"，KV 满就停止准入；
+- 真实 vLLM 在 KV 满时会 **preempt 受害者 → 释放 KV → 重算**，所以 running 能硬撑到远超
+  KV-fit 上限（旧 4080 实测 running 到 **465**），代价是 meas_tpot 冲到 5264ms；
+- 因此模拟能可靠预测的是"**会不会进入高 TPOT 区**"（mooncake 预测 313ms>120ms ✓），
+  但**不能预测 running 峰值**，也不能定量 goodput。真机数字以实测为准。
+
+## 6. 已否决的方向
 
 - 封顶 output（cap8192）——砍掉长尾，机制失效。
 - 自造双峰/密集 trace——偏离论文，结论外推性差。
