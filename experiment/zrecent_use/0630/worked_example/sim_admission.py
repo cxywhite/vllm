@@ -46,12 +46,21 @@ GWF_DEMOTE_MIN_RUNNING_RATIO = 0.5   # demote only when running >= A/2
 # decode per-token time (ms) as a function of running concurrency.
 # curve name -> list of (running_upper_bound_inclusive, tpot_ms). Linear interp.
 TPOT_CURVES: dict[str, list[tuple[int, float]]] = {
-    # clean-load estimate: ~20 ms at low concurrency (matches bimodal8000 23 ms),
-    # old-run cliff values kept for the 129+/257+ regimes until re-probed.
+    # MEASURED 2026-11-06 (dense_short GWF run, 1136 (running,meas_tpot) samples):
+    # decode-side meas_tpot p50 by running bucket. Nearly LINEAR (20+0.11*running),
+    # NO 5264ms cliff on clean load -> the 120ms theta target is unreachable.
+    "real": [(31, 19.7), (63, 26.0), (95, 29.7), (127, 33.4), (159, 38.1),
+             (191, 41.8), (223, 46.3), (255, 47.9), (287, 49.6), (10_000, 62.0)],
+    # clean-load estimate (superseded by "real")
     "clean": [(64, 20.0), (128, 32.0), (256, 97.0), (10_000, 5264.0)],
     # the exact numbers from the code comment (2026-09-24, 4080 trace w/ extremes)
     "old4080": [(8, 74.0), (32, 84.0), (128, 98.0), (256, 97.0), (10_000, 5264.0)],
 }
+
+# When the KV cache is (nearly) full the scheduler must preempt+recompute, which
+# is where the old 4080 run saw 5264 ms/token. On clean load the exact inflation
+# is unmeasured, so it is a CLI hypothesis knob (--thrash-ms) for sensitivity.
+THRASH_TPOT_MS = 500.0
 
 
 def tpot_ms(running: int, curve: list[tuple[int, float]]) -> float:
@@ -159,6 +168,9 @@ def simulate(requests: list[Req], policy: str, curve_name: str,
         # 2. decode: advance running requests
         rn = len(running)
         step_tpot_ms = tpot_ms(rn, curve)
+        # KV nearly exhausted -> preempt/recompute churn inflates the step time.
+        if kv_used >= KV_CAP_TOKENS_PER_INSTANCE * 0.995:
+            step_tpot_ms = max(step_tpot_ms, THRASH_TPOT_MS)
         per_step_adv = (dt_s / (step_tpot_ms / 1000.0)) if step_tpot_ms > 0 else 1.0
         for r in running:
             r.tokens_done += per_step_adv
@@ -276,9 +288,10 @@ def build_bimodal(n_bursts, reqs_per_burst, long_frac, out_short, out_long,
 
 
 def main() -> int:
+    global THRASH_TPOT_MS
     ap = argparse.ArgumentParser()
     ap.add_argument("--trace", help="trace CSV to simulate")
-    ap.add_argument("--curve", default="clean", choices=list(TPOT_CURVES))
+    ap.add_argument("--curve", default="real", choices=list(TPOT_CURVES))
     ap.add_argument("--imbalance", type=float, default=1.6,
                     help="hottest-instance arrival multiplier vs balanced (obs ~1.9)")
     ap.add_argument("--sweep", action="store_true",
@@ -294,7 +307,10 @@ def main() -> int:
     ap.add_argument("--burst-period-s", type=float, default=60.0)
     ap.add_argument("--burst-duration-s", type=float, default=6.0)
     ap.add_argument("--front-load", action="store_true")
+    ap.add_argument("--thrash-ms", type=float, default=THRASH_TPOT_MS,
+                    help="tpot (ms) when KV is full (hypothesis; sensitivity knob)")
     a = ap.parse_args()
+    THRASH_TPOT_MS = a.thrash_ms
 
     def run_one(reqs, tag):
         rows = []
@@ -308,12 +324,14 @@ def main() -> int:
         out = []
         grid = [
             # (tag, n_bursts, reqs_per_burst, long_frac, out_short, out_long, front_load)
-            ("bim8000", 10, 60, 0.5, 200, 8000, False),
-            ("bim20000", 10, 60, 0.5, 200, 20000, False),
-            ("dense3000_b800", 1, 800, 0.0, 3000, 3000, True),
-            ("dense2500_b700", 1, 700, 0.0, 2500, 2500, True),
-            ("bim3000_b90", 10, 90, 0.5, 200, 3000, False),
-            ("bim3000_b90_fl", 1, 540, 0.5, 200, 3000, True),
+            # observed baseline: 12000x200 over 300s -> GWF +5% (measured)
+            ("ds200_b12k", 1, 12000, 0.0, 200, 200, False),
+            # KV-cap sweep: N_max = 881616/(L+56). L=3000 -> 289 (fills KV at ~2/s)
+            ("ds1000_b6k", 1, 6000, 0.0, 1000, 1000, False),
+            ("ds2000_b6k", 1, 6000, 0.0, 2000, 2000, False),
+            ("ds3000_b6k", 1, 6000, 0.0, 3000, 3000, False),
+            ("ds3000_b8k", 1, 8000, 0.0, 3000, 3000, False),
+            ("ds3000_fl", 1, 1200, 0.0, 3000, 3000, True),
         ]
         for tag, nb, rpb, lf, os_, ol, fl in grid:
             reqs = build_bimodal(nb, rpb, lf, os_, ol, a.prompt_len,
