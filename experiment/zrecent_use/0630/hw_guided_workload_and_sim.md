@@ -330,3 +330,33 @@ mooncake（未截断）实测就是这个形态：4 个实例 kv 全部 100 %、
 
 **判别方法（跑的时候就能看）**：GWF 变体的 `[WT][GWF]` 日志里如果出现
 `window=128/64/32`，说明窗口机制真的激活了；如果 `window` 恒 256，那这轮赢的仍然只是尾部清理。
+
+---
+
+## 2.6 关键约束：KV 打满 → 抢占重算 → **引擎 deadlock**（两轮实测）
+
+两轮 mooncake（未截断 / 截断 8192）都以同样的方式死掉，时间线完全一致：
+
+| 事件 | 未截断 mooncake | 截断 mooncake |
+|---|---|---|
+| kv_usage 触顶 | 99.8–100 % | 99.8–100 % |
+| **首次抢占** | t ≈ 447–457 s（running 164–180） | t ≈ 446–463 s（running 156–170） |
+| 抢占后 20–70 s 内 | 重算 token 从 0 跳到 21k–101k，引擎停摆 | 从 0 跳到 8k–90k，引擎停摆 |
+| 结束方式 | `[WARN] GPU deadlock detected (decode GPUs all mem>0 util=0)` → 300 s 倒计时 → kill → **benchmark exit 137** | 同上 |
+
+对照：dense_short（kv < 60 %、recompute 恒 0）从未 deadlock。
+
+**结论（写进工作负载约束）**：
+
+1. 这个 build（PD 分离 + `P2pNcclConnector` + `--swap-space 0`）在 decode 侧做
+   **本地抢占重算会在几十秒内 deadlock**。因此「KV 打满」的负载不可用——
+   不是慢，是直接报废整轮。
+2. 所以 **GWF 的 preemption / eV 路径在本环境无法测量**；
+   能演示的只有「准入窗口 + 淘汰 hopeless」这条路径（dense_short：+3.6 %/+5.0 %）。
+3. 安全设计线：**kv_usage 峰值 < 95 %**（留 5 % 余量），避免触发抢占。
+   即 `running 的构造要让 KV 有富余`：`avg_seq × peak_running ≲ 830k`。
+4. 由此推论：**窗口收缩（`meas_tpot > 120 ms`）在本环境也基本不可达**，
+   因为唯一能把 TPOT 顶过 120 ms 的机制就是 KV 抖动，而它会 deadlock。
+   → 若要用到论文的窗口机制，只能调 θ（`WT_GWF_WINDOW_TPOT_TARGET_MS`，
+   当前 120 ms = 4×SLO；实测 TPOT 在 running≈220 时才 ~45 ms）。
+   这是一个**参数敏感性实验**，不是工作负载问题，需要单独决定是否做。

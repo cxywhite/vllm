@@ -15,6 +15,7 @@
 #
 # Usage (env is the *only* difference from calling the eval script directly):
 #   BASE_RESULT_DIR=$PWD/admission_ab_confirm \
+#   MODEL_TYPE=qwen \
 #   COMPARE_EXPERIMENT_VARIANTS="scheme4 scheme4_gwf" PD_RATIO_LIST="4:4" \
 #   TPOT_MS_LIST="30" RUN_REPEAT_PER_CONFIG=3 TRACE_NAME=bimodal_burst \
 #   DATASET_BASE_DIR=$PWD/admission_ab_base \
@@ -96,13 +97,14 @@ except FileNotFoundError:
     print(f"[hw] no csv written: {path}")
     sys.exit(0)
 print(f"[hw] samples: {len(rows)}  ({path})")
-for prefix, label in (("gpu", "per-GPU")):
-    for i in (0, 4):
-        fb = [float(r[f"gpu{i}_fb_mb"]) for r in rows if r.get(f"gpu{i}_fb_mb")]
-        sm = [float(r[f"gpu{i}_sm_pct"]) for r in rows if r.get(f"gpu{i}_sm_pct")]
-        if fb:
-            print(f"[hw] {label} gpu{i}: fb {min(fb):.0f}..{max(fb):.0f} MiB "
-                  f"(peak {max(fb):.0f}), sm mean {statistics.mean(sm):.1f}% max {max(sm):.0f}%")
+for i in (0, 4):
+    fb = [float(r[f"gpu{i}_fb_mb"]) for r in rows if r.get(f"gpu{i}_fb_mb")]
+    sm = [float(r[f"gpu{i}_sm_pct"]) for r in rows if r.get(f"gpu{i}_sm_pct")]
+    mem = [float(r[f"gpu{i}_mem_pct"]) for r in rows if r.get(f"gpu{i}_mem_pct")]
+    if fb:
+        print(f"[hw] gpu{i}: fb {min(fb):.0f}..{max(fb):.0f} MiB "
+              f"(peak {max(fb):.0f}), sm mean {statistics.mean(sm):.1f}% max {max(sm):.0f}%, "
+              f"mem_pct mean {statistics.mean(mem):.1f}%")
 load = [float(r["load1"]) for r in rows if r.get("load1")]
 if load:
     print(f"[hw] load1 mean {statistics.mean(load):.1f} max {max(load):.1f}")

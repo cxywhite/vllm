@@ -38,6 +38,8 @@
 
 | 10 | 11-07 | 反思：为什么窗口从不收缩 | — | — | 由实测曲线 `meas_tpot ≈ 19.7+0.117×running` 反解 θ=120 ms 需要 running≈860，而实测峰值仅 338 → window 恒 256 | **重要认知**：dense_short 的 +3.6 % 只来自「淘汰 hopeless 的尾部清理」，不是论文窗口机制的收益。窗口收缩只能靠 KV 打满后的重算抖动把 meas_tpot 顶到 ≫120 ms。正确画像是「running 200–300 + KV 长期 100 % + 平均 seq 2000–4000」。判别：跑的时候看 `[WT][GWF]` 里 window 是否出现 128/64/32 |
 
+| 11 | 11-07 | mooncake 两轮（未截断 / 截断 8192） | 观察 | 每轮 ~11 min 后死 | 两轮都在 **首次抢占后 20–70 s 内 deadlock**：kv 触顶 99.8–100 %、首抢占 t≈450 s（running 156–180）、recompute 从 0 跳到 21k–101k、`GPU deadlock detected` → 300s 倒计时 → exit 137。dense_short（kv<60 %、recompute=0）从未 deadlock | **硬约束**：此 build 下 decode 侧本地抢占重算会 deadlock，KV 打满的负载不可用。安全线 kv<95 %。**GWF 的 eV/preemption 路径在本环境不可测**，只能演示「窗口限流+淘汰 hopeless」。窗口收缩也需要 KV 抖动把 TPOT 顶过 120 ms → 同样不可达；要用窗口机制必须调 θ（参数实验，非负载） |
+
 ## 踩过的坑（按时间，含修复）
 
 1. **模型权重路径**：脚本默认 `/root/.cache/.../Qwen-2.5-7b-Instruct` 在慢盘 /dev/sdb1 → 卡死。修复：`QWEN_MODEL_PATH=/root/myshare/models/...`（NVMe）。
