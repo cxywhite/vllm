@@ -274,6 +274,20 @@ peak_running ≈ min( λ_inst × min(B, S),  881,616 / avg_seq,  max_num_seqs )
 注意 KV 项：`avg_seq` 用的是**运行中的均值**，不是 trace 里的最大值——
 mooncake 的 p90 是 12.7k token，但运行时均值只有 ~4.6k（长请求少、短请求多），所以 slots 还有 ~190。
 
+**逐实例看（2026-11-07 实测，同一轮 mooncake 的 4 个 decode）**：
+
+| 实例 | running max/p50 | kv_pct p50/max | 抢占重算 tokens |
+|---|---|---|---|
+| decode0 | 187 / 144 | 62.2 / 100.0 | 21,269 |
+| decode1 | 209 / 167 | 67.9 / 100.0 | 87,905 |
+| decode2 | 237 / 176 | 62.2 / 100.0 | 15,504 |
+| decode3 | 257 / 181 | 66.6 / 100.0 | 96,506 |
+
+**方法教训（我踩过）**：把 4 个 decode 实例的 `running`/`kv_pct` 混在一起算平均，
+会得到「running 200–300 的桶 kv_pct 反而比 128–200 低」这种自相矛盾的结论——
+因为每个实例的请求长度分布不同（decode0 均值 ~4000 token，decode3 ~2800）。
+**必须逐实例看**；`hw_workload_report.py` 现在会打 per-instance 表。
+
 **风险**：KV 打到 100 % 时出现过 `GPU deadlock` 看门狗警告（17 次 stalled），
 极端长输出（20k）曾直接把 benchmark 打挂（exit 137）。所以往 KV 受限区推要**小步**：
 先 1.1–1.2× 到达率，不要一次把 output 拉到 20k。

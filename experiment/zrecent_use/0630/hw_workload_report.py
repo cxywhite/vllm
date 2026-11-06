@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+import os
 import statistics as st
 import sys
 
@@ -103,6 +104,7 @@ def parse_sched(log_paths: list[str]) -> list[dict]:
                 continue
             try:
                 recs.append({
+                    "inst": os.path.basename(path).split("_")[0],
                     "t_ms": int(kv.get("t_ms", -1)),
                     "running": int(kv["running"]),
                     "waiting": int(kv.get("waiting", -1)),
@@ -112,6 +114,7 @@ def parse_sched(log_paths: list[str]) -> list[dict]:
                     "demoted": int(kv.get("demoted", 0)),
                     "stop_window": int(kv.get("stop_window", 0)),
                     "preempted": int(kv.get("preempted", 0)),
+                    "recompute": int(kv.get("preempted_recompute_tokens", 0)),
                     "src": "gwf" if "[WT][GWF]" in line else "native",
                 })
             except ValueError:
@@ -218,15 +221,30 @@ def main() -> int:
                   f"{max(r['demoted'] for r in rs)}/{sum(r['demoted'] for r in rs)} | "
                   f"{max(r['stop_window'] for r in rs)}/{sum(r['stop_window'] for r in rs)} | "
                   f"{max(r['preempted'] for r in rs)}/{sum(r['preempted'] for r in rs)} |")
+        insts = sorted({r["inst"] for r in recs if r.get("inst")})
+        if len(insts) > 1:
+            print("\nper-instance (aggregating across the 4 decode instances hides 2-3x "
+                  "differences — kv_pct and running must be read per instance):\n")
+            print("| inst | samples | running max/p50 | kv_pct p50/max | recompute_tokens |")
+            print("|---|---|---|---|---|")
+            for it in insts:
+                rs = [r for r in recs if r.get("inst") == it]
+                run_i = sorted(r["running"] for r in rs)
+                kvp_i = sorted(r["kv_pct"] for r in rs if r["kv_pct"] == r["kv_pct"])
+                print(f"| {it} | {len(rs)} | {run_i[-1]}/{run_i[len(run_i)//2]} | "
+                      f"{(kvp_i[len(kvp_i)//2] if kvp_i else float('nan')):.1f}/"
+                      f"{(kvp_i[-1] if kvp_i else float('nan')):.1f} | "
+                      f"{max(r.get('recompute', 0) for r in rs)} |")
         run = [r["running"] for r in recs]
         mx = max(run)
         kvp = [r["kv_pct"] for r in recs if r["kv_pct"] == r["kv_pct"]]
         print(f"\n- peak running {mx} vs demote gate {GWF_DEMOTE_GATE} / window gate {GWF_WINDOW_GATE}")
         if kvp:
-            seq_tokens = 256  # 56 prompt + ~200 output, dense-short profile
-            print(f"- peak kv_usage {max(kvp):.1f}% → ~{max(kvp)/100*KV_CAP_TOKENS/1000:.0f}k tokens in KV; "
-                  f"at {seq_tokens} tok/request that is ~{max(kvp)/100*KV_CAP_TOKENS/seq_tokens:.0f} concurrent slots "
-                  f"(cap by --max-num-seqs is {MAX_NUM_SEQS})")
+            run_p50 = st.median([r["running"] for r in recs]) or 1
+            avg_seq = (max(kvp) / 100.0 * KV_CAP_TOKENS) / run_p50
+            print(f"- peak kv_usage {max(kvp):.1f}% at running p50 {run_p50:.0f} → implied avg seq "
+                  f"≈{avg_seq:.0f} tok/request (compute it from the data; do NOT assume 200-token "
+                  f"requests when the trace has a long tail); KV slots ≈ {KV_CAP_TOKENS/max(1,avg_seq):.0f}")
             print(f"- KV cap {KV_CAP_TOKENS:,} tokens ≈ {KV_CAP_TOKENS*QWEN_KV_BYTES_PER_TOKEN/MiB/1024:.1f} GiB "
                   f"per decode instance (this is what fb shows as preallocated)")
     else:
@@ -265,9 +283,20 @@ def main() -> int:
         else:
             adv.append(f"peak running {mx} < {GWF_DEMOTE_GATE}: below the demote gate — GWF is pure overhead here. "
                        f"Need ~{GWF_DEMOTE_GATE/max(1,mx):.1f}x more concurrency.")
+    rec_total = max((r.get("recompute", 0) for r in recs), default=0)
+    if rec_total > 0:
+        adv.append(f"**KV-limited regime**: this scheduler recomputed {rec_total:,} tokens "
+                   f"(preemption + full recompute, --swap-space 0). The GWF run's same counter is the "
+                   f"headline: the difference IS the wasted work the eviction value should remove.")
     sm_pre, sm_pre_x = gstat("sm", prefill_ids)
     sm_dec, sm_dec_x = gstat("sm", decode_ids)
-    if sm_pre_x < 50 and sm_dec < 70:
+    kv_peak = max((r["kv_pct"] for r in recs if r["kv_pct"] == r["kv_pct"]), default=0.0)
+    kv_starved = kv_peak >= 99.0
+    if kv_starved:
+        adv.append(f"KV is the bottleneck (kv_usage peaks at {kv_peak:.1f}%): **low sm here does NOT mean "
+                   f"headroom** — steps stall because there is no free block, so decode sm ({sm_dec:.0f}%) "
+                   f"under-reports the load. Raise load only if you intend to test the recompute path.")
+    elif sm_pre_x < 50 and sm_dec < 70:
         adv.append(f"neither role is saturated (prefill peak {sm_pre_x:.0f}%, decode mean {sm_dec:.0f}%): "
                    "the box has headroom → raise arrival rate before touching GWF params.")
     if sm_dec > 90:
