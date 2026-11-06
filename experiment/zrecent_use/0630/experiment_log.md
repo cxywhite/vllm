@@ -28,7 +28,11 @@
 - **触发≠有 goodput 增益**：goodput 靠"淘汰 hopeless + 压低尾部"得来（本轮 tpot p99 −13%、ttft p99 −20%）。要更大增益，需 (a) 更多实例饱和（提高密度）、或 (b) 让窗口真正收缩（output≈3000 使 KV 上限≈289，撞满→thrash→meas_tpot 冲上 120ms）。
 - **负载热点不平衡（2–3×）**：实测 decode0/1/2/3 running 峰值 61/28/96/18（bimodal8000）、105/115/256/256（dense_short）——predictor 路由把请求集中到部分 decode 实例，反而**降低**触发门槛（热实例先满）。
 - **预测 miscalibration**（系统 8–13× 过预测）仍是独立短板；已用 `WT_SIMPLIFY_PREDICT=1` 隔离。
+- **并发峰值的构造公式（实测拟合）**：`peak_running_inst ≈ λ_inst × min(B, S)`（λ_inst=每突发请求数/B/4，B=突发时长，S=output×tpot/1000）。dense_short 实测 λ=60/s、B=5s、S≈9.6s → 预测 300、实测 338。要跨 256 需每 5s 突发 ≥1024 条；「短而密」比「长而疏」更容易触发（B 拉长到 10s 时 1200 条只有 150 峰值）。
+- **硬件信号能测什么、不能测什么**：能测——sm 判断 prefill/decode 瓶颈、mem_pct 判断是否 memory-bound、load1 判断 CPU（proxy/scheduler）瓶颈、`mem_avail_mib` 佐证 `--swap-space 0`（无 KV 换出）、`fb_mb` 判"有没有别的容器占卡"；不能测——framebuffer 当并发、`rxpci/txpci` 当 KV 流量（P2pNccl 走 NVLink，PCIe 计数恒 0；KV 按 57,344 B/token 记账）。
 - **✅ 已找到有提升的负载（迭代 #6）**：**高并发短请求**（200 token、~40 req/s、bursty、300s）→ per-instance running 到 **256**（窗口上限）、meas_tpot 到 **46–48ms**（>30ms hopeless 阈值）→ GWF 的 demote(1525)/stop_window(179) 真正触发 → **goodput +2.8%、P99 TPOT −14.1%**。负载画像：**短输出（~200 token）+ 高到达率（~40 req/s）+ 突发**。这是 GWF 能赢的唯一 regime。
+
+| 8 | 11-07 | 硬件采样 + 离线模拟校准（不跑新 A/B） | — | — | 见 `hw_guided_workload_and_sim.md` 与 `worked_example/sim_vs_real_dense_short.md` | ① 采样开销实测 0 tick/58s，可全程常驻；② **GPU fb 不能当并发代理**（vLLM 预分配 KV，running 5→338 时 fb 只差几十 MiB），并发只能看新增的 `kv_usage_pct`；③ 修掉模拟器跨策略状态污染（旧 GWF 模拟从空队列起跑，`max_running=11`），修后仍**符号相反**（实测 +3.6% vs 模拟 −15.7%）→ 模拟器暂只能用来筛"到不了 128"的负载 |
 
 ## 踩过的坑（按时间，含修复）
 

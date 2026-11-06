@@ -105,6 +105,18 @@ def simulate(requests: list[Req], policy: str, curve_name: str,
     on the hottest instance). Default 1.0 = balanced lower bound.
     """
     curve = TPOT_CURVES[curve_name]
+    # NOTE: callers reuse the same Req objects for the greedy and GWF passes, so a
+    # previous pass would leave every request `finished=True` (that bug made the GWF
+    # pass start from a drained queue: max_running=11 instead of ~300). Reset here.
+    for r in requests:
+        r.t_admit_s = 0.0
+        r.t_first_s = 0.0
+        r.first_done = False
+        r.tokens_done = 0.0
+        r.decode_time_s = 0.0
+        r.preemptions = 0
+        r.finished = False
+        r.good = False
     span_s = max(1.0, requests[-1].t_arr_s + 60.0)
     dt_s = 0.1
     running: list[Req] = []
@@ -119,6 +131,7 @@ def simulate(requests: list[Req], policy: str, curve_name: str,
     max_running = 0
     max_waiting = 0
     good_tokens = 0
+    good_reqs = 0
 
     # request feed: take a fraction of arrivals (balanced) and scale by imbalance
     # for the "hottest instance" estimate; imbalance only multiplies arrival rate.
@@ -188,6 +201,7 @@ def simulate(requests: list[Req], policy: str, curve_name: str,
                 r.good = (ttft_ms <= TTFT_SLO_MS and tpot_of(r) <= TPOT_SLO_MS)
                 if r.good:
                     good_tokens += r.out_tokens
+                    good_reqs += 1
             else:
                 still.append(r)
         running = still
@@ -247,6 +261,7 @@ def simulate(requests: list[Req], policy: str, curve_name: str,
     return {
         "policy": policy, "max_running": max_running, "max_waiting": max_waiting,
         "goodput_tok_s": goodput, "good_tokens": good_tokens, "span_s": span_s,
+        "good_reqs": good_reqs, "goodput_req_s": good_reqs / span_s,
         "counters": counters, "final_meas_tpot_ms": (meas_tpot or 0.0),
         "final_window": window,
         "n_total_fed": len(my_idx), "share": share,
@@ -292,6 +307,13 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--trace", help="trace CSV to simulate")
     ap.add_argument("--curve", default="real", choices=list(TPOT_CURVES))
+    ap.add_argument("--curve-scale", type=float, default=1.0,
+                    help="multiply the tpot curve (measured bucket curve is a LIFETIME "
+                         "average, so it over-estimates the instantaneous step time; "
+                         "~0.6 matches the client-observed mean on dense_short)")
+    ap.add_argument("--curve-json", default="",
+                    help="service-model json from extract_service_model.py; its tpot_curve "
+                         "overrides --curve (measured on the real box)")
     ap.add_argument("--imbalance", type=float, default=1.6,
                     help="hottest-instance arrival multiplier vs balanced (obs ~1.9)")
     ap.add_argument("--sweep", action="store_true",
@@ -311,6 +333,14 @@ def main() -> int:
                     help="tpot (ms) when KV is full (hypothesis; sensitivity knob)")
     a = ap.parse_args()
     THRASH_TPOT_MS = a.thrash_ms
+    if a.curve_json:
+        _m = json.load(open(a.curve_json))
+        _c = [(int(u), float(v)) for u, v in _m["tpot_curve"]]
+        if _c:
+            TPOT_CURVES["measured"] = [(u, v * a.curve_scale) for u, v in _c]
+            _c = TPOT_CURVES["measured"]
+            a.curve = "measured"
+            print(f"[sim] tpot curve from {a.curve_json}: {_c}")
 
     def run_one(reqs, tag):
         rows = []
@@ -356,7 +386,8 @@ def main() -> int:
     for r in rows:
         c = r["counters"]
         print(f"[{r['policy']}] max_running={r['max_running']} max_waiting={r['max_waiting']} "
-              f"goodput={r['goodput_tok_s']:.1f} tok/s  stop_window={c['stop_window']} "
+              f"goodput={r['goodput_tok_s']:.1f} tok/s ({r['goodput_req_s']:.2f} req/s, "
+              f"{r['good_reqs']} good reqs)  stop_window={c['stop_window']} "
               f"demoted={c['demoted']} preempted={c['preempted']} "
               f"recompute_tokens={c['recompute_tokens']} meas_tpot={r['final_meas_tpot_ms']:.1f}ms "
               f"window={r['final_window']}")

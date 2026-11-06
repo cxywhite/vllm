@@ -1,0 +1,167 @@
+{
+  "source_run": "admission_ab_dense_short/qwen_qwen-lmsys-chat-bimodal_burst_n12000_pd4p4d_tpot30ms_tracebimodal_burst_rep1_20261106_215009_scheme4",
+  "scheduler": "native",
+  "kv_cap_tokens": 881616,
+  "kv_bytes_per_token": 57344,
+  "kv_cap_gib": 47.1,
+  "max_num_seqs": 1024,
+  "tpot_curve": [
+    [
+      32,
+      19.7
+    ],
+    [
+      64,
+      26.0
+    ],
+    [
+      96,
+      29.7
+    ],
+    [
+      128,
+      33.4
+    ],
+    [
+      160,
+      38.1
+    ],
+    [
+      192,
+      41.8
+    ],
+    [
+      224,
+      46.3
+    ],
+    [
+      256,
+      47.9
+    ],
+    [
+      288,
+      49.6
+    ]
+  ],
+  "tpot_curve_source": "borrowed from admission_ab_dense_short/qwen_qwen-lmsys-chat-bimodal_burst_n12000_pd4p4d_tpot30ms_tracebimodal_burst_rep1_20261106_215655_scheme4_gwf",
+  "tpot_curve_detail": {
+    "32": {
+      "n": 363,
+      "p50": 19.7,
+      "p90": 23.7
+    },
+    "64": {
+      "n": 358,
+      "p50": 26.0,
+      "p90": 31.1
+    },
+    "96": {
+      "n": 196,
+      "p50": 29.7,
+      "p90": 35.2
+    },
+    "128": {
+      "n": 91,
+      "p50": 33.4,
+      "p90": 39.0
+    },
+    "160": {
+      "n": 49,
+      "p50": 38.1,
+      "p90": 43.1
+    },
+    "192": {
+      "n": 35,
+      "p50": 41.8,
+      "p90": 47.8
+    },
+    "224": {
+      "n": 21,
+      "p50": 46.3,
+      "p90": 48.6
+    },
+    "256": {
+      "n": 16,
+      "p50": 47.9,
+      "p90": 57.4
+    },
+    "288": {
+      "n": 7,
+      "p50": 49.6,
+      "p90": 55.8
+    }
+  },
+  "tpot_curve_bucket_width": 32,
+  "curve_scale_suggested": 0.82,
+  "measured": {
+    "max_running": 338,
+    "peak_running_per_instance": {
+      "decode2": 338,
+      "decode1": 256,
+      "decode3": 277,
+      "decode0": 181
+    },
+    "routing_imbalance": 1.29,
+    "total_demoted": 0,
+    "total_stop_window": 0,
+    "total_preempted": 0,
+    "max_demoted": 0,
+    "max_stop_window": 0,
+    "max_preempted": 0,
+    "max_kv_pct": null,
+    "min_window": null,
+    "bench": {
+      "Successful requests": 12000.0,
+      "Request throughput (req/s)": 38.91,
+      "Request goodput (req/s)": 13.25,
+      "Output token goodput (tok/s)": 2566.19,
+      "Total token goodput (tok/s)": 3812.34,
+      "Mean TTFT (ms)": 1229.86,
+      "Median TTFT (ms)": 823.38,
+      "P99 TTFT (ms)": 5412.05,
+      "Mean TPOT (ms)": 30.39,
+      "Median TPOT (ms)": 28.95,
+      "P99 TPOT (ms)": 55.17
+    }
+  },
+  "per_request": {
+    "n": 12000,
+    "ttft_ms": {
+      "p50": 823.4316520101856,
+      "p90": 2794.0034299972467,
+      "p99": 5434.980229998473,
+      "max": 7784.085337014403
+    },
+    "tpot_ms": {
+      "p50": 30.228650010598667,
+      "p90": 42.68614590502693,
+      "p99": 55.26033146266622,
+      "max": 58.808540596860745
+    },
+    "output_tokens": {
+      "p50": 200,
+      "p90": 200,
+      "max": 200,
+      "mean": 197.83333333333334
+    },
+    "prompt_len": {
+      "p50": 56,
+      "p90": 216,
+      "max": 650
+    }
+  },
+  "arrival": {
+    "n": 12000,
+    "span_s": 308.4,
+    "req_s": 38.91
+  },
+  "slo": {
+    "ttft_ms": 1000.0,
+    "tpot_ms": 30.0
+  },
+  "notes": [
+    "tpot_curve is p50 meas_tpot per running bucket, from the scheduler's own 1 s lines",
+    "per-request ttft/tpot in the CSV are SECONDS and were multiplied by 1000 here",
+    "kv cap comes from the engine log 'GPU KV cache size: N tokens'"
+  ]
+}
