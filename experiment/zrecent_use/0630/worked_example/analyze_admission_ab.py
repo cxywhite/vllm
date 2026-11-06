@@ -39,6 +39,7 @@ BENCH_PATS = {
 
 GWF_RE = re.compile(
     r"\[WT\]\[GWF\] steps=(\d+) admitted=(\d+) preempted=(\d+) "
+    r"recompute_tokens=(\d+) "
     r"evicted_hopeless=(\d+) demoted=(\d+) hopeless_forced=(\d+) "
     r"stop_window=(\d+) meas_tpot_ms=([-\d.]+) budget_ms=([\d.]+) "
     r"window=(\d+) running=(\d+) waiting=(\d+)")
@@ -59,7 +60,8 @@ def parse_benchmark_log(path: Path) -> dict:
 
 def parse_gwf_counters(decode_logs: list[Path]) -> dict:
     """Sum the per-second GWF counters across a run's decode logs."""
-    tot = {"steps": 0, "admitted": 0, "preempted": 0, "evicted_hopeless": 0,
+    tot = {"steps": 0, "admitted": 0, "preempted": 0,
+           "preempted_recompute_tokens": 0, "evicted_hopeless": 0,
            "demoted": 0, "hopeless_forced": 0, "stop_window": 0}
     meas_tpots: list[float] = []
     for lp in decode_logs:
@@ -72,11 +74,12 @@ def parse_gwf_counters(decode_logs: list[Path]) -> dict:
             tot["steps"] += int(mm.group(1))
             tot["admitted"] += int(mm.group(2))
             tot["preempted"] += int(mm.group(3))
-            tot["evicted_hopeless"] += int(mm.group(4))
-            tot["demoted"] += int(mm.group(5))
-            tot["hopeless_forced"] += int(mm.group(6))
-            tot["stop_window"] += int(mm.group(7))
-            mt = float(mm.group(8))
+            tot["preempted_recompute_tokens"] += int(mm.group(4))
+            tot["evicted_hopeless"] += int(mm.group(5))
+            tot["demoted"] += int(mm.group(6))
+            tot["hopeless_forced"] += int(mm.group(7))
+            tot["stop_window"] += int(mm.group(8))
+            mt = float(mm.group(9))
             if mt >= 0:
                 meas_tpots.append(mt)
     tot["meas_tpot_p50_ms"] = statistics.median(meas_tpots) if meas_tpots else None
@@ -132,7 +135,9 @@ def main() -> int:
         if method == "scheme4_gwf":
             for r in sorted(rs, key=lambda x: x["rep"]):
                 g = r["gwf"]
-                print(f"  rep{r['rep']} GWF: preempted={g['preempted']} demoted={g['demoted']} "
+                print(f"  rep{r['rep']} GWF: preempted={g['preempted']} "
+                      f"recompute_tokens={g['preempted_recompute_tokens']} "
+                      f"demoted={g['demoted']} "
                       f"evicted_hopeless={g['evicted_hopeless']} stop_window={g['stop_window']} "
                       f"meas_tpot_p50={g.get('meas_tpot_p50_ms')}")
         print()
