@@ -12,7 +12,7 @@
 | 3 | 11-06 | burstgpt cap8192 | BERT（坏） | ~11min | greedy goodput=1956.75、p99 TPOT=37.32ms；GWF goodput=1851.73（**Δ=−5.4%**）、计数器全 0 | **封顶后负载太容易**：并发 <257 无悬崖、无 hopeless → GWF 准入门一次没触发，纯开销反而亏 5%。**结论：GWF 在"没悬崖/没 hopeless"时是负收益，必须把负载推到悬崖/长尾才轮到它赢** |
 | 4 | 11-06 | bimodal（300 短×200 + 300 长×8000，10 burst） | **完美预测**（WT_SIMPLIFY_PREDICT=1） | ~9min | greedy goodput=1502.81、p99=65.82ms；GWF goodput=951.02（**Δ=−36.7%**）、计数器仍全 0、meas_tpot_p50=23.4ms | **决定性发现**：双峰负载确实更难（greedy p99 从 37→65.8ms），但 GWF 准入仍一次没触发——两个根因：① **并发不够**：`running` 峰值仅 61（< A/2=128），demote 分支 `\|running\|≥A/2` 永远进不去，window 恒 256、waiting 恒 0；② **测量口径解耦**：meas_tpot（decode 侧 23.4ms）比 SLO（client 侧 median 32.85ms）低 ~10ms。per-request：短请求 good 148/300（49%）、长请求 good 105/300（35%） |
 | 5 | 11-06 | bimodal（300 短×200 + 300 长×**20000**，10 burst） | 完美预测 | ~12min 后崩溃 | benchmark exit 137（SIGKILL）+ "GPU deadlock"；未到 scheme4_gwf 就死 | **假设错了**：加长到 20000 反而**撞 KV 容量**。实测单 decode 实例 GPU KV=**881,616 tokens**；20000+prompt≈20056 → 最多 ~44/实例并发，远 < 128。触发 demote/悬崖要 output ≤ ~3400（悬崖）/~6800（demote） |
-| 6 | 11-06 | dense_short（12000 短×200，300s 内 ~40 req/s） | 完美预测 | 跑中 | 待测 | 换成"高并发短请求"撞悬崖。离线模拟预测：greedy running→2974（悬崖）、GWF gate 触发（stop_window=3376、demoted=9920、window 256→32），但**两者 goodput 都≈0**（256 并发 decode tpot 97ms→客户端 ~107ms > 30ms SLO） |
+| 6 | 11-06 | dense_short（12000 短×200，300s 内 ~40 req/s） | 完美预测 | ~7min | **正向结果**：greedy goodput=2566.19、P99 TPOT=55.17ms；GWF goodput=**2637.21（+2.8%）**、P99 TPOT=**47.39ms（−14.1%）**；GWF running 峰值 **256**、demoted=**1525**、stop_window=**179**、preempted=0 | **第一次 GWF 真正赢**。高并发短请求（200 token、40 req/s）把 running 推到 256（窗口上限）、meas_tpot 到 46–48ms（>30ms）→ hopeless 驱逐 + 窗口限流真正生效。**注意：离线模拟曾预测"两者 goodput≈0"，与实际不符——因为旧 4080 TPOT 曲线（256 并发 97ms）不适用于短请求（实际 ~29ms），短请求 goodput 非零** |
 
 ## 结论快照（随迭代更新）
 
@@ -24,6 +24,7 @@
 - **触发≠有 goodput 增益**：256 并发下 decode tpot ~97ms（旧 4080 数据）→ 客户端 ~107ms > 30ms SLO，goodput 仍归零。真正要赢需要**振荡负载**：短暂高压触发 GWF 甩载 + 随后的低并发期服务短请求（低并发时短请求客户端 tpot ~28ms、49% good）。
 - **负载热点不平衡（3×）**：实测 decode0/1/2/3 running 峰值 61/28/96/18，最热实例 ~3× 平衡值——predictor 路由把请求集中到单个 decode 实例，反而**降低**触发门槛（热实例先到 128）。
 - **预测 miscalibration**（系统 8–13× 过预测）仍是独立短板；已用 `WT_SIMPLIFY_PREDICT=1` 隔离。
+- **✅ 已找到有提升的负载（迭代 #6）**：**高并发短请求**（200 token、~40 req/s、bursty、300s）→ per-instance running 到 **256**（窗口上限）、meas_tpot 到 **46–48ms**（>30ms hopeless 阈值）→ GWF 的 demote(1525)/stop_window(179) 真正触发 → **goodput +2.8%、P99 TPOT −14.1%**。负载画像：**短输出（~200 token）+ 高到达率（~40 req/s）+ 突发**。这是 GWF 能赢的唯一 regime。
 
 ## 踩过的坑（按时间，含修复）
 
