@@ -40,6 +40,8 @@
 
 | 11 | 11-07 | mooncake 两轮（未截断 / 截断 8192） | 观察 | 每轮 ~11 min 后死 | 两轮都在 **首次抢占后 20–70 s 内 deadlock**：kv 触顶 99.8–100 %、首抢占 t≈450 s（running 156–180）、recompute 从 0 跳到 21k–101k、`GPU deadlock detected` → 300s 倒计时 → exit 137。dense_short（kv<60 %、recompute=0）从未 deadlock | **硬约束**：此 build 下 decode 侧本地抢占重算会 deadlock，KV 打满的负载不可用。安全线 kv<95 %。**GWF 的 eV/preemption 路径在本环境不可测**，只能演示「窗口限流+淘汰 hopeless」。窗口收缩也需要 KV 抖动把 TPOT 顶过 120 ms → 同样不可达；要用窗口机制必须调 θ（参数实验，非负载） |
 
+| 12 | 11-07 | 修正 §2.7 + 设计振荡负载 | — | — | 交叉验证：对方独立算出 greedy only-tpot=3301、only-ttft=2145、both=2864，与我一致。几何约束：demote 门 running≥128 处 decode tpot=34 ms、客户端 40 ms，**必然 TPOT 超** → 持续负载下「TTFT 主导、TPOT 干净」不可能 | 改用**振荡负载**（短突发 130–200 → 长静默 <64）。新增约束：请求必须跨过突发尾部，否则生命周期平均 TPOT 仍是高值——`out_tokens > B×1000/(20+0.11r)`（B=5 时 out>136，B=10 时 out>272）。已生成 osc_slow（B5/G60，5400 条，10.3/s）与 osc_fast（B5/G30，10200 条，18.1/s），峰密度均 120/s cluster→设计峰值 running≈150 |
+
 ## 踩过的坑（按时间，含修复）
 
 1. **模型权重路径**：脚本默认 `/root/.cache/.../Qwen-2.5-7b-Instruct` 在慢盘 /dev/sdb1 → 卡死。修复：`QWEN_MODEL_PATH=/root/myshare/models/...`（NVMe）。
