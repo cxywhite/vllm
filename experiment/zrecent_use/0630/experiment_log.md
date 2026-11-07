@@ -86,6 +86,18 @@
     # 3) 崩溃轮的日志尾部
     tail -30 <crash_dir>/log/decode0_*.log
     ```
+19. **同时跑两个评估脚本（严重操作失误，导致"反复断"的假象）**：我在重启时只杀了更早的 PID，**前一个 `test_evaluation_scheme4_rr_compare.sh` 仍在跑**，两个脚本各要 7 张卡、实际只有 8 张 → 互相踩端口/显存/实例，表现为"实例莫名其妙退出、只有部分 decode 在跑"。
+    **正确做法**：
+    ```bash
+    # 启动前必须确认只有一个脚本
+    ps -eo pid,cmd | grep 'test_evaluation_scheme4_rr_compare.sh' | grep -v grep
+    # 停止时按脚本 PID 杀，并确认归零
+    kill -TERM <pid>; sleep 8; ps -eo pid,cmd | grep test_evaluation | grep -v grep | wc -l  # 必须为 0
+    # 再确认 GPU / 端口干净
+    nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
+    ```
+    **排查提示**：如果看到"部分 decode 在跑、部分像死了"，先查**是不是有别的脚本/别的 base 目录在跑**（用 `/proc/<pid>/fd` 看实例实际写哪个日志文件最可靠），不要急着怀疑 vLLM。
+
     另一条相关经验：主日志里的 `Killed`（SIGKILL）**通常是 health guard 判定 down 之后 `stop_servers` 的清理动作**（`kill -TERM -<pgid>` 进程组广播 + `kill -KILL`），**不是崩溃原因本身**；找原因要往它上面的实例自己日志里看。
 
 ## 环境（每次实验都应记录）
