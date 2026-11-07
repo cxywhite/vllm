@@ -44,6 +44,8 @@
 
 | 13 | 11-07 | qwen_cap 4P4D（n=4080，封顶 8192） | 部分 | greedy 1h17m 跑到 76% 被杀 | greedy：running max **455**、kv **100 %**、recompute **74,439**（decode0 22,993 + decode2 51,446，decode1/3 = 0，**只有两个实例打到 KV 上限**）；GWF 变体只跑了 3 min（417/4080）就被杀，`running 105 / kv 13.8 %` 只是爬坡值 | **A/B 不成立，不能比较**。但 greedy 侧证实：qwen_cap 确实把原生推到 KV 悬崖（有效吞吐 ~0.27 req/s 的慢爬），且**不均衡**——只有 2/4 个 decode 实例打满，与 predictor 把长请求集中路由一致。GWF 侧要重跑（现 deadlock guard 已改进度判据，不会再被 util=0 误杀） |
 
+| 14 | 11-07 | dense_short 3rep 抢到空卡后仍崩（rc=137，283 s） | — | — | `[CRASH] dmesg oom recent: sglang::schedul invoked oom-killer ... Out of memory`；崩溃时 `Mem: total 377G used 303G free 7G shared 257G`；随后 `prefill-0 down for 120s` → `INSTANCE_RESTART` → 被 kill | **宿主内存 OOM**，不是 GPU 问题。根因：我们 8 个实例各 `mem_pool_size_gb=32`（P2p KV 共享内存）= **256 GB**，占 377 GB 的 68 %；再叠加同宿主另一个租户的 sglang 作业（shmem-rss 29.8 GB）→ 全局 OOM，内核随机杀进程。**对策：`PREFILL_TENSOR_POOL_MEMORY=8 DECODE_TENSOR_POOL_MEMORY=8`（降到 64 GB）**；200 token 请求每条 KV 仅 ~11 MB，8 GB 足够 |
+
 ## 踩过的坑（按时间，含修复）
 
 > 本文件是**踩坑的唯一记录处**（不再分散到 AGENTS.md / TROUBLESHOOTING.md）。
