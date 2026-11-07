@@ -1684,14 +1684,38 @@ start_servers() {
 }
 run_benchmark_with_health_guard() {
     local client_pid="$1"
+    local bench_log="${2:-}"
     local timeout_seconds="${INSTANCE_DOWN_TIMEOUT_SECONDS}"
     local check_interval="${INSTANCE_HEALTH_CHECK_INTERVAL_SECONDS}"
     declare -A down_since=()
     local deadlock_since=""
+    # [WT] progress-based watchdog state: last tqdm "done/total" we have seen
+    # and when it last changed.  A run is genuinely stuck only when the
+    # completed count stops advancing; GPU util==0 alone is misleading because
+    # KV-bound decode sits at util=0 while still making (slow) progress.
+    local last_progress=""
+    local progress_since=""
 
     while ps -p "$client_pid" >/dev/null 2>&1; do
         local now
         now=$(date +%s)
+
+        # [WT] progress-based watchdog (replaces the util-only heuristic).
+        if [[ -n "$bench_log" && -f "$bench_log" ]]; then
+            local cur_progress
+            cur_progress=$(tail -c 4000 "$bench_log" 2>/dev/null \
+                | tr '\r' '\n' | grep -oE '[0-9]+/[0-9]+' | tail -1)
+            if [[ -n "$cur_progress" ]]; then
+                if [[ "$cur_progress" != "$last_progress" ]]; then
+                    last_progress="$cur_progress"
+                    progress_since="$now"
+                elif [[ -n "$progress_since" ]] && \
+                     (( now - progress_since >= ${WT_PROGRESS_TIMEOUT_SECONDS:-1800} )); then
+                    echo "[ERROR] benchmark progress stuck at ${cur_progress} for $((now - progress_since))s, killing run"
+                    return 3
+                fi
+            fi
+        fi
 
         for i in "${!PREFILL_PIDS[@]}"; do
             local pid="${PREFILL_PIDS[$i]}"
