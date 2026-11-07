@@ -107,6 +107,18 @@
 
 17. **实例间路由的预留集中**：scheme4 路由按"预测未来 token"预留（`Future_Tokens`），长请求会被集中到一个实例（实测某实例 `Future=344k`，其余 1k–4k），使该实例 `pred_bottle` 抬高被后续路由排除。若需均匀，应在 `select_best_instance` 加"Future 超阈值则跳过"的均摊条件。
 
+20. **"ps 显示 0 脚本" ≠ 干净：vLLM 的 EngineCore 会残留占卡**：
+    `kill -TERM` 脚本后，`ps -eo pid,cmd | grep test_evaluation_scheme4 | wc -l` 立刻变成 0，
+    但 **`VLLM::EngineCore` 进程还要 5–10 秒才退出**，期间 GPU 仍被占（8 卡各 ~66GB）。
+    下一轮启动时实例分不到显存/端口 → proxy 报 `proxy died immediately` + 503 连接错误。
+    **正确验证（必须三条都满足）**：
+    ```bash
+    ps -eo pid,cmd | grep -E 'VLLM|vllm|EngineCore|APIServer' | grep -v grep | wc -l   # 0
+    nvidia-smi --query-gpu=index,memory.used --format=csv,noheader                     # 全 0 MiB
+    nvidia-smi | sed -n '/Processes/,$p'                                               # No running processes
+    ```
+    并 `sleep 5~10` 等 vLLM 释放 NCCL/共享内存再启动下一轮。
+
 18. **查崩溃日志查错目录（排查方法论错误，务必避免）**：评估脚本**实例崩溃重启时会新建一个目录**（`timestamp=$(date +%Y%m%d_%H%M%S)` + `setup_directories`），所以：
     - **最新目录（`ls -dt | head -1`）是"重启后的新轮"，不是崩掉的那轮**；
     - 崩溃现场在**次新目录**（或主日志里 `[WT][INSTANCE_RESTART]` 那一行上面的目录）；
