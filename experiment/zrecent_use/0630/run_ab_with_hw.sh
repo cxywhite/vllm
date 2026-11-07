@@ -33,6 +33,9 @@ SAMPLER="${SAMPLER:-$HERE/hw_metrics_sampler_v2.py}"
 HW_INTERVAL_S="${HW_INTERVAL_S:-5}"
 HW_GPU_BUSY_MIB="${HW_GPU_BUSY_MIB:-2000}"
 HW_ALLOW_BUSY_GPU="${HW_ALLOW_BUSY_GPU:-0}"
+# Only check the GPUs this run will actually use: on a shared box GPU0 can belong
+# to another tenant while a 3P4D run only wants GPU1-7 (AGENTS.md §13).
+HW_CHECK_GPUS="${HW_CHECK_GPUS:-}"
 OUT_DIR="${BASE_RESULT_DIR:-$HERE/admission_ab_hw}"
 mkdir -p "$OUT_DIR"
 STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -42,9 +45,14 @@ echo "[hw] wrapper: eval=$EVAL_SCRIPT"
 echo "[hw] output csv: $CSV"
 
 # ---------------- 1. pre-flight: is the box ours? ----------------
-max_used_mib=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
-  | awk 'BEGIN{m=0} {if ($1+0 > m) m=$1+0} END{print m+0}')
-echo "[hw] pre-flight: max GPU memory in use = ${max_used_mib} MiB (threshold ${HW_GPU_BUSY_MIB} MiB)"
+if [[ -n "$HW_CHECK_GPUS" ]]; then
+  max_used_mib=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null \
+    | awk -v want=",$HW_CHECK_GPUS," -F',' 'BEGIN{m=0} {g=$1+0; v=$2+0; if (index(want, "," g ",") && v>m) m=v} END{print m+0}')
+else
+  max_used_mib=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
+    | awk 'BEGIN{m=0} {if ($1+0 > m) m=$1+0} END{print m+0}')
+fi
+echo "[hw] pre-flight: max GPU memory in use = ${max_used_mib} MiB (threshold ${HW_GPU_BUSY_MIB} MiB, gpus='${HW_CHECK_GPUS:-all}')"
 if (( max_used_mib > HW_GPU_BUSY_MIB )) && [[ "$HW_ALLOW_BUSY_GPU" != "1" ]]; then
   echo "[hw] REFUSING to start: GPUs already hold ${max_used_mib} MiB." >&2
   echo "[hw] Foreign compute apps (host view):" >&2

@@ -19,12 +19,14 @@ Read-only.
 from __future__ import annotations
 
 import argparse
+import csv as _csvmod
 import glob
 import os
 import re
 import statistics as st
 import sys
 
+_csvmod.field_size_limit(1 << 30)   # prompts are long; default 128 KiB limit trips
 KV_CAP_TOKENS = 881_616
 
 

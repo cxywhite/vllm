@@ -46,6 +46,8 @@
 
 | 14 | 11-07 | dense_short 3rep 抢到空卡后仍崩（rc=137，283 s） | — | — | `[CRASH] dmesg oom recent: sglang::schedul invoked oom-killer ... Out of memory`；崩溃时 `Mem: total 377G used 303G free 7G shared 257G`；随后 `prefill-0 down for 120s` → `INSTANCE_RESTART` → 被 kill | **宿主内存 OOM**，不是 GPU 问题。根因：我们 8 个实例各 `mem_pool_size_gb=32`（P2p KV 共享内存）= **256 GB**，占 377 GB 的 68 %；再叠加同宿主另一个租户的 sglang 作业（shmem-rss 29.8 GB）→ 全局 OOM，内核随机杀进程。**对策：`PREFILL_TENSOR_POOL_MEMORY=8 DECODE_TENSOR_POOL_MEMORY=8`（降到 64 GB）**；200 token 请求每条 KV 仅 ~11 MB，8 GB 足够 |
 
+| 15 | 11-07 | **qwen_o1500 3P4D（decode gmu=0.5）** | 完美预测 | 20 min / 17 min | **迄今最好**：greedy goodput **0.48** / GWF **0.81 req/s（+68.8 %）**；output-token goodput 274→578 tok/s（**+110.8 %**）；P99 TPOT **311.6→87.1 ms（−72 %）**；mean E2EL 100.0→81.2 s；recompute **796,044→0**；running 366→256；kv 两者都 100 %；代价：P99 TTFT 12.8→17.0 s | **机制终于对上论文**：greedy 把 running 推到 366 > KV 容量 → 抢占+重算 796k token → TPOT p99 312 ms，几乎没人能满足 30 ms SLO；GWF 的窗口 256 恰好等于该序列长度下的 KV 容量 → 零抢占 → TPOT p99 87 ms。**增益全部来自"窗口≈KV容量"**。对照 `wl_util07_o1500v2`（gmu=0.7、v2 trace）GWF 反而 −7.4 %（P99 TTFT 315 s 饿死）→ 结论对配置敏感，必须在 gmu=0.5 这一档确认 |
+
 ## 踩过的坑（按时间，含修复）
 
 > 本文件是**踩坑的唯一记录处**（不再分散到 AGENTS.md / TROUBLESHOOTING.md）。
