@@ -1682,6 +1682,32 @@ start_servers() {
     done
     return 0
 }
+# [WT] crash-context recorder: when an instance goes down, capture everything
+# needed to diagnose it later (its own log tail, host memory, GPU state, dmesg
+# OOM).  Without this the crash reason is lost: the restart truncates the
+# per-instance log and the process is gone by the time someone looks.
+_wt_dump_instance_context() {
+    local key="$1"
+    local idx="$2"
+    local kind="${key%%-*}"      # prefill / decode
+    echo "[CRASH] ===== ${key} down at $(date '+%F %T') ====="
+    echo "[CRASH] host memory:"; free -g 2>/dev/null | head -3
+    echo "[CRASH] gpu:"
+    nvidia-smi --query-gpu=index,memory.used,utilization.gpu \
+        --format=csv,noheader 2>/dev/null | head -8
+    echo "[CRASH] dmesg oom recent:"
+    dmesg 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -3
+    local _f
+    _f=$(ls "${LOG_DIR}/${kind}${idx}_"*.log 2>/dev/null | head -1)
+    if [[ -n "$_f" ]]; then
+        echo "[CRASH] last 30 lines of ${_f}:"
+        tail -30 "$_f" 2>/dev/null | cut -c1-220
+    else
+        echo "[CRASH] (no log file matched ${kind}${idx}_*)"
+    fi
+    echo "[CRASH] ===== end ${key} ====="
+}
+
 run_benchmark_with_health_guard() {
     local client_pid="$1"
     local bench_log="${2:-}"
@@ -1699,6 +1725,17 @@ run_benchmark_with_health_guard() {
     while ps -p "$client_pid" >/dev/null 2>&1; do
         local now
         now=$(date +%s)
+
+        # [WT] periodic host/GPU snapshot (every 60 s) for post-mortem analysis:
+        # when a run dies we want to know whether the host ran out of memory or
+        # the GPUs were idle right before it.
+        if [[ -z "${_last_sys_snapshot:-}" ]] || (( now - _last_sys_snapshot >= 60 )); then
+            _last_sys_snapshot="$now"
+            local _memline _gpuline
+            _memline=$(free -g 2>/dev/null | awk '/^Mem:/{printf "used=%sG free=%sG avail=%sG", $3, $4, $7}')
+            _gpuline=$(nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader 2>/dev/null | tr '\n' ' ')
+            echo "[SYS] $(date '+%F %T') mem: ${_memline} | gpu: ${_gpuline}"
+        fi
 
         # [WT] progress-based watchdog (replaces the util-only heuristic).
         if [[ -n "$bench_log" && -f "$bench_log" ]]; then
@@ -1724,6 +1761,7 @@ run_benchmark_with_health_guard() {
                 if [[ -z "${down_since[$key]:-}" ]]; then
                     down_since[$key]="$now"
                     echo "[WARN] ${key} down, start countdown"
+                    _wt_dump_instance_context "$key" "$i"
                 elif (( now - down_since[$key] >= timeout_seconds )); then
                     echo "[ERROR] ${key} down for ${timeout_seconds}s"
                     return 2
@@ -1740,6 +1778,7 @@ run_benchmark_with_health_guard() {
                 if [[ -z "${down_since[$key]:-}" ]]; then
                     down_since[$key]="$now"
                     echo "[WARN] ${key} down, start countdown"
+                    _wt_dump_instance_context "$key" "$i"
                 elif (( now - down_since[$key] >= timeout_seconds )); then
                     echo "[ERROR] ${key} down for ${timeout_seconds}s"
                     return 2
