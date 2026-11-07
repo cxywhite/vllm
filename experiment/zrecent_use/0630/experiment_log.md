@@ -140,6 +140,22 @@
     `NCCL_MAX_NCHANNELS=8 NCCL_MIN_NCHANNELS=8 NCCL_CUMEM_ENABLE=1`。
     **排查口诀**：prefill/decode 随机单卡挂 → 先搜 `Caught signal 11` + `backtrace`，别只盯 OOM 和看门狗。
 
+22. **4P4D 启动时部分实例挂掉：多租户 GPU 冲突（不是磁盘！我判断错过）**：
+    症状：4P4D 的 8 个实例只起来 4 个（`nvidia-smi` 有 4 张卡 0 MiB），失败实例报
+    `RuntimeError: Engine core initialization failed`，日志停在 `Loading safetensors checkpoint shards: 0/4~1/4`。
+    **错误诊断（务必避免）**：看到 `/root/myshare` 100% 满（仅剩 20G）就归因为"磁盘不足"。
+    实际上模型加载是**读**操作，磁盘满不影响读；且 `/dev/shm` 只用了 9%、cgroup `oom_kill=0`、dmesg 无新 OOM。
+    **真因（多用户冲突）**：`dmesg` 里有 6 条
+    `Cannot map memory with base addr 0x... and size of 0x800000 pages`
+    （0x800000 pages × 4KB = 32GB）。共享主机上**别的租户已占用部分 GPU 显存**
+    （实测 GPU 2/3/7 有 18–32GB 属于其他容器），vLLM 按 `gpu_memory_utilization=0.8`
+    预留 64GB 虚拟映射时被 CUDA 拒绝 → `Engine core initialization failed`。
+    **判断口诀**：多实例启动失败时，先 `nvidia-smi` 看**每张卡已用显存是否被别人占着**
+    （`nvidia-smi --query-compute-apps=pid,used_memory` 里 PID 不在本容器 = 其他租户），
+    再 `dmesg | grep 'Cannot map memory'` 确认；**不要一看磁盘满就下结论**。
+    **规避**：① 优先用 3P4D（7 实例，已多次成功）；② 等别的租户释放显存后再上 4P4D；
+    ③ 不要盲目调高 `gpu_memory_utilization`。
+
 18. **查崩溃日志查错目录（排查方法论错误，务必避免）**：评估脚本**实例崩溃重启时会新建一个目录**（`timestamp=$(date +%Y%m%d_%H%M%S)` + `setup_directories`），所以：
     - **最新目录（`ls -dt | head -1`）是"重启后的新轮"，不是崩掉的那轮**；
     - 崩溃现场在**次新目录**（或主日志里 `[WT][INSTANCE_RESTART]` 那一行上面的目录）；
