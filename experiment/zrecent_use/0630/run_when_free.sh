@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Wait for a free A/B slot, then run the dense_short 3-rep confirmation, with retries.
+# Wait for a free A/B slot, then run ONE dense_short A/B rep (scheme4 + scheme4_gwf),
+# repeating across slots until we have 3 paired reps.
+#
+# One rep at a time (~15 min) instead of RUN_REPEAT_PER_CONFIG=3 (~50 min): this box
+# is shared, and a single lost slot must not throw away the whole confirmation.
 #
 # "Free" means: no other eval process, every GPU < 2 GiB, and none of our ports
 # (22xxx / 28002) listening -- held for two consecutive checks (40 s), so we do
@@ -17,7 +21,8 @@ LOG="${2:-/root/myshare/ab_logs/confirm_dense_short_3rep.log}"
 
 free_now() {
   local n used ports
-  n=$(pgrep -fc 'test_evaluation_scheme4_rr_compare' 2>/dev/null || echo 0)
+  # bracket trick avoids counting the grep itself; pgrep -c also exits 1 on 0
+  n=$(ps -eo cmd | grep -c '[t]est_evaluation_scheme4_rr_compare')
   used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | sort -n | tail -1)
   ports=$(ss -ltn 2>/dev/null | grep -cE ':220[0-9][0-9]|:28002')
   (( n == 0 && used < 2000 && ports == 0 ))
@@ -26,7 +31,7 @@ free_now() {
 for attempt in $(seq 1 "$ATTEMPTS"); do
   echo "[grab] attempt $attempt/$ATTEMPTS: waiting for a free slot ($(date -Is))"
   got=0
-  for _ in $(seq 1 180); do          # up to 3 h per attempt
+  for _ in $(seq 1 540); do          # 540 x 20 s = 3 h per attempt
     if free_now; then
       sleep 20
       if free_now; then got=1; break; fi
@@ -45,8 +50,8 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
   PREFILL_TENSOR_POOL_MEMORY=8 DECODE_TENSOR_POOL_MEMORY=8 \
   WT_SIMPLIFY_PREDICT=1 WT_NATIVE_LOG_INTERVAL_MS=1000 \
   COMPARE_EXPERIMENT_VARIANTS="scheme4 scheme4_gwf" PD_RATIO_LIST="4:4" TPOT_MS_LIST="30" \
-  RUN_REPEAT_PER_CONFIG=3 TRACE_NAME=bimodal_burst DATASET_BASE_DIR="$HERE/admission_ab_base" \
-  BASE_RESULT_DIR="$HERE/admission_ab_confirm3c" \
+  RUN_REPEAT_PER_CONFIG=1 TRACE_NAME=bimodal_burst DATASET_BASE_DIR="$HERE/admission_ab_base" \
+  BASE_RESULT_DIR="$HERE/admission_ab_confirm_1rep" \
     bash "$HERE/run_ab_with_hw.sh" >> "$LOG" 2>&1
   rc=$?
   echo "[grab] attempt $attempt finished rc=$rc at $(date -Is)"
