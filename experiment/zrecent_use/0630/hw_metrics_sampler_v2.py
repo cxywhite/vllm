@@ -114,9 +114,12 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _on_sig)
     signal.signal(signal.SIGINT, _on_sig)
 
-    dmon = subprocess.Popen(
-        ["nvidia-smi", "dmon", "-s", "pucvmet", "-d", str(int(max(1, args.interval)))],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    def _spawn_dmon() -> subprocess.Popen:
+        return subprocess.Popen(
+            ["nvidia-smi", "dmon", "-s", "pucvmet", "-d", str(int(max(1, args.interval)))],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+
+    dmon = _spawn_dmon()
     assert dmon.stdout is not None
 
     start = time.time()
@@ -127,11 +130,28 @@ def main() -> int:
         w = csv.writer(f)
         w.writerow(_header(n_gpu))
         f.flush()
+        respawns = 0
         while not stop["flag"] and time.time() < deadline:
             line = dmon.stdout.readline()
-            if line == "":  # dmon exited
-                print("[hw_sampler] dmon closed stdout", file=sys.stderr)
-                break
+            if line == "":  # dmon exited (killing the engines can take dmon down too)
+                if stop["flag"] or time.time() >= deadline:
+                    break
+                respawns += 1
+                if respawns > 50:
+                    print("[hw_sampler] dmon died 50x, giving up", file=sys.stderr)
+                    break
+                # without this the sampler silently stopped at 22:21 during the
+                # mooncake deadlock, so the preemption window had no hardware data
+                print(f"[hw_sampler] dmon closed stdout, respawning ({respawns})",
+                      file=sys.stderr)
+                time.sleep(min(30.0, 2.0 * respawns))
+                try:
+                    dmon.kill()
+                except Exception:
+                    pass
+                dmon = _spawn_dmon()
+                pending = {}
+                continue
             if line.lstrip().startswith("#"):
                 continue
             parsed = _parse_row(line)
