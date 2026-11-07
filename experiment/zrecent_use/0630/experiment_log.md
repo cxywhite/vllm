@@ -48,6 +48,8 @@
 
 | 15 | 11-07 | **qwen_o1500 3P4D（decode gmu=0.5）** | 完美预测 | 20 min / 17 min | **迄今最好**：greedy goodput **0.48** / GWF **0.81 req/s（+68.8 %）**；output-token goodput 274→578 tok/s（**+110.8 %**）；P99 TPOT **311.6→87.1 ms（−72 %）**；mean E2EL 100.0→81.2 s；recompute **796,044→0**；running 366→256；kv 两者都 100 %；代价：P99 TTFT 12.8→17.0 s | **机制终于对上论文**：greedy 把 running 推到 366 > KV 容量 → 抢占+重算 796k token → TPOT p99 312 ms，几乎没人能满足 30 ms SLO；GWF 的窗口 256 恰好等于该序列长度下的 KV 容量 → 零抢占 → TPOT p99 87 ms。**增益全部来自"窗口≈KV容量"**。对照 `wl_util07_o1500v2`（gmu=0.7、v2 trace）GWF 反而 −7.4 %（P99 TTFT 315 s 饿死）→ 结论对配置敏感，必须在 gmu=0.5 这一档确认 |
 
+| 16 | 11-07 | **qwen_o1500 3P4D gmu=0.5 复现**（我的确认跑，rep1 完成 / rep2 崩于 instance_restart） | 完美预测 | 57 min（2 次完整 run + 1 次重启） | rep1：greedy goodput **0.56**（recompute 425,748；running 494）/ GWF **0.64**（recompute **0**；running 256）→ **+14.3 %**；rep2 greedy 0.49（n=3968，recompute 258,542） | **方向复现、幅度不回**：两次配对 +68.8 %（对方）与 +14.3 %（我）→ 配对中位数 +41.5 %；按均值 pooled（greedy n=3 均值 0.510，GWF n=2 均值 0.725）**+42.2 %**。**三个 greedy run 的 recompute 258k–428k → 两个 GWF run 全部 0**，机制稳定（窗口 256 ≈ KV 容量）。幅度方差大是因为 goodput 是尾部统计量（0.5–0.8 / 4 req/s），需要更多 rep 才能给中位数 |
+
 ## 踩过的坑（按时间，含修复）
 
 > 本文件是**踩坑的唯一记录处**（不再分散到 AGENTS.md / TROUBLESHOOTING.md）。

@@ -19,6 +19,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ATTEMPTS="${1:-4}"
 LOG="${2:-/root/myshare/ab_logs/confirm_dense_short_3rep.log}"
 
+# Which workload to grab a slot for (defaults reproduce the dense_short runs).
+TRACE="${TRACE:-bimodal_burst}"
+PD_RATIO="${PD_RATIO:-4:4}"
+DECODE_GMU="${DECODE_GMU:-0.8}"
+CHECK_GPUS="${CHECK_GPUS:-}"          # empty = all 8
+OUT_DIR="${OUT_DIR:-$HERE/admission_ab_confirm3c}"
+REPS="${REPS:-1}"
+
 free_now() {
   local n used ports
   # bracket trick avoids counting the grep itself; pgrep -c also exits 1 on 0
