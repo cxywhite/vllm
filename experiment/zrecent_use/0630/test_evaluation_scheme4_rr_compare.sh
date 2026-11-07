@@ -233,6 +233,14 @@ PD_4P4D_DECODE_GPUS=${PD_4P4D_DECODE_GPUS:-4,5,6,7}
 PD_4P4D_DECODE_PORTS=${PD_4P4D_DECODE_PORTS:-22020,22021,22022,22023}
 PD_4P4D_DECODE_KV_PORTS=${PD_4P4D_DECODE_KV_PORTS:-22032,22033,22034,22035}
 
+# 3P4D: 3 prefill + 4 decode = 7 GPUs (frees GPU 3 for other work).
+PD_3P4D_PREFILL_GPUS=${PD_3P4D_PREFILL_GPUS:-0,1,2}
+PD_3P4D_PREFILL_PORTS=${PD_3P4D_PREFILL_PORTS:-22001,22002,22003}
+PD_3P4D_PREFILL_KV_PORTS=${PD_3P4D_PREFILL_KV_PORTS:-22011,22012,22013}
+PD_3P4D_DECODE_GPUS=${PD_3P4D_DECODE_GPUS:-4,5,6,7}
+PD_3P4D_DECODE_PORTS=${PD_3P4D_DECODE_PORTS:-22020,22021,22022,22023}
+PD_3P4D_DECODE_KV_PORTS=${PD_3P4D_DECODE_KV_PORTS:-22032,22033,22034,22035}
+
 # Active runtime assignment is selected by configure_pd_ratio().
 # Initialize with 1:3 profile so cleanup paths always have valid values.
 PREFILL_GPUS="$PD_1P3D_PREFILL_GPUS"
@@ -772,8 +780,16 @@ configure_pd_ratio() {
             DECODE_PORTS="$PD_4P4D_DECODE_PORTS"
             DECODE_KV_PORTS="$PD_4P4D_DECODE_KV_PORTS"
             ;;
+        3:4)
+            PREFILL_GPUS="$PD_3P4D_PREFILL_GPUS"
+            PREFILL_PORTS="$PD_3P4D_PREFILL_PORTS"
+            PREFILL_KV_PORTS="$PD_3P4D_PREFILL_KV_PORTS"
+            DECODE_GPUS="$PD_3P4D_DECODE_GPUS"
+            DECODE_PORTS="$PD_3P4D_DECODE_PORTS"
+            DECODE_KV_PORTS="$PD_3P4D_DECODE_KV_PORTS"
+            ;;
         *)
-            echo "ERROR: unsupported PD ratio=${pd_ratio}, expected 1:3 / 2:6 / 4:4"
+            echo "ERROR: unsupported PD ratio=${pd_ratio}, expected 1:3 / 2:6 / 4:4 / 3:4"
             return 1
             ;;
     esac
