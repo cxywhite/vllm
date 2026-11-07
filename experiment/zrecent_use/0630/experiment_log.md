@@ -55,6 +55,24 @@
 9. **GPU deadlock → benchmark exit 137**：日志 `[WARN] GPU deadlock detected (decode GPUs ... util=0)`，随后 benchmark 被 SIGKILL。重负载 trace 下 decode 实例会短时假死，看门狗 300s 倒计时；若没恢复则整轮报废。
 10. **离线模拟器 `worked_example/sim_admission.py`**：秒级预测 greedy/GWF 的 max_running/waiting/gate 计数器。注意 feed 用 `share=imbalance/N`（实测热实例 ~3× 平衡，默认 `--imbalance 3.0`）；goodput 预测受 TPOT 曲线校准限制（旧 4080 曲线不可靠，需 `wt_concurrency_probe.py` 重测干净负载曲线）。
 
+11. **死锁看门狗误杀（已默认关闭）**：判据只看"decode GPU `utilization.gpu`==0 持续 300s"，但 **KV-bound 忙等时 util 也会是 0**，导致仍在推进的轮次被当死锁杀掉（qwen_cap scheme4 在 3111/4080 被杀，白扔 76%）。修复：
+    - 默认关闭（`WT_ENABLE_GPU_DEADLOCK_GUARD=1` 才启用）；
+    - 新增**进度判据看门狗**：解析 bench log 的 tqdm `done/total`，`WT_PROGRESS_TIMEOUT_SECONDS`（默认 1800s）内完成数不动才判死（`test_evaluation_scheme4_rr_compare.sh` 的 `run_benchmark_with_health_guard`）。
+    - 判据口诀：**"util=0 是 KV-bound 的正常现象；完成数不动才是真死"**。
+
+12. **P2P NCCL resumed-request 死锁（vLLM bug，已 patch）**：P/D 分离下，decode 端请求被抢占后重新准入，`start_load_kv → recv_first_available` 会**无限阻塞**（`p2p_nccl_engine.py` 的 `while True: recv_store_cv.wait()` 无超时），因为 prefill 早已完成该请求并释放 KV，不会再发。症状：decode EngineCore 停在 `recv_first_available`，GPU util=0，prefill 栈却是 `_process_input_queue → queue.get`（空闲）。修复（vllm `cef34ada1`）：`get_num_new_matched_tokens` 里 `if getattr(request,"preempt_count",0) > 0: return 0, False`，让 decode **本地重算**（方案 B）。
+    - 诊断命令：`py-spy dump --pid <EngineCore_pid> --nonblocking`，看是否卡在 `recv_first_available`。
+
+13. **清理漏掉大写 `VLLM::EngineCore`（ZMQ 端口残留）**：kill 的 grep 用小写 `vllm` 匹配不到 `VLLM::EngineCore`（大写），旧引擎进程继续占 `tcp://127.0.0.1:22032` 等 KV 端口 → 新轮 `zmq.error.ZMQError: Address already in use` → 启动失败进重启循环。修复：清理时用**大小写不敏感**匹配（`grep -E 'VLLM|vllm|EngineCore|APIServer|benchmark_serving'`），杀完必须验证 `ss -ltn | grep ':2203[2-5]'` 为空、`nvidia-smi` 全 0 MiB。
+
+14. **GitHub 推送被假阳性 secret 拦截**：trace CSV 的 prompt 里含 `sk-...` 文本，被 GitHub secret scanning 判成 OpenAI Key，阻塞整个分支推送（13 个未推送提交全被拦）。修复：对 `admission_ab_base/**/*.csv` 做**等长替换** `sk-` → `sk_`（不改 prompt 长度/负载），再用 `git filter-branch --tree-filter` 重写全部未推送提交（`origin..HEAD`），推送前用 `git grep -l 'sk-' <commit> -- '*.csv'` 逐个验证干净。
+
+15. **KV thrash（trace 总量 > KV 总量）**：qwen_cap8192 总输出 14.94M token，而 4 个 decode 的 KV 合计仅 ~3.5M（881,616/实例）→ 必然"抢占 + 重算"慢爬（~0.27 req/s、ETA 数小时），且**不是死锁**（decode 进程仍 40%+ CPU）。判据：`kv_usage_pct≈100%` 且 `preempted_recompute_tokens` 持续增长、进度条极慢。对策：**把 trace 缩到 KV 容量内**（总输出 ≤ ~3M）。
+
+16. **3P4D 的 GPU 分配**：共享机上 GPU 0 可能被别的租户占用（`nvidia-smi` 里 PID 不在自己 `ps` 中）。3P4D 配置为 **prefill=GPU 1,2,3 / decode=GPU 4,5,6,7**（7 卡），可用 `PD_RATIO_LIST="3:4"`；启动前先 `nvidia-smi --query-compute-apps=pid,used_memory` 确认哪些卡空闲。
+
+17. **实例间路由的预留集中**：scheme4 路由按"预测未来 token"预留（`Future_Tokens`），长请求会被集中到一个实例（实测某实例 `Future=344k`，其余 1k–4k），使该实例 `pred_bottle` 抬高被后续路由排除。若需均匀，应在 `select_best_instance` 加"Future 超阈值则跳过"的均摊条件。
+
 ## 环境（每次实验都应记录）
 
 - 8× A800-80GB，4P4D，Qwen-2.5-7B-Instruct，TTFT SLO 1000ms / TPOT SLO 30ms，vLLM v0.11.0。
