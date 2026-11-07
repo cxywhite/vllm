@@ -46,6 +46,38 @@
 
 ## 踩过的坑（按时间，含修复）
 
+> 本文件是**踩坑的唯一记录处**（不再分散到 AGENTS.md / TROUBLESHOOTING.md）。
+> 先看下面的速查表定位，再看后面按时间编号的详细条目。
+
+### 速查表（症状 → 判据 → 修复）
+
+| 症状 | 判据 | 修复 |
+|---|---|---|
+| 模型加载卡死，显存停 ~498 MiB | `[c10d] server socket ... timed out` | `export VLLM_HOST_IP=127.0.0.1 NCCL_SOCKET_IFNAME=lo GLOO_SOCKET_IFNAME=lo` |
+| 模型加载极慢 | 权重在 `/root/.cache`（/dev/sdb1 慢盘） | 用 `/root/myshare/models/...`（NVMe） |
+| `InvalidURL: Invalid port ':1]'` | `no_proxy` 含 `::1`/`[::1]` | `export no_proxy=localhost,127.0.0.1 NO_PROXY=localhost,127.0.0.1` |
+| 启动 `ZMQError: Address already in use` | 旧引擎占着 `tcp://127.0.0.1:2203x` | 杀进程时**必须含大写 `VLLM::EngineCore`**；验 `ss -ltn \| grep ':2203[2-5]'` 为空 |
+| 看门狗报 `GPU deadlock` 并杀轮次 | decode GPU `util=0` 持续 300s | **误杀**（KV-bound 时 util 也是 0）。已默认关；改用"tqdm 完成数 1800s 不动"判死 |
+| decode 引擎完全不动、util=0 | `py-spy dump` 卡在 `recv_first_available`，prefill 栈空闲 | **vLLM P2P bug**：resumed 请求不该等 prefill KV。已 patch `cef34ada1`（decode 本地重算） |
+| 进度极慢（~0.27 req/s）、`kv_usage_pct≈100%` | trace 总输出 > 实例数×881,616 | **KV thrash，不是死锁**。缩 trace 到 ≤~3M token |
+| **只有部分 decode 在跑、部分像死了** | **先查是否同时跑了两个评估脚本**（`ps -eo pid,cmd \| grep test_evaluation_scheme4 \| wc -l` 必须=1；用 `/proc/<pid>/fd` 看实例实际写哪个日志最可靠） | 两脚本各要 7 卡、只有 8 卡 → 互相踩。停掉多余脚本 |
+| 查不到崩溃原因 | **最新目录是"重启后的新轮"，崩溃现场在次新目录** | `ls -dt <BASE>/*/` → `grep -n 'INSTANCE_RESTART' <main>.log` → `tail -30 <crash_dir>/log/decode0_*.log` |
+| 把 `Killed` 当崩溃原因 | `Killed` 是 health guard 判 down 后 `stop_servers` 的清理广播 | 原因看崩溃轮实例自己日志尾部 + 宿主内存/GPU/dmesg |
+| `git push` 被 `GH013 secret scanning` 拦 | trace CSV 含 `sk-` 文本 | 等长替换 `sk-`→`sk_` + `git filter-branch --tree-filter` 重写 `origin..HEAD` |
+| GWF 计数器全 0 | 并发没到门槛（demote 需 `running≥128`、窗口需 `≥256`） | 用短请求+高到达率；长请求撞 KV 反把并发压到 186 以下 |
+| 长请求并发上不去 | `并发 ≤ 881,616/(prompt+output)` | output 8000/20000 → 并发 ~107/~44 |
+| 路由把长请求集中到一个实例 | scheme4 按 `Future_Tokens` 预留（实测某实例 344k、其余 1k–4k） | 在 `select_best_instance` 加"Future 超阈值跳过" |
+
+### 当前可观测性（已内置）
+
+- `[SYS]`：健康检查循环每 60s 打宿主内存（used/free/avail）+ 8 卡 util/mem。
+- `[CRASH]`：任一实例 down 时自动 dump 该实例日志尾部 30 行 + 宿主内存 + GPU + dmesg OOM。
+- `[WT][NATIVE]` / `[WT][GWF]`：每 1s 打 KV/running/waiting/抢占计数（GWF 另有 `demoted/stop_window/meas_tpot/window`）。
+- `[WT][MONITOR]`：proxy 视角每实例 `reqs/curr_bottle/pred_bottle/Future`。
+- bench 进度条：`done/total`，配合进度判据看门狗。
+
+### 详细条目（按时间）
+
 1. **模型权重路径**：脚本默认 `/root/.cache/.../Qwen-2.5-7b-Instruct` 在慢盘 /dev/sdb1 → 卡死。修复：`QWEN_MODEL_PATH=/root/myshare/models/...`（NVMe）。
 2. **proxy InvalidURL**：`no_proxy` 含 `::1`/`[::1]` → httpx 崩。修复：`no_proxy=localhost,127.0.0.1`。
 3. **c10d 卡死**：未设 `VLLM_HOST_IP` 时 `get_ip()` 取 hostname 连不通。修复：`VLLM_HOST_IP=127.0.0.1 NCCL_SOCKET_IFNAME=lo GLOO_SOCKET_IFNAME=lo`。判据：GPU 显存停在 ~498 MiB。

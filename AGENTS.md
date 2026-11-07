@@ -124,58 +124,8 @@ vLLM `get_ip()` 未设 `VLLM_HOST_IP` 时会 UDP 探测 8.8.8.8 取机器 IP（�
 找到有提升的负载后，才对该配置补 `RUN_REPEAT_PER_CONFIG=3` 取中位数做最终确认。
 （注意："关键指标至少 3 次取中位数"的约定适用于 I/O 压测；disagg A/B 迭代先用 1 次快速试错。）
 
-### 8. 死锁看门狗会误杀 KV-bound 的慢跑（默认已关）
-
-旧判据只看 decode GPU `utilization.gpu`==0 持续 300s，但 **KV-bound 忙等时 util 也是 0**，
-曾把已跑到 3111/4080 的 qwen_cap scheme4 杀掉。现在：
-- 默认关闭，`WT_ENABLE_GPU_DEADLOCK_GUARD=1` 才启用；
-- 改用**进度判据**：bench log 的 tqdm `done/total` 在 `WT_PROGRESS_TIMEOUT_SECONDS`（默认 1800s）
-  内不动才判死。
-- 一句话：**"util=0 是正常现象，完成数不动才是真死"**。
-
-### 9. P2P NCCL resumed-request 死锁（vLLM bug，已 patch `cef34ada1`）
-
-P/D 分离下 decode 请求被抢占后重新准入，`start_load_kv → recv_first_available` 会**无限阻塞**
-（prefill 早已完成该请求并释放 KV，不会再发）。症状：decode EngineCore 卡在 `recv_first_available`，
-GPU util=0，而 prefill 栈是 `_process_input_queue → queue.get`（空闲）。
-诊断：`py-spy dump --pid <EngineCore_pid> --nonblocking`。
-修复：`get_num_new_matched_tokens` 里 `preempt_count>0 → return 0, False`（decode 本地重算，方案 B）。
-注意：方案 B 会把重算算力压在 decode（瓶颈）上；论文口径更理想的是**被抢占请求回 prefill 重算**（方案 A）。
-
-### 10. 清理必须包含大写 `VLLM::EngineCore`
-
-kill 时 grep 用小写 `vllm` 匹配不到 `VLLM::EngineCore`（大写），旧引擎会继续占
-`tcp://127.0.0.1:22032` 等 KV 端口 → 新轮 `zmq.error.ZMQError: Address already in use` → 启动失败循环。
-清理后必须验证：`ss -ltn | grep ':2203[2-5]'` 为空 + `nvidia-smi` 全 0 MiB。
-
-### 11. GitHub 推送被假阳性 secret 拦
-
-trace CSV 的 prompt 里含 `sk-...` 文本会被判成 OpenAI Key，阻塞整条分支推送。
-修复：对 `admission_ab_base/**/*.csv` 等长替换 `sk-`→`sk_`，`git filter-branch --tree-filter`
-重写 `origin..HEAD` 全部未推送提交，推送前逐 commit `git grep -l 'sk-' <c> -- '*.csv'` 验证。
-
-### 12. KV thrash：trace 总量 > KV 总量
-
-单 decode 实例 KV ≈ 881,616 token（util=0.8）。若 trace 总输出 > 实例数×KV，必然"抢占+重算"慢爬
-（`kv_usage_pct≈100%`、`preempted_recompute_tokens` 涨、进度 ~0.27 req/s），**不是死锁**。
-对策：把 trace 缩到 KV 容量内（总输出 ≤ ~3M），或接受慢爬只测"谁先卡死"。
-
-### 13. 3P4D 的 GPU 分配（共享机）
-
-GPU 0 可能被别的租户占用（`nvidia-smi` 的 PID 不在自己 `ps` 里）。3P4D 用
-`PD_RATIO_LIST="3:4"`，配置为 **prefill=GPU 1,2,3 / decode=GPU 4,5,6,7**（7 卡）。
-启动前先 `nvidia-smi --query-compute-apps=pid,used_memory` 确认空闲卡。
-
-### 14. 排查崩溃：先找对目录，再找对信号
-
-评估脚本**实例崩溃重启时会新建目录**（新 `timestamp`），所以：
-
-- **最新目录是"重启后的新轮"，崩溃现场在次新目录**（或主日志 `[WT][INSTANCE_RESTART]` 那行上方对应的旧目录）；
-- 直接对最新目录 `tail` 日志会看到 `Initializing a V1 LLM engine`（新实例启动），误以为"崩溃日志被覆盖"。
-  正确顺序：`ls -dt <BASE>/*/` 列目录 → `grep -n 'INSTANCE_RESTART' <main>.log` 定崩溃点 → `tail -30 <crash_dir>/log/decode0_*.log`。
-- 主日志里的 `Killed`（SIGKILL）**是 health guard 判 down 后 `stop_servers` 的清理**（`kill -TERM -<pgid>` 进程组广播），
-  **不是崩溃原因**；原因要看崩溃轮实例自己日志的最后输出 + 宿主内存/GPU/dmesg。
-
+> **踩坑详细记录统一放在 `experiment/zrecent_use/0630/experiment_log.md` 的「踩过的坑」**
+> （含速查表 + 按时间编号的完整条目）。本文件只保留上面 1–7 条"跑之前必查"。
 
 ## 回滚安全点（git）
 
