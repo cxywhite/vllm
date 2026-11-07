@@ -42,6 +42,8 @@
 
 | 12 | 11-07 | 修正 §2.7 + 设计振荡负载 | — | — | 交叉验证：对方独立算出 greedy only-tpot=3301、only-ttft=2145、both=2864，与我一致。几何约束：demote 门 running≥128 处 decode tpot=34 ms、客户端 40 ms，**必然 TPOT 超** → 持续负载下「TTFT 主导、TPOT 干净」不可能 | 改用**振荡负载**（短突发 130–200 → 长静默 <64）。新增约束：请求必须跨过突发尾部，否则生命周期平均 TPOT 仍是高值——`out_tokens > B×1000/(20+0.11r)`（B=5 时 out>136，B=10 时 out>272）。已生成 osc_slow（B5/G60，5400 条，10.3/s）与 osc_fast（B5/G30，10200 条，18.1/s），峰密度均 120/s cluster→设计峰值 running≈150 |
 
+| 13 | 11-07 | qwen_cap 4P4D（n=4080，封顶 8192） | 部分 | greedy 1h17m 跑到 76% 被杀 | greedy：running max **455**、kv **100 %**、recompute **74,439**（decode0 22,993 + decode2 51,446，decode1/3 = 0，**只有两个实例打到 KV 上限**）；GWF 变体只跑了 3 min（417/4080）就被杀，`running 105 / kv 13.8 %` 只是爬坡值 | **A/B 不成立，不能比较**。但 greedy 侧证实：qwen_cap 确实把原生推到 KV 悬崖（有效吞吐 ~0.27 req/s 的慢爬），且**不均衡**——只有 2/4 个 decode 实例打满，与 predictor 把长请求集中路由一致。GWF 侧要重跑（现 deadlock guard 已改进度判据，不会再被 util=0 误杀） |
+
 ## 踩过的坑（按时间，含修复）
 
 1. **模型权重路径**：脚本默认 `/root/.cache/.../Qwen-2.5-7b-Instruct` 在慢盘 /dev/sdb1 → 卡死。修复：`QWEN_MODEL_PATH=/root/myshare/models/...`（NVMe）。
