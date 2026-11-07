@@ -73,6 +73,21 @@
 
 17. **实例间路由的预留集中**：scheme4 路由按"预测未来 token"预留（`Future_Tokens`），长请求会被集中到一个实例（实测某实例 `Future=344k`，其余 1k–4k），使该实例 `pred_bottle` 抬高被后续路由排除。若需均匀，应在 `select_best_instance` 加"Future 超阈值则跳过"的均摊条件。
 
+18. **查崩溃日志查错目录（排查方法论错误，务必避免）**：评估脚本**实例崩溃重启时会新建一个目录**（`timestamp=$(date +%Y%m%d_%H%M%S)` + `setup_directories`），所以：
+    - **最新目录（`ls -dt | head -1`）是"重启后的新轮"，不是崩掉的那轮**；
+    - 崩溃现场在**次新目录**（或主日志里 `[WT][INSTANCE_RESTART]` 那一行上面的目录）；
+    - 我这次错把最新目录的日志当成崩溃现场，看到 `Init/destroy_process_group` 就误判"日志被截断、查不到原因"，白走了一大段弯路。
+    **正确姿势**：
+    ```bash
+    # 1) 先看有几个目录、各自时间戳
+    ls -dt <BASE_RESULT_DIR>/*/
+    # 2) 主日志里找重启点，崩溃轮在它之前
+    grep -n 'INSTANCE_RESTART' <main>.log
+    # 3) 崩溃轮的日志尾部
+    tail -30 <crash_dir>/log/decode0_*.log
+    ```
+    另一条相关经验：主日志里的 `Killed`（SIGKILL）**通常是 health guard 判定 down 之后 `stop_servers` 的清理动作**（`kill -TERM -<pgid>` 进程组广播 + `kill -KILL`），**不是崩溃原因本身**；找原因要往它上面的实例自己日志里看。
+
 ## 环境（每次实验都应记录）
 
 - 8× A800-80GB，4P4D，Qwen-2.5-7B-Instruct，TTFT SLO 1000ms / TPOT SLO 30ms，vLLM v0.11.0。

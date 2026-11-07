@@ -166,6 +166,17 @@ GPU 0 可能被别的租户占用（`nvidia-smi` 的 PID 不在自己 `ps` 里�
 `PD_RATIO_LIST="3:4"`，配置为 **prefill=GPU 1,2,3 / decode=GPU 4,5,6,7**（7 卡）。
 启动前先 `nvidia-smi --query-compute-apps=pid,used_memory` 确认空闲卡。
 
+### 14. 排查崩溃：先找对目录，再找对信号
+
+评估脚本**实例崩溃重启时会新建目录**（新 `timestamp`），所以：
+
+- **最新目录是"重启后的新轮"，崩溃现场在次新目录**（或主日志 `[WT][INSTANCE_RESTART]` 那行上方对应的旧目录）；
+- 直接对最新目录 `tail` 日志会看到 `Initializing a V1 LLM engine`（新实例启动），误以为"崩溃日志被覆盖"。
+  正确顺序：`ls -dt <BASE>/*/` 列目录 → `grep -n 'INSTANCE_RESTART' <main>.log` 定崩溃点 → `tail -30 <crash_dir>/log/decode0_*.log`。
+- 主日志里的 `Killed`（SIGKILL）**是 health guard 判 down 后 `stop_servers` 的清理**（`kill -TERM -<pgid>` 进程组广播），
+  **不是崩溃原因**；原因要看崩溃轮实例自己日志的最后输出 + 宿主内存/GPU/dmesg。
+
+
 ## 回滚安全点（git）
 
 已建立并推送到远程的回滚点（记录于 2026-11-07）：
