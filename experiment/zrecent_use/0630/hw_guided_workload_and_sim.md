@@ -470,3 +470,44 @@ greedy 只到 247，窗口 256 只是把 3 个请求挡回去，没有任何收�
 **选负载的判据（跑之前就能估）**：
 `峰值需求 ≈ 到达率 × 服务时间`，`KV 可容纳并发 ≈ (gmu×80GB − 15GB) / 57344B / (prompt + output/2)`；
 要让 `GWF_window(256) ≤ KV 可容纳并发 < 峰值需求`。
+
+---
+
+## 2.10 如果 decode `gmu` 提到 0.8，什么负载还能让 GWF 有效
+
+gmu=0.8、4P4D 时单 decode 实例的 KV 容量是**实测值 881,616 token**（引擎日志 `GPU KV cache size`）。
+GWF 的窗口是常数 256，所以第一条是**硬约束**：
+
+```
+256 × (prompt + output/2) ≤ 881,616      # 窗口自身不能越界，否则 GWF 自己也要抢占
+=> output ≤ ~6,700 token                 # prompt≈60
+```
+
+第二条是**压力条件**：greedy 必须把 KV 打满才会出现「抢占重算」，GWF 才有东西可救。
+按实测可持续吞吐 ~6.0–7.5k tok/s（o1500：6.1M/1023s=5.98k；dense_short：2.4M/320s=7.5k），
+并按 o1500 那组的成功比例（offered ≈1.7× 可持续）外推：
+
+| output L | GWF@256 的 KV 占用 | 要 greedy 越界需要的 offered | 判定 |
+|---|---|---|---|
+| 2,000 | 31 % | ~18k tok/s（不可达） | 无效（就是 ln2k_cap4k 的 −19 %） |
+| 4,000 | 60 % | ~9k tok/s（勉强） | 临界，值得一试 |
+| **5,000** | **74 %** | **~12k tok/s ≈ 2.5 req/s** | **推荐** |
+| 6,000 | 89 % | ~12k tok/s ≈ 2.0 req/s | 更猛，但逼近 89 %，有抢占/死锁风险 |
+| ≥7,000 | >100 % | — | 窗口自己越界，禁用 |
+
+已生成两条候选 trace（600 s、均匀长输出、10 个突发）：
+
+```
+admission_ab_base/u08_o5000/  n=1500  L=5000  2.5 req/s  7.5M tok  (约 20 min/run)
+admission_ab_base/u08_o6000/  n=1200  L=6000  2.0 req/s  7.2M tok
+```
+
+**跑的时候看三个数就能判成败**：
+1. greedy 的 `kv_usage_pct` 是否打到 ~100 % 且 `preempted_recompute_tokens > 0`（压力成立）；
+2. GWF 的 `kv_usage_pct` 是否 ≤ 85 % 且 `window=256`（窗口没被冲破）；
+3. GWF 的 `preempted_recompute_tokens` 是否 = 0（没有越界）。
+若 GWF 的 kv 也到 100 % → L 太大，降到 4,500。
+
+**注意**：这个 SLO（TPOT ≤30 ms）在 running≈256 时必然不满足（decode tpot ≈48 ms），
+所以绝对 goodput 会很低（0.3–0.8 req/s），比较的是**相对增益**与 **P99 TPOT / 重算量**，
+不是绝对值。若审稿人只认 goodput 绝对值，那 gmu=0.8 + 30 ms SLO 这一档本身就不友好。
