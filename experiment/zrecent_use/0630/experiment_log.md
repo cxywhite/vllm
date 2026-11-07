@@ -50,6 +50,9 @@
 
 | 16 | 11-07 | **qwen_o1500 3P4D gmu=0.5 复现**（我的确认跑，rep1 完成 / rep2 崩于 instance_restart） | 完美预测 | 57 min（2 次完整 run + 1 次重启） | rep1：greedy goodput **0.56**（recompute 425,748；running 494）/ GWF **0.64**（recompute **0**；running 256）→ **+14.3 %**；rep2 greedy 0.49（n=3968，recompute 258,542） | **方向复现、幅度不回**：两次配对 +68.8 %（对方）与 +14.3 %（我）→ 配对中位数 +41.5 %；按均值 pooled（greedy n=3 均值 0.510，GWF n=2 均值 0.725）**+42.2 %**。**三个 greedy run 的 recompute 258k–428k → 两个 GWF run 全部 0**，机制稳定（窗口 256 ≈ KV 容量）。幅度方差大是因为 goodput 是尾部统计量（0.5–0.8 / 4 req/s），需要更多 rep 才能给中位数 |
 
+| 17 | 11-07 | ln2k_cap4k 3P4D gmu=0.7（n=4080，output p50 1752 / p90 3342 / max 4000，6.8 req/s） | 完美预测 | ~15 min | greedy goodput **0.37** / GWF **0.30 req/s（−18.9 %）**；running 247→256；**kv 仅 34.8 %→39.4 %**；recompute 两边全 0；GWF `stop_window` Σ 252 | **负对照（边界条件）**：KV 完全没压力时，GWF 的窗口 256 只是把本该被服务的请求挡在外面 → −19 %。与 o1500（kv 100 %、greedy recompute 26–43 万）的 +14 %~+69 % 形成清晰边界：**GWF 只在「greedy 会越界抢占重算」时有正收益**；KV 富余时中性到负 |
+| 18 | 11-07 | dense_short 4P4D 再跑一次（greedy） | 完美预测 | ~7 min | greedy goodput **14.56 req/s**、good 4098/12000（34.1 %）、running 294、kv **5.5 %**、recompute 0；同配置的 GWF 变体启动即崩（无 bench 日志） | 同一负载第三次测量 greedy goodput = 13.25 / 13.73(GWF) / **14.56**，**run-to-run 跨度 10 %**（14.56 vs 13.25）→ 再次说明 1 rep 不可用于比较，必须 3 rep 中位数 |
+
 ## 踩过的坑（按时间，含修复）
 
 > 本文件是**踩坑的唯一记录处**（不再分散到 AGENTS.md / TROUBLESHOOTING.md）。
