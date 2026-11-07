@@ -117,6 +117,55 @@ def _normalize_expected_output_len(raw_output_len: Any) -> int:
     return expected_output_len
 
 from customfunction import load_and_prepare_dataset,ensure_id_column_from_df,extract_first_human_prompt,save_outputs_grouped_csv_by_base_reqid,save_test_outputs,save_full_outputs,save_sample
+
+# [WT] non-blocking live per-request latency writer ---------------------------
+# Set WT_LIVE_CSV=<path> to enable.  A daemon thread drains a queue, so the
+# benchmark's event loop never blocks on disk I/O.  wt_live_monitor.py tails
+# the file and prints live TTFT/TPOT percentiles.
+_WT_LIVE_CSV = os.environ.get("WT_LIVE_CSV", "")
+_WT_LIVE_QUEUE = None
+
+
+def _wt_live_start():
+    global _WT_LIVE_QUEUE
+    if not _WT_LIVE_CSV or _WT_LIVE_QUEUE is not None:
+        return
+    import csv as _csv
+    import queue as _queue
+    import threading as _threading
+
+    _WT_LIVE_QUEUE = _queue.Queue()
+
+    def _run():
+        with open(_WT_LIVE_CSV, "w", newline="", encoding="utf-8") as f:
+            w = _csv.writer(f)
+            w.writerow(["ts", "req_id", "ttft_ms", "tpot_ms", "latency_ms",
+                        "success"])
+            f.flush()
+            while True:
+                item = _WT_LIVE_QUEUE.get()
+                if item is None:
+                    break
+                w.writerow(item)
+                f.flush()
+
+    _threading.Thread(target=_run, daemon=True).start()
+
+
+def _wt_live_put(out):
+    if _WT_LIVE_QUEUE is None:
+        return
+    try:
+        _WT_LIVE_QUEUE.put_nowait((
+            round(time.time(), 3),
+            getattr(out, "req_id", ""),
+            round(float(getattr(out, "ttft", 0.0)) * 1000.0, 1),
+            round(float(getattr(out, "tpot", 0.0)) * 1000.0, 1),
+            round(float(getattr(out, "latency", 0.0)) * 1000.0, 1),
+            int(bool(getattr(out, "success", False))),
+        ))
+    except Exception:
+        pass
 import pdb
 from transformers import AutoTokenizer, AutoConfig
 import csv
@@ -477,6 +526,8 @@ async def benchmark(
         # or connection error.  Retrying up to WT_RETRY_TIMES keeps the A/B from
         # being biased by asymmetric request loss.  Only the first attempt
         # updates the progress bar, so the pbar count stays == len(requests).
+        _wt_live_start()
+
         async def _attempt(pbar_arg):
             if semaphore is None:
                 return await request_func(request_func_input=request_func_input,
@@ -492,6 +543,7 @@ async def benchmark(
                 break
             await asyncio.sleep(0.2)
             out = await _attempt(None)
+        _wt_live_put(out)
         return out
 
     benchmark_start_time = time.perf_counter()
