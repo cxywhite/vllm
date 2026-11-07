@@ -121,6 +121,18 @@
     ```
     并 `sleep 5~10` 等 vLLM 释放 NCCL/共享内存再启动下一轮。
 
+21. **prefill 卡随机 SIGSEGV：`set_p2p_nccl_context` 的 environ 并发竞争（vLLM bug，已 patch `4ef9f9d5f`）**：
+    症状：某张 prefill 卡突然 `EngineCore_DP0 died unexpectedly`，`[CRASH]` 记录到 GPU 显存归零、host 内存正常、cgroup `oom_kill=0`。
+    真因在 prefill 日志里搜 `Caught signal 11` + `backtrace`：
+    ```
+    #4 libc getenv+0x56 / #5 libc10 c10::utils::get_env / #10 libtorch_cuda structured_mm_out_cuda
+    ```
+    `set_p2p_nccl_context`（`p2p_nccl_engine.py:45`）在运行时 `os.environ[...] = ...` → `putenv/unsetenv`
+    会 realloc `environ`，与 torch 工作线程的 `getenv` 竞争 → 段错误。
+    修复：该函数不再改 `os.environ`（no-op），NCCL 参数改在**启动环境**注入
+    `NCCL_MAX_NCHANNELS=8 NCCL_MIN_NCHANNELS=8 NCCL_CUMEM_ENABLE=1`。
+    **排查口诀**：prefill/decode 随机单卡挂 → 先搜 `Caught signal 11` + `backtrace`，别只盯 OOM 和看门狗。
+
 18. **查崩溃日志查错目录（排查方法论错误，务必避免）**：评估脚本**实例崩溃重启时会新建一个目录**（`timestamp=$(date +%Y%m%d_%H%M%S)` + `setup_directories`），所以：
     - **最新目录（`ls -dt | head -1`）是"重启后的新轮"，不是崩掉的那轮**；
     - 崩溃现场在**次新目录**（或主日志里 `[WT][INSTANCE_RESTART]` 那一行上面的目录）；
