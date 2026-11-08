@@ -145,6 +145,19 @@ USE_PASTFUTURE_SCHEDULER=${USE_PASTFUTURE_SCHEDULER:-false}
 USE_ACTIVATION_PREDICTOR=${USE_ACTIVATION_PREDICTOR:-false}
 USE_CUSTOM_PROXY=${USE_CUSTOM_PROXY:-false}
 USE_GWF_SCHEDULER=${USE_GWF_SCHEDULER:-false}
+# [WT] UniBoost baseline (paper [4], arXiv:2606.18431). Stock vLLM must stay
+# byte-identical in the baseline arm, so the scheduler class is injected at
+# runtime by uniboost_serve.py (wraps EngineArgs.create_engine_config) instead
+# of adding a flag to vLLM itself.
+USE_UNIBOOST_SCHEDULER=${USE_UNIBOOST_SCHEDULER:-false}
+UNIBOOST_SERVE_PY=${UNIBOOST_SERVE_PY:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/uniboost_serve.py}
+UNIBOOST_GAMMA=${WT_UNIBOOST_GAMMA:-1e-3}
+UNIBOOST_BIN=${WT_UNIBOOST_BIN:-128}
+UNIBOOST_ORDER=${WT_UNIBOOST_ORDER:-1}
+UNIBOOST_VICTIM=${WT_UNIBOOST_VICTIM:-longest}
+UNIBOOST_VICTIM_MIN_TOKENS=${WT_UNIBOOST_VICTIM_MIN_TOKENS:-32}
+UNIBOOST_LOG_INTERVAL_MS=${WT_UNIBOOST_LOG_INTERVAL_MS:-1000}
+UNIBOOST_RESULT_SUFFIX=${UNIBOOST_RESULT_SUFFIX:-uniboost}
 TEST_ABLATION_P2D=${TEST_ABLATION_P2D:-false}
 TEST_ABLATION_P2D_CURRENT_3DLOAD=${TEST_ABLATION_P2D_CURRENT_3DLOAD:-false}
 TEST_ABLATION_P2D_CURRENT_CAPACITY=${TEST_ABLATION_P2D_CURRENT_CAPACITY:-false}
@@ -241,6 +254,15 @@ PD_3P4D_PREFILL_KV_PORTS=${PD_3P4D_PREFILL_KV_PORTS:-22011,22012,22013}
 PD_3P4D_DECODE_GPUS=${PD_3P4D_DECODE_GPUS:-4,5,6,7}
 PD_3P4D_DECODE_PORTS=${PD_3P4D_DECODE_PORTS:-22020,22021,22022,22023}
 PD_3P4D_DECODE_KV_PORTS=${PD_3P4D_DECODE_KV_PORTS:-22032,22033,22034,22035}
+
+# 1P4D: 1 prefill + 4 decode = 5 GPUs. Used to validate a scheduler change
+# while other tenants hold 2-3 cards. Prefill on GPU 1, decodes on 4-7.
+PD_1P4D_PREFILL_GPUS=${PD_1P4D_PREFILL_GPUS:-1}
+PD_1P4D_PREFILL_PORTS=${PD_1P4D_PREFILL_PORTS:-22001}
+PD_1P4D_PREFILL_KV_PORTS=${PD_1P4D_PREFILL_KV_PORTS:-22011}
+PD_1P4D_DECODE_GPUS=${PD_1P4D_DECODE_GPUS:-4,5,6,7}
+PD_1P4D_DECODE_PORTS=${PD_1P4D_DECODE_PORTS:-22020,22021,22022,22023}
+PD_1P4D_DECODE_KV_PORTS=${PD_1P4D_DECODE_KV_PORTS:-22032,22033,22034,22035}
 
 # Active runtime assignment is selected by configure_pd_ratio().
 # Initialize with 1:3 profile so cleanup paths always have valid values.
@@ -401,6 +423,10 @@ set_proxy_script_path() {
 configure_experiment_variant() {
     local variant="$1"
 
+    # Every variant must fully determine the scheduler choice, otherwise a
+    # previous variant's UniBoost arm would leak into the next one.
+    USE_UNIBOOST_SCHEDULER=false
+
     case "$variant" in
         roundrobin)
             USE_CUSTOM_PROXY=false
@@ -414,6 +440,23 @@ configure_experiment_variant() {
             WT_PREDICT_ANALYSIS_ENABLE=0
             CURRENT_RUN_METHOD="roundrobin"
             CURRENT_RUN_SUFFIX="$ROUNDROBIN_RESULT_SUFFIX"
+            ;;
+        roundrobin_uniboost)
+            # [4] baseline on stock vLLM semantics: round-robin inter-instance
+            # routing + vLLM's own intra-instance scheduler, with the UniBoost
+            # policy injected. No scheme4 routing, no GWF, no prediction.
+            USE_CUSTOM_PROXY=false
+            USE_ACTIVATION_PREDICTOR=false
+            USE_GWF_SCHEDULER=false
+            USE_UNIBOOST_SCHEDULER=true
+            TEST_ABLATION_P2D=false
+            TEST_ABLATION_P2D_CURRENT_3DLOAD=false
+            TEST_ABLATION_P2D_CURRENT_CAPACITY=false
+            TEST_OPTIMAL=false
+            WT_PREDICT_ROUTE_SCHEME=roundrobin
+            WT_PREDICT_ANALYSIS_ENABLE=0
+            CURRENT_RUN_METHOD="roundrobin_uniboost"
+            CURRENT_RUN_SUFFIX="$UNIBOOST_RESULT_SUFFIX"
             ;;
         roundrobin_pp)
             USE_CUSTOM_PROXY=false
@@ -440,6 +483,25 @@ configure_experiment_variant() {
             WT_PREDICT_ANALYSIS_ENABLE="$USER_WT_PREDICT_ANALYSIS_ENABLE_OVERRIDE"
             CURRENT_RUN_METHOD="scheme4"
             CURRENT_RUN_SUFFIX="$SCHEME4_RESULT_SUFFIX"
+            ;;
+        scheme4_uniboost)
+            # [4] baseline at the intra-instance layer: same scheme4 prediction
+            # routing, but the intra-instance scheduler is UniBoost (prediction-
+            # free ordering + eviction) instead of FCFS. The UniBoost code stays
+            # a decoupled stock-vLLM add-on; only the launch-time routing is
+            # scheme4. Compare against scheme4 (FCFS) and scheme4_gwf (GWF).
+            USE_CUSTOM_PROXY=false
+            USE_ACTIVATION_PREDICTOR=true
+            USE_GWF_SCHEDULER=false
+            USE_UNIBOOST_SCHEDULER=true
+            TEST_ABLATION_P2D=true
+            TEST_ABLATION_P2D_CURRENT_3DLOAD=false
+            TEST_ABLATION_P2D_CURRENT_CAPACITY=false
+            TEST_OPTIMAL=false
+            WT_PREDICT_ROUTE_SCHEME=scheme4
+            WT_PREDICT_ANALYSIS_ENABLE="$USER_WT_PREDICT_ANALYSIS_ENABLE_OVERRIDE"
+            CURRENT_RUN_METHOD="scheme4_uniboost"
+            CURRENT_RUN_SUFFIX="$UNIBOOST_RESULT_SUFFIX"
             ;;
         scheme4_gwf)
             USE_CUSTOM_PROXY=false
@@ -521,7 +583,7 @@ configure_experiment_variant() {
             CURRENT_RUN_SUFFIX="$ORACLE_RESULT_SUFFIX"
             ;;
         *)
-            echo "ERROR: unsupported experiment variant=${variant}, expected roundrobin/roundrobin_pp/scheme4/scheme4_gwf/scheme5/current_capacity/current_3dload/oracle"
+            echo "ERROR: unsupported experiment variant=${variant}, expected roundrobin/roundrobin_pp/roundrobin_uniboost/scheme4/scheme4_gwf/scheme4_uniboost/scheme5/current_capacity/current_3dload/oracle"
             return 1
             ;;
     esac
@@ -764,6 +826,14 @@ configure_pd_ratio() {
             DECODE_GPUS="$PD_1P3D_DECODE_GPUS"
             DECODE_PORTS="$PD_1P3D_DECODE_PORTS"
             DECODE_KV_PORTS="$PD_1P3D_DECODE_KV_PORTS"
+            ;;
+        1:4)
+            PREFILL_GPUS="$PD_1P4D_PREFILL_GPUS"
+            PREFILL_PORTS="$PD_1P4D_PREFILL_PORTS"
+            PREFILL_KV_PORTS="$PD_1P4D_PREFILL_KV_PORTS"
+            DECODE_GPUS="$PD_1P4D_DECODE_GPUS"
+            DECODE_PORTS="$PD_1P4D_DECODE_PORTS"
+            DECODE_KV_PORTS="$PD_1P4D_DECODE_KV_PORTS"
             ;;
         2:6)
             PREFILL_GPUS="$PD_2P6D_PREFILL_GPUS"
@@ -1436,6 +1506,8 @@ stop_servers() {
 
     pkill -9 -f "$PROXY_SCRIPT" >/dev/null 2>&1 || true
     pkill -9 -f "vllm serve" >/dev/null 2>&1 || true
+    # [WT] UniBoost arm runs as `python uniboost_serve.py serve ...`
+    pkill -9 -f "uniboost_serve" >/dev/null 2>&1 || true
     fuser -k ${PROXY_PORT}/tcp 2>/dev/null || true  # kill stale proxy by port
     fuser -k ${BENCH_PORT}/tcp 2>/dev/null || true
 
@@ -1601,7 +1673,11 @@ start_servers() {
         local dist_port=$((40000 + port))
 
         local cmd
-        cmd="vllm serve \"$MODEL\" \
+        local decode_entry="vllm serve"
+        if is_true "$USE_UNIBOOST_SCHEDULER"; then
+            decode_entry="python ${UNIBOOST_SERVE_PY} serve"
+        fi
+        cmd="${decode_entry} \"$MODEL\" \
             --enforce-eager \
             --host 0.0.0.0 \
             --port \"$port\" \
@@ -1615,6 +1691,18 @@ start_servers() {
             --test-model ${TEST_MODEL} \
             --swap-space 0"
 
+        # [WT] align decode-side routing with the GWF arm: the GWF scheduler
+        # overrides _should_track_predictive_pressure() to always track predicted
+        # tokens in waiting/running, but the stock scheduler only does so under
+        # --activation-predict / --test-optimal.  Pass --activation-predict to
+        # the decode instances too (same condition as the prefill side) so both
+        # arms feed the router the same eq6 load signal, leaving admission as
+        # the only difference.
+        if is_true "$USE_ACTIVATION_PREDICTOR" \
+            || { [[ "$WT_PREDICT_ROUTE_SCHEME" != "oracle" ]] && is_true "$TEST_ABLATION_P2D"; } \
+            || { [[ "$WT_PREDICT_ROUTE_SCHEME" != "oracle" ]] && is_true "$USE_CUSTOM_PROXY"; }; then
+            cmd="$cmd --activation-predict"
+        fi
         if is_true "$USE_PASTFUTURE_SCHEDULER"; then
             cmd="$cmd --pastfuture-scheduler"
         fi
@@ -1659,6 +1747,12 @@ start_servers() {
             WT_GWF_HOPELESS_MAX_DEFER_MS="${WT_GWF_HOPELESS_MAX_DEFER_MS}" \
             WT_GWF_FORCE_IDLE="${WT_GWF_FORCE_IDLE}" \
             WT_GWF_LOG_INTERVAL_MS="${WT_GWF_LOG_INTERVAL_MS}" \
+            WT_UNIBOOST_GAMMA="${UNIBOOST_GAMMA}" \
+            WT_UNIBOOST_BIN="${UNIBOOST_BIN}" \
+            WT_UNIBOOST_ORDER="${UNIBOOST_ORDER}" \
+            WT_UNIBOOST_VICTIM="${UNIBOOST_VICTIM}" \
+            WT_UNIBOOST_VICTIM_MIN_TOKENS="${UNIBOOST_VICTIM_MIN_TOKENS}" \
+            WT_UNIBOOST_LOG_INTERVAL_MS="${UNIBOOST_LOG_INTERVAL_MS}" \
             VLLM_USE_V1=1 \
             CUDA_VISIBLE_DEVICES="$gpu_id" \
             MASTER_ADDR="127.0.0.1" \

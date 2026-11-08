@@ -16,21 +16,31 @@
 
 | 7 | 11-06 | dense_short 第二轮（同 12000×200） | 完美预测 | ~6min/轮 | greedy 2326.8 / GWF **2442.6（+5.0%）**；good 3690→3896；tpot p99 55.3→47.8(−13.4%)、max 58.8→49.4；ttft p50 823→701、p99 5435→4336(−20.2%)、max 7784→5446(−30%)；GWF：decode2/3 卡 256、demoted=194、stop_window=115、preempted=0 | 与第 6 轮同向（+2.8% / +5.0%），**两轮都正、方向一致，但幅度差 2pp → run-to-run 方差约 7–9%，必须 3 rep 取中位数确认**。同时：greedy 两轮 goodput 差 9%（2566 vs 2327），单轮不可信 |
 
-## 结论快照（随迭代更新）
+## 结论快照（2026-11-09 更新）
 
-- **KV 容量是并发上限（关键新认知）**：单 decode 实例 GPU KV=**881,616 tokens**（decode0 日志 kv_cache_utils）。并发 running ≤ 881616/(prompt+output)。所以：
-  - 要触发 demote（running≥A/2=128）→ output ≤ ~6800；
-  - 要触发悬崖/stop_window（running≥A=256）→ output ≤ ~3400。
-  - 之前的 8000/20000 长请求分别把并发卡在 ~107/~44，**根本到不了触发阈值**——这就是 GWF 计数器全 0 的根因。
-- **GWF 只在两个过载区出手**：并发过载（running≥256→stop_window + demote）和 KV 过载（KV 满→preempt+eV）。当前 8000/20000 trace 是"KV 受限"但并发不到 128，两者都不触发。
-- **真实干净负载 TPOT 曲线（2026-11-06 拟合，1136 个 (running,meas_tpot) 样本）**：decode 侧 meas_tpot ≈ **20 + 0.11×running** ms，近似线性，**没有 5264ms 悬崖**（旧 4080 的悬崖是 30k extreme + KV thrash 造成的假象）。分桶 p50：0-31→19.7、64-95→29.7、128-159→38.1、224-255→47.9、256-287→49.6ms。
-- **θ=120ms 实际够不到**：真实 meas_tpot 最大 ~61ms << 120ms，所以 window 永远不收缩、恒 256，GWF 退化成"固定 256 上限 + 淘汰 hopeless"。**这是 +5% 增益的天花板来源**：goodput 阈值 30ms 对应 running ≈ 64，而窗口上限 256 是它的 4 倍。
-- **触发≠有 goodput 增益**：goodput 靠"淘汰 hopeless + 压低尾部"得来（本轮 tpot p99 −13%、ttft p99 −20%）。要更大增益，需 (a) 更多实例饱和（提高密度）、或 (b) 让窗口真正收缩（output≈3000 使 KV 上限≈289，撞满→thrash→meas_tpot 冲上 120ms）。
-- **负载热点不平衡（2–3×）**：实测 decode0/1/2/3 running 峰值 61/28/96/18（bimodal8000）、105/115/256/256（dense_short）——predictor 路由把请求集中到部分 decode 实例，反而**降低**触发门槛（热实例先满）。
-- **预测 miscalibration**（系统 8–13× 过预测）仍是独立短板；已用 `WT_SIMPLIFY_PREDICT=1` 隔离。
-- **并发峰值的构造公式（实测拟合）**：`peak_running_inst ≈ λ_inst × min(B, S)`（λ_inst=每突发请求数/B/4，B=突发时长，S=output×tpot/1000）。dense_short 实测 λ=60/s、B=5s、S≈9.6s → 预测 300、实测 338。要跨 256 需每 5s 突发 ≥1024 条；「短而密」比「长而疏」更容易触发（B 拉长到 10s 时 1200 条只有 150 峰值）。
-- **硬件信号能测什么、不能测什么**：能测——sm 判断 prefill/decode 瓶颈、mem_pct 判断是否 memory-bound、load1 判断 CPU（proxy/scheduler）瓶颈、`mem_avail_mib` 佐证 `--swap-space 0`（无 KV 换出）、`fb_mb` 判"有没有别的容器占卡"；不能测——framebuffer 当并发、`rxpci/txpci` 当 KV 流量（P2pNccl 走 NVLink，PCIe 计数恒 0；KV 按 57,344 B/token 记账）。
-- **✅ 已找到有提升的负载（迭代 #6）**：**高并发短请求**（200 token、~40 req/s、bursty、300s）→ per-instance running 到 **256**（窗口上限）、meas_tpot 到 **46–48ms**（>30ms hopeless 阈值）→ GWF 的 demote(1525)/stop_window(179) 真正触发 → **goodput +2.8%、P99 TPOT −14.1%**。负载画像：**短输出（~200 token）+ 高到达率（~40 req/s）+ 突发**。这是 GWF 能赢的唯一 regime。
+**GWF 准入的正收益 regime（三个，按机制）**：
+1. **dense_short**（200 token、~40 req/s 突发）：running 顶到 256、meas_tpot 46–48ms → demote/stop_window 真触发 → goodput **+2.8%～+5%**（#6/#7）。
+2. **o1500@gmu0.5**（KV 打满、greedy 抢占重算 26–43 万 token）：窗口 256≈KV 容量 → 零抢占 → goodput **+14%～+69%**（#15/#16）。
+3. **sum θ=120 + TTFT-margin 强制准入（本次新找到，margin 需按负载调）**：窗口节流本会把请求饿到超 TTFT 预算，加「deferral≥ttft_budget−margin 就绕过窗口强制放行」后 TTFT 尾巴被砍掉。**o2000 用 margin=250 → goodput 0.42→0.52（+24%）、P99 TTFT 510s→1.6s（#31）；o1600 用 margin=100 → goodput 0.69→0.72（+4.3%）、TPOT≈native、TTFT 不爆（#33）**。margin 是双刃剑：太大抬 TPOT（o1600 margin=250 → TPOT 40→77ms、goodput 0.61 输），太小压不住 TTFT 尾巴（o1600 无 margin → P99 TTFT 349s）。**甜点 = "TPOT≈native + TTFT 不爆"**。
+   - 共同点：**greedy 会越界（并发>256 或 KV 抢占重算）或窗口会饿死请求（TTFT 爆），GWF 用窗口+TTFT 余量正好卡住这条线**。KV 富余时（ln2k_cap4k）GWF −19%（#17）。
+
+**oXXX 输出长度扫描（θ=120，无 margin）全线无 GWF 正收益（甜点假设证伪）**：
+- native Median TPOT：o400=17.8 → **o1200=29.9（=30ms SLO 压线）** → o1600=54.0 → o2000=100.2 → o4296=124.5 ms。
+- GWF Δgoodput（sum θ=120 无 margin）：o1200 **−16%**、o1600 **−4%**、o2000 **0%（平）**、o4296 不可救。**crossover 在 o1200，但窗口守 θ=120ms 这个点，30ms SLO 的 goodput 它救不了**（o2000 节流后 TPOT 仍 60ms=2×SLO）。
+- **转折：加 TTFT-margin 后 o2000 转正 +24%（#31）**——瓶颈从"TTFT 饿死"变成了"TPOT 不可达"（80ms 仍 2.7×SLO）。
+
+**三个方法学修复（11-08/11-09，之前"GWF 减 TPOT"的结论据此作废）**：
+1. **路由污染**：native 臂 decode 无 `--activation-predict` → `waiting_tokens` 只算 prompt → 长请求堆 2 卡。修复后 native 均衡（268/274/266/302），P99 TPOT 439→157ms；旧"GWF TPOT −65%"是路由假象。
+2. **τ 语义**：fraction 二值 → 标量 EMA（Algorithm 2 L1）。单位经历 per-token θ=120（松=4×SLO）→ **sum θ=120（紧=每-token 30ms）**。sum 版已跑完（#29/#30），并发现窗口会饿死请求。
+3. **TTFT-margin 强制准入**（`WT_GWF_TTFT_MARGIN_MS`，默认 250ms）：窗口闸门会把 waiting 请求饿到超 TTFT 预算（P99 TTFT 510s），加「deferral≥750ms 绕过窗口强制放行」后 P99 TTFT→1.6s、o2000 goodput 转正 +24%（#31）。**这是本次最关键的新机制**。
+
+**KV 容量 = 并发上限**：单 decode 实例 KV=881,616 tokens；demote 需 output≤~6800、stop_window 需 output≤~3400（running≥256）。长 output 触发不了 GWF 的根因。
+
+**θ=120ms 够不到（11-06 实测）**：干净负载 meas_tpot≈20+0.11×running，峰值 338→meas_tpot max≈61ms≪120ms → 窗口不收缩（fraction 版 +5% 的天花板）。
+
+**run-to-run 方差大**：dense_short 三次 greedy=13.25/13.73(GWF)/14.56（跨度 10%）；o1500 配对 +68.8%/+14.3%。**1 rep 不可比，需 3 rep 中位数**。
+
+**预测 miscalibration（8–13×）是独立短板**，已用 `WT_SIMPLIFY_PREDICT=1`（完美预测）隔离。
 
 | 8 | 11-07 | 硬件采样 + 离线模拟校准（不跑新 A/B） | — | — | 见 `hw_guided_workload_and_sim.md` 与 `worked_example/sim_vs_real_dense_short.md` | ① 采样开销实测 0 tick/58s，可全程常驻；② **GPU fb 不能当并发代理**（vLLM 预分配 KV，running 5→338 时 fb 只差几十 MiB），并发只能看新增的 `kv_usage_pct`；③ 修掉模拟器跨策略状态污染（旧 GWF 模拟从空队列起跑，`max_running=11`），修后仍**符号相反**（实测 +3.6% vs 模拟 −15.7%）→ 模拟器暂只能用来筛"到不了 128"的负载 |
 
@@ -52,6 +62,78 @@
 
 | 17 | 11-07 | ln2k_cap4k 3P4D gmu=0.7（n=4080，output p50 1752 / p90 3342 / max 4000，6.8 req/s） | 完美预测 | ~15 min | greedy goodput **0.37** / GWF **0.30 req/s（−18.9 %）**；running 247→256；**kv 仅 34.8 %→39.4 %**；recompute 两边全 0；GWF `stop_window` Σ 252 | **负对照（边界条件）**：KV 完全没压力时，GWF 的窗口 256 只是把本该被服务的请求挡在外面 → −19 %。与 o1500（kv 100 %、greedy recompute 26–43 万）的 +14 %~+69 % 形成清晰边界：**GWF 只在「greedy 会越界抢占重算」时有正收益**；KV 富余时中性到负 |
 | 18 | 11-07 | dense_short 4P4D 再跑一次（greedy） | 完美预测 | ~7 min | greedy goodput **14.56 req/s**、good 4098/12000（34.1 %）、running 294、kv **5.5 %**、recompute 0；同配置的 GWF 变体启动即崩（无 bench 日志） | 同一负载第三次测量 greedy goodput = 13.25 / 13.73(GWF) / **14.56**，**run-to-run 跨度 10 %**（14.56 vs 13.25）→ 再次说明 1 rep 不可用于比较，必须 3 rep 中位数 |
+| 19 | 11-08 | —（代码改动，非跑分） | **路由也冻结为完美预测** | — | ① 修掉路由负载漏记（waiting 未来输出不计入，见坑 #23）；② `WT_SIMPLIFY_PREDICT` 全面冻结预测：proxy `_predictor_route_output_len` 走 `max_tokens`、decode `predicted_output_len`/`predicted_total_tokens`/`predicted_remaining_tokens` 全部走 `max_tokens`（后者原来仍走 BERT bucket 后验，已补上），路由与 eV 完全一致 | **下一步**：在「完美预测 + 路由账目正确」的前提下，扫 output 长度/并发找 GWF > native 的负载 |
+| 20 | 11-08 | qwen_o4296 4P4D util0.8（修复后复跑） | 完美预测（路由也冻结） | native 49min / GWF 46min | **路由修复验证通过**：proxy `Future` 现在随 `wait_reqs` 同步（91→614k、214→1.23M），而旧代码 242→23k；running 均衡到 71–85（旧 125–256）。**但 GWF 仍拿 TTFT 换 TPOT**：native 4080/4080 goodput 0.01、TPOT 124.5ms、TTFT 0.8s；GWF 4080/4080 goodput 0.03、TPOT **50.1ms（−60%）**、P99 TPOT 97.9（−71%）、吞吐 +18.7%、但 TTFT **315.3s（+393×）**、window 钉 32、frac 恒 100、worst4≈300ms | **核心结论**：① 修复让 GWF 不再饿死请求（2249→4080 全完成）；② 但 fraction 版 θ=120=4×30 在此硬件上**过紧**——TPOT 50ms 仍 1.7× 于 30ms SLO，窗口为守一个不可达的 SLO 把 TTFT 拖到 315s。**要找到 GWF 正收益，必须同时动 θ（放宽到 160ms 或换 per-token 口径）+ 短 output（让 30ms 可达）**，单靠扫负载不够 |
+| 21 | 11-08 | qwen_o4296 4P4D util0.8（**per-token θ=120**，方案A；首跑 P2P NCCL 死锁重启） | 完美预测 | ~46min | GWF 4080/4080 goodput **0.00**、吞吐 6119 tok/s、TTFT **72.0s**、TPOT **109.9ms**、P99 141.3ms | **per-token 口径下窗口不再钉 32**（worst4≈75ms < 120ms → frac=0 → window 恒 256），TTFT 从 315s 回落到 72s，但 TPOT 从 50ms 涨回 110ms，**goodput 仍是 0**。**结论升级**：qwen_o4296（output 4296）上 30ms SLO 物理不可达——sum 口径守它→TTFT 爆炸，per-token 口径放弃它→TPOT 110ms。**θ 无论怎么调都救不了长 output，必须换短 output**（dense_short/o400 那类，让 30ms/token 可达） |
+| 22 | 11-08 | **qwen_o400 4P4D util0.8**（native 成功；GWF 臂 start_servers_failed 连挂 3 次，环境问题弃） | 完美预测 | native ~13min | **native：4080/4080、goodput 6.53 req/s、TTFT 210ms、TPOT 17.84ms、P99 23.30ms** ← 短 output 首次让 30ms SLO 可达、goodput 非 0 | **关键定标**：output 400 → native TPOT 17.84ms（<30ms，无过载，GWF 无事可做）；output 4296 → native 124.5ms（>30ms，GWF 也救不回）。**甜点位在 output ~800–2000**：native TPOT 刚越过 30ms、GWF 还能用窗口压回 30ms 内。下一步应扫 output 800/1200/1600/2000 找 native TPOT 略超 30ms 的点 |
+| 23 | 11-08 | **qwen_o2000 4P4D util0.8（sum θ=120 倒序扫描第 1 档）** | 完美预测 | native 25min / GWF 23min | **native：4080/4080、goodput 0.37 req/s、output-tok goodput 263.9、Median TPOT 113.2 / P99 439.5、Median TTFT 526 / P99 1828ms。GWF：4080/4080、goodput 0.40 req/s（+8%）、output-tok goodput 228.4（−13%）、Median TPOT 39.2 / P99 96.9（−65%/−78%）、Median TTFT 1062 / P99 379298ms（+2×/+207×）** | **关键负面结论**：GWF 全计数器=0（`window` 恒 256 未收缩、`demoted=0`、`preempted=0`、`stop_window=0`），**准入机制根本没触发**——o2000 每实例 running 峰值 ~150–175 < 256 收缩门槛。TPOT 113→39ms 的改善不是准入控制（是路由账目/run-to-run 差异），且代价是 TTFT 尾部爆炸（P99 1.8s→379s）。**本轮结果随后作废**（见 #24 的代码修复） |
+| 24 | 11-09 | —（代码对齐，非跑分） | 完美预测 | — | ① **路由修复**：decode 启动命令加 `--activation-predict`，让 native 臂的 `_should_track_predictive_pressure()` 也返回 True，路由信号与 GWF 臂对齐——消除"坏路由+native" vs "好路由+GWF"的 A/B 污染；② **τ 对齐论文**：GWF 的 τ 从 fraction 二值改为论文 Algorithm 2 的标量 EMA（每-token 时延，α=0.5、1s 刷新），窗口改 `τ>θ ∧ |Rrun|≥A → A/2` / `τ≤θ → A+A/8`（去掉 frac>5% 与 2-Δt streak） | #23 的 o2000 结果作废（路由污染 + fraction 非论文）。`WT_GWF_TPOT_UNIT`/`WT_GWF_TPOT_TRIGGER_PCT` 变空转，θ 仍由 `WT_GWF_WINDOW_TPOT_TARGET_MS=120` 控制。**待 8 卡空时用新配置重跑 o2000→o800** |
+| 25 | 11-09 | **qwen_o2000 4P4D util0.8 复跑（路由修复 + τ=标量EMA）** | 完美预测 | native 21min / GWF 21min | **native：4080/4080、goodput 0.42 req/s、output-tok goodput 250.3、Median TPOT 100.2 / P99 157.0、Median TTFT 528.9 / P99 1513ms。GWF：4080/4080、goodput 0.43 req/s（+2%）、output-tok goodput 251.5（+0.5%）、Median TPOT 92.6 / P99 116.9（−7.5%/−25.5%）、Median TTFT 606.2 / P99 31649ms（+14.6%/+20×）** | **① 路由修复验证通过**：native 每实例 running 峰值 268/274/266/302（均衡，旧版 2 卡 175/158+2 卡空），P99 TPOT 从 439→157ms（尾部 KV thrash 消失）；② **GWF 准入这次真触发了**：τ 峰值 122–262ms > 120ms，窗口 256→64→再涨回（stop_window 累计 65–1668、demoted 累计 4–1156）；③ **但净 goodput 平**（0.42 vs 0.43 ≈ 噪声），GWF 只是把痛从 TPOT 挪到 TTFT（P99 TTFT 1.5s→31.6s）。**根因：o2000 即便节流后 TPOT 仍 93ms ≈ 3× SLO，30ms SLO 在该 output 下物理不可达**——窗口守的是 120ms 可达点，救不了 30ms 的 goodput |
+| 26 | 11-09 | **qwen_o1600 4P4D util0.8 复跑（路由修复 + τ=标量EMA）** | 完美预测 | native ~17min / GWF ~17min | **native：goodput 0.69 req/s、output-tok goodput 524.6、Median TPOT 54.0 / P99 82.5、Median TTFT 342.9 / P99 1628ms。GWF：goodput 0.55 req/s（−20%）、output-tok goodput 347.4（−34%）、Median TPOT 85.3 / P99 122.2（+58%/+48%）、Median TTFT 503.8 / P99 22093ms（+47%/+13.6×）** | **GWF 在 o1600 反而变差**：τ 峰值 124–134ms 越过 120ms 触发窗口收缩（d1/d2 stop_window 813/966、demoted 689/595），但节流压低并发后 benchmark TPOT 反而 54→85ms、goodput −20%。native running 峰值 218/207/270/276（均衡）。**o1600 是明确负收益档**——native TPOT 54ms 本就在 120ms 可达点以内，GWF 的收缩反而帮倒忙 |
+| 27 | 11-09 | **qwen_o1200 4P4D util0.8 复跑（路由修复 + τ=标量EMA）** | 完美预测 | native ~13min / GWF ~13min | **native：goodput 2.96 req/s、output-tok goodput 3007.0、Median TPOT 29.9 / P99 47.6、Median TTFT 238.6 / P99 810ms。GWF：goodput 2.48 req/s（−16%）、output-tok goodput 2198.9（−27%）、Median TPOT 31.2 / P99 55.3（+4%/+16%）、Median TTFT 245.6 / P99 887ms（+3%/+9.5%）** | **crossover 定标**：native Median TPOT **29.92ms 恰好压线 30ms SLO**——o1200 就是 native TPOT 越过 SLO 的点。但 GWF 在此仍是负收益（goodput −16%）：τ≈30ms ≪ θ=120ms，窗口不触发，GWF 退化成空转开销。**oXXX 全线无 GWF 正收益点，甜点假设证伪** |
+| 28 | 11-09 | —（θ 语义调整：τ 改为 "sum" 单位） | 完美预测 | — | τ 的度量单位从 per-token 改回 **"sum"（4 步和）**：`_measure_tpot` 现在对每个请求取 `stamps[-1]-stamps[0]`（4 步和，不除以 4），episode 平均则 ×4。θ 仍是 `WT_GWF_WINDOW_TPOT_TARGET_MS=120`，于是 **τ>120ms = 4 步和>120ms = 每-token>30ms**（紧贴 SLO，不再是 4×SLO 的 120ms 可达点） | #25–#27 是 per-token θ=120（松）的结果，**作废**；按 sum θ=120（紧）重跑 o2000→o800。预期：窗口会在 native TPOT 刚过 30ms 处就收缩（o1200/o1600 附近），GWF 更可能真正出手 |
+| 29 | 11-09 | **qwen_o2000 4P4D util0.8（sum θ=120，紧）** | 完美预测 | GWF ~19min（native 复用 fair） | **GWF：4080/4080、goodput 0.42 req/s（=native 0.42）、output-tok goodput 246.8（native 250.3，−1.4%）、Median TPOT 60.2 / P99 102.3（native 100.2/157.0，−40%/−35%）、Median TTFT 623.9 / P99 510252ms（+18%/+337×）** | **sum 让窗口真出手**（d1/d3 窗口缩到 32、stop_window 18015/16622、demoted 14028/9377），TPOT 100→60ms；但 **d0/d2 的 stop_window=0**（running 119/131 < 256 收缩守卫，窗口没缩）→ 不对称节流，一半刹死一半不刹。60ms 仍是 2×SLO，省下的 TPOT 全被 TTFT 吃掉（P99 1.5s→510s）。**净 goodput 仍平**：θ 松→空转、θ 紧→猛刹救不回，两头都不赢——30ms 在 o2000 不可达 |
+| 30 | 11-09 | **qwen_o1600 4P4D util0.8（sum θ=120，紧）** | 完美预测 | GWF ~12min（native 复用 fair 0.69） | **GWF：4080/4080、goodput 0.66 req/s（native 0.69，−4.3%）、output-tok goodput 513.9（native 524.6）、Median TPOT 40.4 / P99 78.5（native 54.0/82.5，−25%/−5%）、Median TTFT 546.1 / P99 348955ms（+59%/+214×）** | 同 o2000 的失效模式：d0/d3 猛刹（stop_window 12900/13940、demoted 12517/19359）而 d1/d2 完全不刹（0）→ 不对称。TPOT 54→40ms，但 40ms 仍 >30ms SLO、TTFT P99 爆到 349s，goodput −4%。**结论：sum 紧阈值在 o1600/o2000 都是"节流降 TPOT 但救不回 goodput"，根因 30ms 不可达 + 不对称节流** |
+| 31 | 11-09 | **qwen_o2000 4P4D util0.8（sum θ=120 + TTFT-margin 250ms）** | 完美预测 | GWF ~17min（native 复用 fair 0.42） | **GWF：4080/4080、goodput 0.52 req/s（native 0.42，+24%；无 margin 版 0.42）、output-tok goodput 360.8（native 250.3，+46%）、Median TPOT 80.1 / P99 107.4（native 100.2/157.0）、Median TTFT 860.0 / P99 1628ms（无 margin 版 P99 510252ms → 1628，−99.7%）** | **TTFT 余量强制准入生效，首次 GWF 明确反超 native**：`deferral≥750ms 强制放行` 把被窗口饿死的请求救回来，P99 TTFT 从 510s 砸到 1.6s，goodput +24%。副作用：TPOT 60→80ms（并发升高），demoted 14028/9377→0、stop_window 18015/16622→841/1031。**goodput 仍被 30ms TPOT 上限压着（80ms 仍 2.7×SLO），但 TTFT 瓶颈已被移除** |
+| 32 | 11-09 | **qwen_o1600 4P4D util0.8（sum θ=120 + TTFT-margin 250ms）** | 完美预测 | GWF ~12min（native 复用 fair 0.69） | **GWF：4080/4080、goodput 0.61 req/s（native 0.69，−11.6%；无 margin 版 0.66，−7.6%）、output-tok goodput 425.0（native 524.6）、Median TPOT 77.4 / P99 113.2（native 54.0/82.5；无 margin 版 40.4/78.5 → +92%/+44%）、Median TTFT 557.7 / P99 1569ms（无 margin 版 P99 348955→1569，−99.5%）** | **margin 是把双刃剑，随负载方向反转**：o1600 里 margin 把 stop_window 从 ~13000 压到 ~1100，running 一直较满 → TPOT 从 40→77ms（+92%），goodput 反而 0.66→0.61。**o2000（深过载）TTFT 饿死是主因 → margin 净赚 +24%；o1600（中过载）TPOT 本就接近 SLO → margin 抬 TPOT 是主因 → 净亏 −7.6%**。结论：margin 需要按负载调，250ms 对 o1600 偏激进 |
+| 33 | 11-09 | **qwen_o1600 4P4D util0.8（sum θ=120 + TTFT-margin 100ms）** | 完美预测 | GWF ~12min（native 复用 fair 0.69） | **GWF：4080/4080、goodput 0.72 req/s（native 0.69，+4.3%；margin=250 版 0.61 → +18%）、output-tok goodput 556.0（native 524.6，+6%）、Median TPOT 53.1 / P99 80.1（native 54.0/82.5）、Median TTFT 530.6 / P99 1566ms（无 margin 版 P99 348955→1566，−99.6%）** | **o1600 的 margin 甜点是 100ms**：TPOT 53ms ≈ native 54ms（几乎不抬）、TTFT 1566ms ≈ native 1628ms（不爆）→ goodput 0.72 反超 native +4.3%。margin 梯度呈倒 U（0→0.66、100→0.72、250→0.61），证明 100 是平衡点。**结论：margin 调到"TPOT≈native + TTFT 不爆"处，GWF 在中过载档也能小胜** |
+
+## 结果目录索引（实验 ↔ 原始数据 / git 参考）
+
+结果根目录两处：`/root/myshare/`（对外可见）与仓库内 `experiment/zrecent_use/0630/`。
+
+| 迭代 | 配置 | 结果目录 |
+|---|---|---|
+| #6/#7 dense_short | 短请求 200 token | `wl_4p4d_util08_o1800/`（含 dense_short 复跑） |
+| #15/#16 o1500 gmu0.5 | 3P4D | `wl_util05_o1500/` |
+| #17 ln2k_cap4k | 3P4D gmu0.7 | `wl_util07_ln2k_cap4k/` |
+| #20 o4296 sum | 4P4D util0.8 | `/root/myshare/paper_aligned_v3/`、`wl_o4296_util08/` |
+| #21 o4296 per-token | 4P4D util0.8 | `/root/myshare/paper_aligned_v4_token/`、`_r2/` |
+| #22 o400 | 4P4D util0.8 | `/root/myshare/paper_aligned_v5_o400/`、`wl_o400_util08/` |
+| #23 o2000（作废） | 4P4D util0.8 | `/root/myshare/gwf_sweep_1109/o2000/` |
+| #25–#27 o2000/o1600/o1200（per-token，作废） | 4P4D util0.8 | `/root/myshare/gwf_sweep_1109_fair/{o2000,o1600,o1200}/` |
+| #28 起 sum θ=120（重跑中） | 4P4D util0.8 | `/root/myshare/gwf_sweep_sum120/` |
+| #29/#30 sum θ=120 无 margin（o2000/o1600） | 4P4D util0.8 | `/root/myshare/gwf_sweep_sum120/{o2000,o1600}/` |
+| #31/#32/#33 sum + margin（o2000 250 / o1600 250 / o1600 100） | 4P4D util0.8 | `/root/myshare/gwf_sweep_margin/{o2000,o1600}/`、`/root/myshare/gwf_sweep_margin100/o1600/` |
+| burstgpt 真实 trace（进行中） | 4P4D util0.8 | `/root/myshare/gwf_burstgpt_real/` |
+| workload_trials o1800 / o2140 | 4P4D util0.8 | `wl_4p4d_o1800_util08_v3/`、`wl_o2140_util08/` |
+| UniBoost A/B（**未完成**） | 3P4D gmu0.5 | `wl_util05_uniboost_ab3|ab4|ab5/`、`wl_ub_arm_a|b|b2|c/` |
+
+> **评估脚本**：`test_evaluation_scheme4_rr_compare.sh`（`scheme4`=预测路由+贪心准入、`scheme4_gwf`=预测路由+GWF 准入、`scheme4_uniboost`=预测路由+UniBoost；路由已对齐，见 #24）。
+> **trace 数据**：`admission_ab_base/`（qwen_o400/o800/o1200/o1500/o1600/o1800/o2000/o2140/o2471/o2900/o4296、dense2k、rate600/900 等）。
+> **git 回滚点**：主仓库 `experiment/20260630` @ `a0bdf55`；vllm 子模块 `v0.11.0-local-v2` @ `f3296d1d1`（详见 AGENTS.md「回滚安全点」）。
+> **当前 sum+margin 状态（#28–#33 结果用的代码）**：主仓库（见 `git log`，含 trace、路由修复、日志）+ vllm 子模块 `6e1011be4`（τ 标量 EMA sum + TTFT-margin + WT_SIMPLIFY_PREDICT）。复现「o2000 margin=250 +24% / o1600 margin=100 +4.3%」需 checkout 主仓库该 commit + `cd vllm && git checkout 6e1011be4`。
+> **早期 workload trial**（o1500/o1800/o2140/dense 的逐条调参记录）在 `workload_trials.md`，与本主迭代表互补；`hw_guided_workload_and_sim.md` 是硬件采样+离线模拟的那一轮。
+
+### UniBoost A/B 状态（未完成，无完整配对，不进迭代表）
+
+UniBoost 的 A/B（scheme4 vs scheme4_uniboost）**没跑成完整配对**，多臂因环境（start_servers_failed / instance_restart）失败，单臂数值不可比：
+- `wl_util05_uniboost_ab5`：scheme4 goodput 0.55、TPOT 73.65（uniboost 臂失败）；
+- `wl_ub_arm_a`：scheme4 goodput 0.88、TPOT 46.92（uniboost 臂失败）；
+- `wl_ub_arm_b2`：uniboost goodput 0.66、TPOT 52.18（scheme4 臂失败）。
+只有 [4] 节的集成说明 + 单实例冒烟是完整的。
+
+## 复现约定（2026-11-09 固化）
+
+**主指标口径**：goodput 一律指 **Output token goodput（tok/s）** = 满足「TTFT≤1000ms ∧ TPOT≤30ms」的请求的**输出 token 数 / 总墙钟时间**；`Request goodput（req/s）` 作辅助。TPOT = Time per Output Token（不含首 token，看 Median/P99）；TTFT = Time to First Token（看 Median/P99）。基准臂是 **scheme4（预测路由+贪心准入）**，不是 roundrobin。
+
+**trace 生成溯源**：`admission_ab_base/qwen_oXXX` = 对论文 qwen 原 trace（`qwen_lmsys_qwentrace_4080_600s.csv`，均值 7872.6）的 `output_tokens` 做等比缩放：`new = max(1, round(old × target/7872.6))`，**只改输出长度，4080 请求 + timestamp(QPS) 不变**。oXXX 的数字是**均值**，分布重尾（如 o2000：mean 2000 / median 688 / p90 7008）。`burstgpt_real` 是论文真实 burstgpt trace（未缩放，673 请求、135 条 >30k 极端）。
+
+**每轮必记**（新轮照此填）：① 代码状态（改了什么 + commit）；② 配置（trace/模型/PD/gpu_util/θ/margin/预测/变体）；③ 精确启动命令 + env 覆盖；④ 结果目录路径；⑤ 环境快照（8 卡是否被别的租户占、loadavg、host 内存）；⑥ 结果数字 + GWF 计数器（window/stop_window/demoted/preempted/recompute）+ running 平衡；⑦ 结论 + 是否死胡同。
+
+## 已证伪路径（别再试，除非有新的理由）
+
+| 路径 | 结论 | 出处 |
+|---|---|---|
+| per-token θ=120（松，4×SLO） | GWF ≈ native 全线空转（窗口够不到 120ms） | #25–#27 |
+| fraction 二值 τ | 0↔100 振荡，窗口钉 32 或卡 256 | #23/#20 |
+| sum θ=120 无 margin | 窗口饿死请求 → P99 TTFT 510s/349s，goodput 平/负 | #29/#30 |
+| o1200/o1600 无 margin | GWF 负收益（−16%/−20% 或 −4%） | #27/#30 |
+| o4296（output 4296） | 30ms 物理不可达，θ 松紧都救不回 | #20/#21 |
+| ln2k_cap4k（KV 富余） | GWF −19%（窗口只挡请求不省抢占） | #17 |
+| o1500@gmu0.7 | GWF −7.4%（P99 TTFT 315s 饿死） | #15 对照 |
+
+**有效路径**见 `winning_config.md`（四个正收益配置）。
 
 ## 踩过的坑（按时间，含修复）
 
@@ -182,6 +264,71 @@
     **排查提示**：如果看到"部分 decode 在跑、部分像死了"，先查**是不是有别的脚本/别的 base 目录在跑**（用 `/proc/<pid>/fd` 看实例实际写哪个日志文件最可靠），不要急着怀疑 vLLM。
 
     另一条相关经验：主日志里的 `Killed`（SIGKILL）**通常是 health guard 判定 down 之后 `stop_servers` 的清理动作**（`kill -TERM -<pgid>` 进程组广播 + `kill -KILL`），**不是崩溃原因本身**；找原因要往它上面的实例自己日志里看。
+
+23. **路由负载漏记 waiting 队列的未来输出 → 实例间严重失衡（GWF 准入与路由脱节）**：
+    症状：GWF 把热实例窗口压到 32、请求在 waiting 堆积（283/242），而空闲实例（kv 2.6%）收不到请求，路由仍往热实例塞——单实例准入在刹车，路由却不把负载导走。
+    根因：proxy `_calculate_load` 里 `Future_Tokens = running_predict_tokens + waiting_tokens`，但 decode 实例上报的
+    `waiting_tokens` 在 `--activation-predict` 关闭时**只算 prompt**（`scheduler.py::_waiting_token_contribution` 返回 `num_prompt_tokens`）。
+    实测：某实例 `wait_reqs=242`、`Future=23612`，而真实未来占用 ≈ 242×4296 ≈ **100 万 token**，少了两个数量级 → Path B 判它"很空"继续塞。
+    修复：GWF scheduler 覆写 `_should_track_predictive_pressure()` 返回 True（GWF 场景每个请求都有预测，理应计预测 token），
+    使 `waiting_tokens = Σ(prompt+预测输出)`、`running_predict_tokens = Σ预测剩余`，对应论文 eq 6。
+    **判据**：proxy MONITOR 行里 `wait_reqs` 很大但 `Future` 很小（如 242 → 23612）就是漏记。
+
+24. **改完某个方法后，只重跑受影响的变体，没被影响的不要重跑**：
+    症状：把 GWF 的 τ 单位从 per-token 改成 sum 后，我无脑重跑了整个 A/B（native + GWF 两臂），结果 native 又白跑一遍。
+    根因：**native（scheme4）是 stock greedy scheduler，根本不读 GWF 的 τ/θ**——θ 的语义（per-token vs sum）只影响 `scheme4_gwf` 臂，native 臂结果只跟"路由修复 + trace"有关，θ 无关、可直接复用。
+    修复：改参数前先想清"这个改动影响哪个 scheduler / 哪条代码路径"：
+    - GWF 专属改动（τ 单位、θ、窗口、eV、demote、hopeless）→ 只重跑 `scheme4_gwf`，native 复用；
+    - 路由改动（proxy / `_should_track_predictive_pressure` / `--activation-predict`）→ **两臂都要重跑**（路由同时影响 native 和 GWF）；
+    - 用 `COMPARE_EXPERIMENT_VARIANTS="scheme4_gwf"` 只跑 GWF 臂（脚本 `gwf_sweep_run_gwf_only.sh`）。
+    **判据**：改代码前问一句"native（greedy）会因为这个改动而改变行为吗？"——不会就复用 native。
+
+## [4] UniBoost baseline（arXiv:2606.18431）集成
+
+**为什么要自己实现**：论文 [4] 的项目页 `Code` 链接是空占位（`href="#"`，整页 0 个 github 链接），
+官方**没有**发布代码。社区有一份 SGLang 实现，但只是 4 个 **未合并** PR（sgl-project/sglang#48076–#48079，
+页面状态 `State--open`；sglang `main` 的 `schedule_policy.py`/`scheduler.py` 里 `boost` 匹配数为 0）。
+PR #48076 可下载（633 行，含 158 行 `uniboost.py` + 316 行单测），只作公式参考。
+
+**隔离原则（重要）**：stock vLLM 本身就是 baseline，**不允许改 vLLM 本体的任何文件**，
+否则两个 baseline 共用代码路径、A/B 不成立。所以 UniBoost 全部放在新增文件里，
+通过 launcher 在运行时注入 scheduler class：
+
+| 文件 | 作用 |
+|---|---|
+| `vllm/vllm/v1/core/sched/uniboost.py` | 纯公式：`b_gamma(w)`、MemGuard 几何量化 `q(u)`、`uncached_work`、`phi` |
+| `vllm/vllm/v1/core/sched/uniboost_queue.py` | 按 phi 排序的等待队列（懒刷新 + 每步 rebuild），**不改** stock `request_queue.py` |
+| `vllm/vllm/v1/core/sched/uniboost_scheduler.py` | `Scheduler` 子类：替换 `self.waiting`；把"已生成 token 最多"的请求挪到 `self.running` 末尾，让 stock 的 `running.pop()` 正好驱逐 UniBoost 的 victim |
+| `experiment/zrecent_use/0630/uniboost_serve.py` | `vllm serve` 包装：`EngineArgs.create_engine_config` 之后把 `scheduler_cls` 换成 `UniBoostScheduler` |
+
+为什么不直接在 `scheduler.py` 里加 hook：那会让 stock baseline 也带上 UniBoost 代码路径。
+"把最长的挪到末尾"利用了 stock 的现成语义（KV 不足时 `running.pop()` 驱逐最后一个），
+且安全：running 循环按下标顺序走，失败请求在 `i < n-1`，`n-1` 本步还没被调度，不会重复调度。
+
+**开关**（`test_evaluation_scheme4_rr_compare.sh`）：variant `scheme4_uniboost`
+（与 `scheme4` 完全相同的路由/贪心准入，只有 intra-instance scheduler 不同）。
+
+```bash
+WT_UNIBOOST_GAMMA=1e-3        # 1/token，越大越接近 FCFS（stock 参考实现默认 1e-4）
+WT_UNIBOOST_BIN=128           # MemGuard 量化粒度 k
+WT_UNIBOOST_ORDER=1           # 0 = 只保留驱逐策略，队列退化为 FCFS（消融）
+WT_UNIBOOST_VICTIM=longest    # longest | newest
+WT_UNIBOOST_VICTIM_MIN_TOKENS=32
+WT_UNIBOOST_LOG_INTERVAL_MS=1000
+```
+
+**验证（单实例冒烟，GPU0，gmu=0.35）**：
+- 240 请求 / 64 并发：全部成功，2504 tok/s，`victim_swaps` 递增，`preempted_recompute_tokens=0`；
+- 360 请求 / 300 并发、输出 2048–4096：全部成功，2644 tok/s，
+  `preempted_recompute_tokens=160257`、`victim_swaps=10756` → **驱逐路径确实被触发**且不崩。
+
+**踩坑**：
+1. `python uniboost_serve.py serve --model X` 会报 `ValueError: With vllm serve, you should provide
+   the model as a positional argument`——`vllm serve` 只接受位置参数，launcher 必须同样传位置参数。
+2. 直接改 `vllm/config/scheduler.py`（加 `--uniboost-scheduler`）虽然能用，但**违反隔离原则**，
+   已全部回滚；`git status` 中 `vllm/v1/core/sched/scheduler.py`、`request_queue.py` 必须保持 clean。
+3. 2026-11-07 15:40 又出现**多租户抢占 GPU 3**（74 GB，非本容器进程），3P4D 的 prefill 改到
+   `PD_3P4D_PREFILL_GPUS=0,1,2` 才起来——同踩坑 #22。
 
 ## 环境（每次实验都应记录）
 
