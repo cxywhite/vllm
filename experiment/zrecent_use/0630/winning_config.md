@@ -23,7 +23,7 @@
 - **第二代（标量 EMA τ = sum 单位 + TTFT-margin）**：11-09 的 o2000/o1600 结果，**当前代码**。
   - τ = EMA(4 步和)，θ=120ms（`WT_GWF_WINDOW_TPOT_TARGET_MS=120`，= 4×30ms SLO）。
   - TTFT-margin 强制准入：`WT_GWF_TTFT_MARGIN_MS`，deferral ≥ ttft_budget−margin 就绕过窗口强制放行。
-  - **代码状态（复现用）**：主仓库（见 `git log`，含 trace、路由修复、日志）+ vllm 子模块 `6e1011be4`（τ sum + TTFT-margin + WT_SIMPLIFY_PREDICT）。checkout 主仓库该 commit + `cd vllm && git checkout 6e1011be4`。
+  - **代码状态（复现用）**：主仓库 `df5d7b0`（含 trace、路由修复、日志）+ vllm 子模块 `6e1011be4`（τ sum + TTFT-margin + WT_SIMPLIFY_PREDICT）。`git checkout df5d7b0`（主仓库）+ `cd vllm && git checkout 6e1011be4`。
 
 ## 正收益配置
 

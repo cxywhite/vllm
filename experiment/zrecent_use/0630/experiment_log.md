@@ -102,7 +102,7 @@
 > **评估脚本**：`test_evaluation_scheme4_rr_compare.sh`（`scheme4`=预测路由+贪心准入、`scheme4_gwf`=预测路由+GWF 准入、`scheme4_uniboost`=预测路由+UniBoost；路由已对齐，见 #24）。
 > **trace 数据**：`admission_ab_base/`（qwen_o400/o800/o1200/o1500/o1600/o1800/o2000/o2140/o2471/o2900/o4296、dense2k、rate600/900 等）。
 > **git 回滚点**：主仓库 `experiment/20260630` @ `a0bdf55`；vllm 子模块 `v0.11.0-local-v2` @ `f3296d1d1`（详见 AGENTS.md「回滚安全点」）。
-> **当前 sum+margin 状态（#28–#33 结果用的代码）**：主仓库（见 `git log`，含 trace、路由修复、日志）+ vllm 子模块 `6e1011be4`（τ 标量 EMA sum + TTFT-margin + WT_SIMPLIFY_PREDICT）。复现「o2000 margin=250 +24% / o1600 margin=100 +4.3%」需 checkout 主仓库该 commit + `cd vllm && git checkout 6e1011be4`。
+> **当前 sum+margin 状态（#28–#33 结果用的代码）**：主仓库 `df5d7b0`（含 trace、路由修复、日志）+ vllm 子模块 `6e1011be4`（τ 标量 EMA sum + TTFT-margin + WT_SIMPLIFY_PREDICT）。复现「o2000 margin=250 +24% / o1600 margin=100 +4.3%」需 `git checkout df5d7b0`（主仓库）+ `cd vllm && git checkout 6e1011be4`。
 > **早期 workload trial**（o1500/o1800/o2140/dense 的逐条调参记录）在 `workload_trials.md`，与本主迭代表互补；`hw_guided_workload_and_sim.md` 是硬件采样+离线模拟的那一轮。
 
 ### UniBoost A/B 状态（未完成，无完整配对，不进迭代表）
