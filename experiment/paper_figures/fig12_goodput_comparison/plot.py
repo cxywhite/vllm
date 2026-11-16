@@ -144,7 +144,7 @@ def parse_result(path: Path, source: str) -> Result | None:
         return None
     if source == "Dynamo":
         method = "Dynamo"
-    elif name.endswith("scheme4_aimd"):
+    elif name.endswith("scheme4_gwf"):
         method = "Ours"
     elif name.endswith("roundrobin"):
         method = "RR"

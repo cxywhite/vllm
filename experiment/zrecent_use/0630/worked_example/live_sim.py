@@ -170,9 +170,10 @@ def main():
 
     # ---- live KV-based extrapolation (more reliable than the sim's absolute running) ----
     if kvs and max(runs) > 0:
-        run_now = max(runs)
-        kv_now = sum(kvs) / len(kvs)
-        avg_kv = (kv_now / 100.0) * S.KV_CAP_TOKENS_PER_INSTANCE / run_now
+        wi = max(range(len(kvs)), key=lambda i: kvs[i])   # worst (most full) instance
+        run_now = runs[wi] if wi < len(runs) else max(runs)
+        kv_now = kvs[wi]
+        avg_kv = (kv_now / 100.0) * S.KV_CAP_TOKENS_PER_INSTANCE / max(1, run_now)
         run_kv_full = S.KV_CAP_TOKENS_PER_INSTANCE / max(1.0, avg_kv)
         kv_at_cap = 256.0 * avg_kv / S.KV_CAP_TOKENS_PER_INSTANCE * 100.0
         print(f"\n  ---- live KV extrapolation (avg {avg_kv:.0f} KV tokens/request) ----")
@@ -188,9 +189,10 @@ def main():
     kv_max = max(kvs) if kvs else 0.0
     print("\n  ---- adjustment hint ----")
     if kvs and max(runs) > 0:
-        run_now = max(runs)
-        kv_now = sum(kvs) / len(kvs)
-        avg_kv = (kv_now / 100.0) * S.KV_CAP_TOKENS_PER_INSTANCE / run_now
+        wi = max(range(len(kvs)), key=lambda i: kvs[i])   # worst (most full) instance
+        run_now = runs[wi] if wi < len(runs) else max(runs)
+        kv_now = kvs[wi]
+        avg_kv = (kv_now / 100.0) * S.KV_CAP_TOKENS_PER_INSTANCE / max(1, run_now)
         run_kv_full = S.KV_CAP_TOKENS_PER_INSTANCE / max(1.0, avg_kv)
         kv_at_cap = 256.0 * avg_kv / S.KV_CAP_TOKENS_PER_INSTANCE * 100.0
         if run_kv_full < 1024 and kv_at_cap < 90:

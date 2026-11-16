@@ -108,9 +108,9 @@
 
 #### 2.1.4 decode实例内调度
 
-- `vllm/vllm/v1/core/sched/aimd_queue.py`
+- `vllm/vllm/v1/core/sched/geometric_window_queue.py`
 
-- `vllm/vllm/v1/core/sched/aimd_scheduler.py`
+- `vllm/vllm/v1/core/sched/geometric_window_scheduler.py`
 
 ---
 

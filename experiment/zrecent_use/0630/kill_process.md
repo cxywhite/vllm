@@ -1,0 +1,1 @@
+看所有pid不要grep然后分析哪些是vllm enginecore，哪些是benchmark_serving_trace.py进程，哪些是proxy进程，哪些是sh脚本进程，分析到了再kill，核心是全量搜索然后提取可以的进程kill，要注意彻底清理因为你杀了一次会继续执行后续配置

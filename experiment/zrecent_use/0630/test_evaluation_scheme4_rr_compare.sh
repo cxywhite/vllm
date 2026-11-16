@@ -145,6 +145,18 @@ USE_PASTFUTURE_SCHEDULER=${USE_PASTFUTURE_SCHEDULER:-false}
 USE_ACTIVATION_PREDICTOR=${USE_ACTIVATION_PREDICTOR:-false}
 USE_CUSTOM_PROXY=${USE_CUSTOM_PROXY:-false}
 USE_GWF_SCHEDULER=${USE_GWF_SCHEDULER:-false}
+# [WT] progress-conservative scheduler (prediction-free, est = prompt + output*1.5)
+USE_PROGRESS_SCHEDULER=${USE_PROGRESS_SCHEDULER:-false}
+WT_PROGRESS_MARGIN=${WT_PROGRESS_MARGIN:-1.5}
+WT_PROGRESS_LOG_INTERVAL_MS=${WT_PROGRESS_LOG_INTERVAL_MS:-0}
+# [WT] PKAS-style predictive KV-reservation scheduler (est = prompt + predict_output_mean)
+USE_PKAS_SCHEDULER=${USE_PKAS_SCHEDULER:-false}
+WT_PKAS_LOG_INTERVAL_MS=${WT_PKAS_LOG_INTERVAL_MS:-0}
+# [WT] KV-threshold admission (reviewer's "keep a buffer"): stop admitting when
+# actual KV usage >= threshold. Prediction-free.
+USE_KV_THRESHOLD_SCHEDULER=${USE_KV_THRESHOLD_SCHEDULER:-false}
+WT_KV_ADMIT_THRESHOLD=${WT_KV_ADMIT_THRESHOLD:-0.8}
+WT_KV_ADMIT_LOG_INTERVAL_MS=${WT_KV_ADMIT_LOG_INTERVAL_MS:-0}
 # [WT] UniBoost baseline (paper [4], arXiv:2606.18431). Stock vLLM must stay
 # byte-identical in the baseline arm, so the scheduler class is injected at
 # runtime by uniboost_serve.py (wraps EngineArgs.create_engine_config) instead
@@ -158,6 +170,21 @@ UNIBOOST_VICTIM=${WT_UNIBOOST_VICTIM:-longest}
 UNIBOOST_VICTIM_MIN_TOKENS=${WT_UNIBOOST_VICTIM_MIN_TOKENS:-32}
 UNIBOOST_LOG_INTERVAL_MS=${WT_UNIBOOST_LOG_INTERVAL_MS:-1000}
 UNIBOOST_RESULT_SUFFIX=${UNIBOOST_RESULT_SUFFIX:-uniboost}
+# [WT] TIE baseline (paper [5], arXiv:2604.00499). Same isolation approach as
+# UniBoost: the scheduler class is injected at runtime by tie_serve.py; the
+# DeBERTa predictor runs in-process (CPU by default), one copy per decode
+# instance. Only the waiting-queue order changes; admission/routing untouched.
+USE_TIE_SCHEDULER=${USE_TIE_SCHEDULER:-false}
+TIE_SERVE_PY=${TIE_SERVE_PY:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../tie_baseline/tie_serve.py}
+TIE_MODE=${WT_TIE_MODE:-pred}
+TIE_CKPT=${WT_TIE_CKPT:-}
+TIE_STATS=${WT_TIE_STATS:-}
+TIE_ENCODER=${WT_TIE_ENCODER:-}
+TIE_DEVICE=${WT_TIE_DEVICE:-cpu}
+TIE_BETA=${WT_TIE_BETA:-0.1}
+TIE_MAX_TOKENS=${WT_TIE_MAX_TOKENS:-8192}
+TIE_LOG_INTERVAL_MS=${WT_TIE_LOG_INTERVAL_MS:-1000}
+TIE_RESULT_SUFFIX=${TIE_RESULT_SUFFIX:-tie}
 TEST_ABLATION_P2D=${TEST_ABLATION_P2D:-false}
 TEST_ABLATION_P2D_CURRENT_3DLOAD=${TEST_ABLATION_P2D_CURRENT_3DLOAD:-false}
 TEST_ABLATION_P2D_CURRENT_CAPACITY=${TEST_ABLATION_P2D_CURRENT_CAPACITY:-false}
@@ -177,6 +204,16 @@ WT_SCHEME4_RESERVATION_TOKENS=${WT_SCHEME4_RESERVATION_TOKENS:-}
 # [WT] predictor output-length calibration (measured pred/actual ~4.36x on the
 # eval traces). 1.0 = off.  This is a one-time calibration, not a swept knob.
 WT_PREDICT_OUTPUT_SCALE=${WT_PREDICT_OUTPUT_SCALE:-1.0}
+# [WT] prediction-source switch for scheme4 + GWF:
+#   WT_PRED_CORRECTION=1  => predictor mean x online beta (sum(actual)/sum(pred))
+#   WT_PRED_CORRECTION=0  => WT_SIMPLIFY_PREDICT=1 ground-truth max_tokens
+# The two are mutually exclusive; WT_PRED_CORRECTION takes precedence in code.
+WT_PRED_CORRECTION=${WT_PRED_CORRECTION:-0}
+WT_SIMPLIFY_PREDICT=${WT_SIMPLIFY_PREDICT:-1}
+WT_PRED_CORRECTION_ALPHA=${WT_PRED_CORRECTION_ALPHA:-0.08}
+WT_PRED_CORRECTION_MIN_SAMPLES=${WT_PRED_CORRECTION_MIN_SAMPLES:-16}
+WT_PRED_CORRECTION_CLIP_LO=${WT_PRED_CORRECTION_CLIP_LO:-0.05}
+WT_PRED_CORRECTION_CLIP_HI=${WT_PRED_CORRECTION_CLIP_HI:-20.0}
 # [WT] cleanup start: scheme5 reroute defaults
 WT_SCHEME5_MAX_REROUTES=${WT_SCHEME5_MAX_REROUTES:-1}
 WT_SCHEME5_TIMEOUT_RATIO=${WT_SCHEME5_TIMEOUT_RATIO:-0.9}
@@ -426,6 +463,10 @@ configure_experiment_variant() {
     # Every variant must fully determine the scheduler choice, otherwise a
     # previous variant's UniBoost arm would leak into the next one.
     USE_UNIBOOST_SCHEDULER=false
+    USE_TIE_SCHEDULER=false
+    USE_PROGRESS_SCHEDULER=false
+    USE_PKAS_SCHEDULER=false
+    USE_KV_THRESHOLD_SCHEDULER=false
 
     case "$variant" in
         roundrobin)
@@ -484,6 +525,60 @@ configure_experiment_variant() {
             CURRENT_RUN_METHOD="scheme4"
             CURRENT_RUN_SUFFIX="$SCHEME4_RESULT_SUFFIX"
             ;;
+        scheme4_progress)
+            # [WT] progress-conservative baseline: same scheme4 prediction routing,
+            # but the intra-instance scheduler reserves est = prompt + output*1.5
+            # per request (prediction-free). Compare against scheme4 (FCFS) and
+            # scheme4_gwf (GWF).
+            USE_CUSTOM_PROXY=false
+            USE_ACTIVATION_PREDICTOR=true
+            USE_GWF_SCHEDULER=false
+            USE_PROGRESS_SCHEDULER=true
+            TEST_ABLATION_P2D=true
+            TEST_ABLATION_P2D_CURRENT_3DLOAD=false
+            TEST_ABLATION_P2D_CURRENT_CAPACITY=false
+            TEST_OPTIMAL=false
+            WT_PREDICT_ROUTE_SCHEME=scheme4
+            WT_PREDICT_ANALYSIS_ENABLE="$USER_WT_PREDICT_ANALYSIS_ENABLE_OVERRIDE"
+            CURRENT_RUN_METHOD="scheme4_progress"
+            CURRENT_RUN_SUFFIX="scheme4_progress"
+            ;;
+        scheme4_pkas)
+            # [WT] PKAS-style predictive KV-reservation baseline: same scheme4
+            # prediction routing, but the intra-instance scheduler reserves
+            # est = prompt + predict_output_mean*scale per request and admits
+            # only while sum(est) <= KV capacity (a prediction-based buffer —
+            # the reviewer's "track KV + keep a buffer" approach).
+            USE_CUSTOM_PROXY=false
+            USE_ACTIVATION_PREDICTOR=true
+            USE_GWF_SCHEDULER=false
+            USE_PKAS_SCHEDULER=true
+            TEST_ABLATION_P2D=true
+            TEST_ABLATION_P2D_CURRENT_3DLOAD=false
+            TEST_ABLATION_P2D_CURRENT_CAPACITY=false
+            TEST_OPTIMAL=false
+            WT_PREDICT_ROUTE_SCHEME=scheme4
+            WT_PREDICT_ANALYSIS_ENABLE="$USER_WT_PREDICT_ANALYSIS_ENABLE_OVERRIDE"
+            CURRENT_RUN_METHOD="scheme4_pkas"
+            CURRENT_RUN_SUFFIX="scheme4_pkas"
+            ;;
+        scheme4_kvthreshold)
+            # [WT] reviewer's "keep a buffer" policy: track actual KV usage and
+            # stop admitting waiting requests once usage >= WT_KV_ADMIT_THRESHOLD.
+            # Prediction-free, simulation-free.
+            USE_CUSTOM_PROXY=false
+            USE_ACTIVATION_PREDICTOR=true
+            USE_GWF_SCHEDULER=false
+            USE_KV_THRESHOLD_SCHEDULER=true
+            TEST_ABLATION_P2D=true
+            TEST_ABLATION_P2D_CURRENT_3DLOAD=false
+            TEST_ABLATION_P2D_CURRENT_CAPACITY=false
+            TEST_OPTIMAL=false
+            WT_PREDICT_ROUTE_SCHEME=scheme4
+            WT_PREDICT_ANALYSIS_ENABLE="$USER_WT_PREDICT_ANALYSIS_ENABLE_OVERRIDE"
+            CURRENT_RUN_METHOD="scheme4_kvthreshold"
+            CURRENT_RUN_SUFFIX="scheme4_kvthreshold"
+            ;;
         scheme4_uniboost)
             # [4] baseline at the intra-instance layer: same scheme4 prediction
             # routing, but the intra-instance scheduler is UniBoost (prediction-
@@ -502,6 +597,25 @@ configure_experiment_variant() {
             WT_PREDICT_ANALYSIS_ENABLE="$USER_WT_PREDICT_ANALYSIS_ENABLE_OVERRIDE"
             CURRENT_RUN_METHOD="scheme4_uniboost"
             CURRENT_RUN_SUFFIX="$UNIBOOST_RESULT_SUFFIX"
+            ;;
+        scheme4_tie)
+            # [5] baseline at the intra-instance layer: same scheme4 prediction
+            # routing, but the decode-side waiting queue is ordered by the TIE
+            # score E[X]+beta*CVaR from a DeBERTa predictor (prediction-based
+            # SJF ordering). Scheduler injected by tie_serve.py; compare against
+            # scheme4 (FCFS) and scheme4_gwf (GWF).
+            USE_CUSTOM_PROXY=false
+            USE_ACTIVATION_PREDICTOR=true
+            USE_GWF_SCHEDULER=false
+            USE_TIE_SCHEDULER=true
+            TEST_ABLATION_P2D=true
+            TEST_ABLATION_P2D_CURRENT_3DLOAD=false
+            TEST_ABLATION_P2D_CURRENT_CAPACITY=false
+            TEST_OPTIMAL=false
+            WT_PREDICT_ROUTE_SCHEME=scheme4
+            WT_PREDICT_ANALYSIS_ENABLE="$USER_WT_PREDICT_ANALYSIS_ENABLE_OVERRIDE"
+            CURRENT_RUN_METHOD="scheme4_tie"
+            CURRENT_RUN_SUFFIX="$TIE_RESULT_SUFFIX"
             ;;
         scheme4_gwf)
             USE_CUSTOM_PROXY=false
@@ -583,7 +697,7 @@ configure_experiment_variant() {
             CURRENT_RUN_SUFFIX="$ORACLE_RESULT_SUFFIX"
             ;;
         *)
-            echo "ERROR: unsupported experiment variant=${variant}, expected roundrobin/roundrobin_pp/roundrobin_uniboost/scheme4/scheme4_gwf/scheme4_uniboost/scheme5/current_capacity/current_3dload/oracle"
+            echo "ERROR: unsupported experiment variant=${variant}, expected roundrobin/roundrobin_pp/roundrobin_uniboost/scheme4/scheme4_gwf/scheme4_uniboost/scheme4_tie/scheme4_pkas/scheme4_kvthreshold/scheme5/current_capacity/current_3dload/oracle"
             return 1
             ;;
     esac
@@ -1508,6 +1622,8 @@ stop_servers() {
     pkill -9 -f "vllm serve" >/dev/null 2>&1 || true
     # [WT] UniBoost arm runs as `python uniboost_serve.py serve ...`
     pkill -9 -f "uniboost_serve" >/dev/null 2>&1 || true
+    # [WT] TIE arm runs as `python tie_serve.py serve ...`
+    pkill -9 -f "tie_serve" >/dev/null 2>&1 || true
     fuser -k ${PROXY_PORT}/tcp 2>/dev/null || true  # kill stale proxy by port
     fuser -k ${BENCH_PORT}/tcp 2>/dev/null || true
 
@@ -1566,6 +1682,12 @@ start_servers() {
         WT_SCHEME4_LOAD_THRESHOLD="${WT_SCHEME4_LOAD_THRESHOLD}" \
         WT_SCHEME4_RESERVATION_TOKENS="${WT_SCHEME4_RESERVATION_TOKENS}" \
         WT_PREDICT_OUTPUT_SCALE="${WT_PREDICT_OUTPUT_SCALE}" \
+        WT_PRED_CORRECTION="${WT_PRED_CORRECTION}" \
+        WT_SIMPLIFY_PREDICT="${WT_SIMPLIFY_PREDICT}" \
+        WT_PRED_CORRECTION_ALPHA="${WT_PRED_CORRECTION_ALPHA}" \
+        WT_PRED_CORRECTION_MIN_SAMPLES="${WT_PRED_CORRECTION_MIN_SAMPLES}" \
+        WT_PRED_CORRECTION_CLIP_LO="${WT_PRED_CORRECTION_CLIP_LO}" \
+        WT_PRED_CORRECTION_CLIP_HI="${WT_PRED_CORRECTION_CLIP_HI}" \
         WT_SCHEME5_MAX_REROUTES="${WT_SCHEME5_MAX_REROUTES}" \
         WT_SCHEME5_TIMEOUT_RATIO="${WT_SCHEME5_TIMEOUT_RATIO}" \
         WT_SCHEME5_FIRST_CHUNK_TIMEOUT_MS="${WT_SCHEME5_FIRST_CHUNK_TIMEOUT_MS}" \
@@ -1576,6 +1698,9 @@ start_servers() {
         WT_ROUTE_DECISION_LOG_ENABLED="${WT_ROUTE_DECISION_LOG_ENABLED}" \
         WT_MONITOR_LOG_INTERVAL_MS="${WT_MONITOR_LOG_INTERVAL_MS}" \
         WT_ORACLE_DATASET_PATH="${CURRENT_BENCH_DATASET_PATH}" \
+        WT_PREDICTOR_ZMQ_ADDR="${WT_PREDICTOR_ZMQ_ADDR:-tcp://127.0.0.1:32323}" \
+        WT_ROUTING_PUB_ADDR="${WT_ROUTING_PUB_ADDR:-tcp://127.0.0.1:32324}" \
+        WT_PREDICT_PROXY_ZMQ_ADDR="${WT_PREDICT_PROXY_ZMQ_ADDR:-tcp://127.0.0.1:32323}" \
         bash -c "exec python3 \"$PROXY_SCRIPT\"" \
         &> "${LOG_DIR}/proxy_${timestamp}.log" &
 
@@ -1645,6 +1770,8 @@ start_servers() {
             MASTER_PORT="$dist_port" \
             VLLM_USE_V1=1 \
             WT_PREDICT_CHAIN_VERBOSE="${WT_PREDICT_CHAIN_VERBOSE}" \
+            WT_PRED_CORRECTION="${WT_PRED_CORRECTION}" \
+            WT_SIMPLIFY_PREDICT="${WT_SIMPLIFY_PREDICT}" \
             WT_PREDICT_TIMING_CSV="${LOG_DIR}/predict_timing_prefill${i}_${timestamp}.csv" \
             WT_TIMING_VERBOSE="${WT_TIMING_VERBOSE}" \
             WT_TIMING_PENDING_CHECK_MS="${WT_TIMING_PENDING_CHECK_MS}" \
@@ -1653,6 +1780,9 @@ start_servers() {
             WT_KV_FLUSH_VERBOSE="${WT_KV_FLUSH_VERBOSE}" \
             WT_KV_LAYER_PACK_ENABLE="${WT_KV_LAYER_PACK_ENABLE}" \
             WT_KV_ROUTE_AWARE_IMMEDIATE_SEND="${WT_KV_ROUTE_AWARE_IMMEDIATE_SEND}" \
+            WT_PREDICTOR_ZMQ_ADDR="${WT_PREDICTOR_ZMQ_ADDR:-tcp://127.0.0.1:32323}" \
+            WT_ROUTING_PUB_ADDR="${WT_ROUTING_PUB_ADDR:-tcp://127.0.0.1:32324}" \
+            WT_PREDICT_PROXY_ZMQ_ADDR="${WT_PREDICT_PROXY_ZMQ_ADDR:-tcp://127.0.0.1:32323}" \
             bash -c "exec $cmd" > "${LOG_DIR}/prefill${i}_${timestamp}.log" 2>&1 &
         local pid=$!
         local pgid
@@ -1676,6 +1806,8 @@ start_servers() {
         local decode_entry="vllm serve"
         if is_true "$USE_UNIBOOST_SCHEDULER"; then
             decode_entry="python ${UNIBOOST_SERVE_PY} serve"
+        elif is_true "$USE_TIE_SCHEDULER"; then
+            decode_entry="python ${TIE_SERVE_PY} serve"
         fi
         cmd="${decode_entry} \"$MODEL\" \
             --enforce-eager \
@@ -1709,6 +1841,15 @@ start_servers() {
         if is_true "$USE_GWF_SCHEDULER"; then
             cmd="$cmd --geometric-window-scheduler"
         fi
+        if is_true "$USE_PROGRESS_SCHEDULER"; then
+            cmd="$cmd --scheduler-cls vllm.v1.core.sched.progress_conservative_scheduler.ProgressConservativeScheduler"
+        fi
+        if is_true "$USE_PKAS_SCHEDULER"; then
+            cmd="$cmd --scheduler-cls vllm.v1.core.sched.predictive_kv_reservation_scheduler.PredictiveKVReservationScheduler"
+        fi
+        if is_true "$USE_KV_THRESHOLD_SCHEDULER"; then
+            cmd="$cmd --scheduler-cls vllm.v1.core.sched.kv_threshold_admission_scheduler.KVThresholdAdmissionScheduler"
+        fi
         if is_true "$TEST_ABLATION_P2D"; then
             cmd="$cmd --test-p2d"
         fi
@@ -1739,6 +1880,8 @@ start_servers() {
         setsid env \
             DECODE_INSTANCE_ID="decode-${i}" \
             WT_PREDICT_CHAIN_VERBOSE="${WT_PREDICT_CHAIN_VERBOSE}" \
+            WT_PRED_CORRECTION="${WT_PRED_CORRECTION}" \
+            WT_SIMPLIFY_PREDICT="${WT_SIMPLIFY_PREDICT}" \
             WT_PREDICT_ANALYSIS_ENABLE="${WT_PREDICT_ANALYSIS_ENABLE}" \
             WT_PREDICT_ANALYSIS_CSV="${predict_analysis_csv}" \
             WT_GWF_TTFT_BUDGET_MS="${BENCH_GOODPUT_TTFT_MS}" \
@@ -1747,16 +1890,32 @@ start_servers() {
             WT_GWF_HOPELESS_MAX_DEFER_MS="${WT_GWF_HOPELESS_MAX_DEFER_MS}" \
             WT_GWF_FORCE_IDLE="${WT_GWF_FORCE_IDLE}" \
             WT_GWF_LOG_INTERVAL_MS="${WT_GWF_LOG_INTERVAL_MS}" \
+            WT_PROGRESS_MARGIN="${WT_PROGRESS_MARGIN}" \
+            WT_PROGRESS_LOG_INTERVAL_MS="${WT_PROGRESS_LOG_INTERVAL_MS}" \
+            WT_PKAS_LOG_INTERVAL_MS="${WT_PKAS_LOG_INTERVAL_MS}" \
+            WT_KV_ADMIT_THRESHOLD="${WT_KV_ADMIT_THRESHOLD}" \
+            WT_KV_ADMIT_LOG_INTERVAL_MS="${WT_KV_ADMIT_LOG_INTERVAL_MS}" \
             WT_UNIBOOST_GAMMA="${UNIBOOST_GAMMA}" \
             WT_UNIBOOST_BIN="${UNIBOOST_BIN}" \
             WT_UNIBOOST_ORDER="${UNIBOOST_ORDER}" \
             WT_UNIBOOST_VICTIM="${UNIBOOST_VICTIM}" \
             WT_UNIBOOST_VICTIM_MIN_TOKENS="${UNIBOOST_VICTIM_MIN_TOKENS}" \
             WT_UNIBOOST_LOG_INTERVAL_MS="${UNIBOOST_LOG_INTERVAL_MS}" \
+            WT_TIE_MODE="${TIE_MODE}" \
+            WT_TIE_CKPT="${TIE_CKPT}" \
+            WT_TIE_STATS="${TIE_STATS}" \
+            WT_TIE_ENCODER="${TIE_ENCODER}" \
+            WT_TIE_DEVICE="${TIE_DEVICE}" \
+            WT_TIE_BETA="${TIE_BETA}" \
+            WT_TIE_MAX_TOKENS="${TIE_MAX_TOKENS}" \
+            WT_TIE_LOG_INTERVAL_MS="${TIE_LOG_INTERVAL_MS}" \
             VLLM_USE_V1=1 \
             CUDA_VISIBLE_DEVICES="$gpu_id" \
             MASTER_ADDR="127.0.0.1" \
             MASTER_PORT="$dist_port" \
+            WT_PREDICTOR_ZMQ_ADDR="${WT_PREDICTOR_ZMQ_ADDR:-tcp://127.0.0.1:32323}" \
+            WT_ROUTING_PUB_ADDR="${WT_ROUTING_PUB_ADDR:-tcp://127.0.0.1:32324}" \
+            WT_PREDICT_PROXY_ZMQ_ADDR="${WT_PREDICT_PROXY_ZMQ_ADDR:-tcp://127.0.0.1:32323}" \
             bash -c "exec $cmd" > "${LOG_DIR}/decode${i}_${timestamp}.log" 2>&1 &
         local pid=$!
         local pgid

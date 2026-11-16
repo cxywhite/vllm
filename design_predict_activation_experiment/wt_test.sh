@@ -4,7 +4,7 @@ set -euo pipefail
 USE_PASTFUTURE_SCHEDULER="false"  # 或者 "false"
 USE_ACTIVATION_PREDICTOR="true"  # 或者 "false"
 USE_CUSTOM_PROXY="true"
-USE_AIMD_SCHEDULER="true"
+USE_GWF_SCHEDULER="true"
 #这里设置为float32以匹配预测器
 VLLM_DTYPE=${VLLM_DTYPE:-bfloat16}  # float16 or bfloat16
 # 这些参数设置是为了在benchmark中测试请求预测时使用
@@ -422,8 +422,8 @@ start_servers() {
         if [ "$USE_PASTFUTURE_SCHEDULER" = "true" ]; then
             CMD="$CMD --pastfuture-scheduler"
         fi
-        if [ "$USE_AIMD_SCHEDULER" = "true" ]; then
-            CMD="$CMD --aimd-scheduler"
+        if [ "$USE_GWF_SCHEDULER" = "true" ]; then
+            CMD="$CMD --geometric-window-scheduler"
         fi
         # 条件添加 --activation_predictor 参数
         # if [ "$USE_ACTIVATION_PREDICTOR" = "true" ]; then
