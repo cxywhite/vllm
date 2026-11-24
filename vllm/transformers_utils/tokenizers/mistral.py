@@ -180,7 +180,6 @@ class MistralTokenizer:
     ):
         # Mistral Tokenizers should not add special tokens
         input_ids = self.encode(prompt)
-
         if truncation:
             input_ids = input_ids[:max_length]
 
@@ -199,6 +198,7 @@ class MistralTokenizer:
         # `encode` should only be used for prompt completion
         # it should never be used for chat_completion.
         # For chat completion use `apply_chat_template`
+        
         return self.tokenizer.encode(prompt, bos=True, eos=False)
 
     def apply_chat_template(self,

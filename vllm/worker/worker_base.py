@@ -312,8 +312,10 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         self,
         execute_model_req: Optional[ExecuteModelRequest] = None,
     ) -> Optional[List[SamplerOutput]]:
+        # logger.warning("[ZZX] worker_base")
         """Executes at least one model step on the given sequences, unless no
         sequences are provided."""
+
         start_time = time.perf_counter()
 
         inputs = self.prepare_input(execute_model_req)
@@ -346,6 +348,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
             if self.kv_cache is not None else None,
             intermediate_tensors=intermediate_tensors,
             num_steps=num_steps,
+            dataset_metadata=execute_model_req.seq_group_metadata_list,
             **kwargs,
         )
 

@@ -379,6 +379,9 @@ class DeepseekModel(nn.Module):
                 "residual": residual
             })
         hidden_states, _ = self.norm(hidden_states, residual)
+        # #[wt]
+        # print(f'&'*10)
+        # print(f'deepseek...')
         return hidden_states
 
 

@@ -837,7 +837,8 @@ class LLMEngine:
             self._validate_token_prompt(
                 prompt,
                 tokenizer=self.get_tokenizer(lora_request=lora_request))
-
+        # logger.info(f'[WT]******************')
+        # logger.info(f'[WT]step1 llm_engine.add_request: {request_id}')#step1
         preprocessed_inputs = self.input_preprocessor.preprocess(
             prompt,
             request_id=request_id,

@@ -10,7 +10,8 @@ from vllm.utils import LRUCache
 
 from .base_tokenizer_group import BaseTokenizerGroup
 
-
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 class TokenizerGroup(BaseTokenizerGroup):
     """A group of tokenizers that can be used for LoRA adapters."""
 
@@ -56,7 +57,18 @@ class TokenizerGroup(BaseTokenizerGroup):
                request_id: Optional[str] = None,
                lora_request: Optional[LoRARequest] = None) -> List[int]:
         tokenizer = self.get_lora_tokenizer(lora_request)
+        # logger.info(f'[WT]-----------------------------')
+        # logger.info(f'[WT]step7 tokenizer_group.encode prompt:{prompt}')#step7
         ret = tokenizer.encode(prompt)
+        ret2=tokenizer.encode(prompt,add_special_tokens=False)
+        # logger.info(f'[WT]-----------------------------')
+        wtprompt=tokenizer.decode(ret)
+        wtprompt2=tokenizer.decode(ret2)
+        # logger.info(f'[WT]step7-1 tokenizer_group.encode tokenizer_class:{tokenizer.__class__},{tokenizer.__module__}')#step7-1  
+        # logger.info(f'[WT]step8 tokenizer_group.encode wtprompt:{wtprompt}')#step8
+        # logger.info(f'[WT]step8 tokenizer_group.encode ret:{ret}')#step8
+        # logger.info(f'[WT]step8 tokenizer_group.encode wtprompt2:{wtprompt2}')#step8
+        # logger.info(f'[WT]step8 tokenizer_group.encode ret2:{ret2}')#step8
         self._raise_if_input_too_long(ret, lora_request)
         return ret
 

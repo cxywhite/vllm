@@ -144,6 +144,8 @@ class InputPreprocessor:
         """
 
         decoder_start_token_id = self.get_decoder_start_token_id()
+        # logger.info(f"[WT]")
+        # logger.info(f"decoder_start_token_id: {decoder_start_token_id}")
         assert decoder_start_token_id is not None
 
         if decoder_input_ids is None:
@@ -180,7 +182,9 @@ class InputPreprocessor:
         corresponding token IDs.
         """
         tokenizer = self.get_tokenizer_group()
-
+        
+        
+        
         return tokenizer.encode(request_id=request_id,
                                 prompt=prompt,
                                 lora_request=lora_request)
@@ -222,15 +226,20 @@ class InputPreprocessor:
         '''
 
         parsed = parse_singleton_prompt(prompt)
-
+        # logger.info(f'[WT]----------------------')
+        # logger.info(f"[WT]step5 preprocess._prompt_to_llm_inputs")#step5
+        # logger.info(f"[WT]step5 parsed: {parsed}")
         if parsed["type"] == "str":
+            # logger.info(f'[WT]----------------------')
+            # logger.info(f"[WT]step6 preprocess._prompt_to_llm_inputs")#step6
             prompt_text = parsed["content"]
             prompt_token_ids = self._tokenize_prompt(
                 prompt_text,
                 request_id=request_id,
                 lora_request=lora_request,
             )
-
+            # logger.info(f'[WT]----------------------')
+            # logger.info(f"[WT]step10 preprocess._prompt_to_llm_inputs prompt_token_ids:{prompt_token_ids}")#step10
             return token_inputs(
                 prompt=prompt_text,
                 prompt_token_ids=prompt_token_ids,
@@ -238,7 +247,6 @@ class InputPreprocessor:
 
         if parsed["type"] == "tokens":
             tokens_content = parsed["content"]
-
             prompt_token_ids = tokens_content["prompt_token_ids"]
             multi_modal_data = tokens_content.get("multi_modal_data")
             mm_processor_kwargs = tokens_content.get("mm_processor_kwargs")
@@ -251,7 +259,8 @@ class InputPreprocessor:
 
         if parsed["type"] == "text":
             text_content = parsed["content"]
-
+            # logger.info(f'[WT]----------------------')
+            # logger.info(f"[WT]step6 preprocess._prompt_to_llm_inputs")#step6
             prompt_text = text_content["prompt"]
             prompt_token_ids = self._tokenize_prompt(
                 prompt_text,
@@ -492,7 +501,9 @@ class InputPreprocessor:
 
         * :class:`DecoderOnlyInputs` instance
         '''
-
+        # logger.info(f'[WT]--------------------')
+        # logger.info(f"[WT]step4 preprocess._process_decoder_only_prompt")#step4
+        # logger.info(f"[WT]step4 prompt: {prompt}")
         prompt_comps = self._prompt_to_llm_inputs(
             prompt,
             request_id=request_id,
@@ -531,6 +542,9 @@ class InputPreprocessor:
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
     ) -> ProcessorInputs:
         """Preprocess the input prompt."""
+        # logger.info(f'[WT]******************')
+        # logger.info(f"[WT]step2 preprocess.preprocess")#step2
+        
         if self.is_encoder_decoder_model():
             # Encoder-decoder model requires special mapping of
             # input prompts to encoder & decoder
@@ -538,7 +552,8 @@ class InputPreprocessor:
                 prompt,
                 request_id=request_id,
             )
-
+        # logger.info(f'[WT]******************')
+        # logger.info(f"[WT]step3 preprocess.preprocess2")#step3
         if is_explicit_encoder_decoder_prompt(prompt):
             raise ValueError("Cannot pass encoder-decoder prompt "
                              "to decoder-only models")

@@ -76,6 +76,11 @@ _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [
 ]
 _NUM_WARMUP_ITERS = 2
 
+# zzx: disable warmup for cuda graph
+_BATCH_SIZES_TO_CAPTURE = [1]
+_NUM_WARMUP_ITERS = 1
+logger.warning("[ZZX] CUDA graph & warmup is disabled.")
+
 TModelInputForGPU = TypeVar('TModelInputForGPU', bound="ModelInputForGPU")
 
 # For now, bump up cache limits for recompilations during CUDA graph warmups.
@@ -1588,7 +1593,9 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         kv_caches: List[torch.Tensor],
         intermediate_tensors: Optional[IntermediateTensors] = None,
         num_steps: int = 1,
+        dataset_metadata: [SequenceGroupMetadata] = None,
     ) -> Optional[Union[List[SamplerOutput], IntermediateTensors]]:
+        # logger.warning("[ZZX] model_runner")
         if num_steps > 1:
             raise ValueError("num_steps > 1 is not supported in ModelRunner")
 
@@ -1615,10 +1622,11 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         # virtual engines share the same kv cache.
         virtual_engine = model_input.virtual_engine
         if prefill_meta is None and decode_meta.use_cuda_graph:
-            assert model_input.input_tokens is not None
-            graph_batch_size = model_input.input_tokens.shape[0]
-            model_executable = self.graph_runners[virtual_engine][
-                graph_batch_size]
+            # assert model_input.input_tokens is not None
+            # graph_batch_size = model_input.input_tokens.shape[0]
+            # model_executable = self.graph_runners[virtual_engine][
+            #     graph_batch_size]
+            model_executable = self.model  # zzx: disable cuda graph
         else:
             model_executable = self.model
 
@@ -1634,12 +1642,14 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_start.record()
 
         with set_forward_context(model_input.attn_metadata):
+            # logger.warning("[ZZX] model_runner execute_model")
             hidden_or_intermediate_states = model_executable(
                 input_ids=model_input.input_tokens,
                 positions=model_input.input_positions,
                 kv_caches=kv_caches,
                 attn_metadata=model_input.attn_metadata,
                 intermediate_tensors=intermediate_tensors,
+                dataset_metadata=dataset_metadata,
                 **MultiModalInputs.as_kwargs(multi_modal_kwargs,
                                              device=self.device),
                 **seqlen_agnostic_kwargs)
@@ -1681,6 +1691,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             logits=logits,
             sampling_metadata=model_input.sampling_metadata,
         )
+        # logger.warning(f'[ZZX] model_runner NEW OUTPUT: {output}')
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time
                 and output is not None):
